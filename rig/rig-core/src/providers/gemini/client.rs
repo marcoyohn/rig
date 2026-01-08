@@ -89,6 +89,12 @@ impl Provider for GeminiExt {
             }
         }
     }
+
+    fn with_custom(&self, req: http_client::Builder) -> http_client::Result<http_client::Builder> {
+        // 添加header Authorization: Bearer <api_key>, fork by ymc
+        let req = req.header(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {}", self.api_key))?);
+        Ok(req)
+    }
 }
 
 impl Provider for GeminiInteractionsExt {
