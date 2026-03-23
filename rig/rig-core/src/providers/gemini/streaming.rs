@@ -1,23 +1,24 @@
 use async_stream::stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tracing::{Level, enabled, info_span};
+use tracing::{enabled, info_span, Level};
 use tracing_futures::Instrument;
 
 use super::completion::gemini_api_types::{ContentCandidate, Part, PartKind};
 use super::completion::{
-    CompletionModel, create_request_body, resolve_request_model, streaming_endpoint,
+    create_request_body, resolve_request_model, streaming_endpoint, CompletionModel,
 };
 use crate::completion::message::ReasoningContent;
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
-use crate::http_client::HttpClientExt;
 use crate::http_client::sse::{Event, GenericEventSource};
+use crate::http_client::HttpClientExt;
 use crate::streaming;
 use crate::telemetry::SpanCombinator;
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PartialUsage {
+    #[serde(default)]
     pub total_token_count: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_content_token_count: Option<i32>,
@@ -25,6 +26,7 @@ pub struct PartialUsage {
     pub candidates_token_count: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thoughts_token_count: Option<i32>,
+    #[serde(default)]
     pub prompt_token_count: i32,
 }
 
@@ -108,6 +110,7 @@ where
         }
 
         let body = serde_json::to_vec(&request)?;
+        let request_body_for_error = String::from_utf8_lossy(&body).into_owned();
 
         let req = self
             .client
@@ -135,7 +138,12 @@ where
                         let data = match serde_json::from_str::<StreamGenerateContentResponse>(&message.data) {
                             Ok(d) => d,
                             Err(error) => {
-                                tracing::error!(?error, message = message.data, "Failed to parse SSE message");
+                                tracing::error!(
+                                    ?error,
+                                    message = message.data,
+                                    request = request_body_for_error,
+                                    "Failed to parse SSE message"
+                                );
                                 continue;
                             }
                         };
@@ -220,7 +228,7 @@ where
                         break;
                     }
                     Err(error) => {
-                        tracing::error!(?error, "SSE error");
+                        tracing::error!(?error, request = request_body_for_error, "SSE error");
                         yield Err(CompletionError::ProviderError(error.to_string()));
                         break;
                     }
@@ -556,5 +564,32 @@ mod tests {
         assert_eq!(token_usage.input_tokens, 75);
         assert_eq!(token_usage.output_tokens, 75);
         assert_eq!(token_usage.total_tokens, 150);
+    }
+
+    #[test]
+    fn test_deserialize_stream_response_with_usage_metadata_missing_token_counts() {
+        let json_data = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "Hello from Gemini"}
+                    ],
+                    "role": "model"
+                }
+            }],
+            "usageMetadata": {
+                "trafficType": "ON_DEMAND"
+            },
+            "modelVersion": "gemini-3-pro-preview"
+        });
+
+        let response: StreamGenerateContentResponse = serde_json::from_value(json_data).unwrap();
+        let usage = response
+            .usage_metadata
+            .expect("usage metadata should still deserialize");
+
+        assert_eq!(usage.prompt_token_count, 0);
+        assert_eq!(usage.total_token_count, 0);
+        assert_eq!(usage.candidates_token_count, None);
     }
 }

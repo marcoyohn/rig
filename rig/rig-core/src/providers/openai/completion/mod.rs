@@ -1250,11 +1250,13 @@ where
             tool_result_array_content: self.tool_result_array_content,
         })?;
 
+        let request_text = serde_json::to_string_pretty(&request)?;
+
         if enabled!(Level::TRACE) {
             tracing::trace!(
                 target: "rig::completions",
                 "OpenAI Chat Completions completion request: {}",
-                serde_json::to_string_pretty(&request)?
+                request_text
             );
         }
 
@@ -1272,7 +1274,19 @@ where
             if response.status().is_success() {
                 let text = http_client::text(response).await?;
 
-                match serde_json::from_str::<ApiResponse<CompletionResponse>>(&text)? {
+                let parsed = serde_json::from_str::<ApiResponse<CompletionResponse>>(&text)
+                    .map_err(|error| {
+                        tracing::error!(
+                            target: "rig::completions",
+                            ?error,
+                            request = request_text,
+                            response = text,
+                            "Failed to parse OpenAI Chat Completions completion response"
+                        );
+                        CompletionError::JsonError(error)
+                    })?;
+
+                match parsed {
                     ApiResponse::Ok(response) => {
                         let span = tracing::Span::current();
                         span.record_response_metadata(&response);
