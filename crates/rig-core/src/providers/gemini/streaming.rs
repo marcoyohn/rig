@@ -166,12 +166,10 @@ where
                         let data = match serde_json::from_str::<StreamGenerateContentResponse>(&message.data) {
                             Ok(d) => d,
                             Err(error) => {
-                                tracing::error!(
+                                tracing::error!("Failed to parse SSE message");
                                 stream_failed = true;
                                 yield Err(CompletionError::JsonError(error));
                                 break;
-                                    "Failed to parse SSE message"
-                                );
                             }
                         };
 
