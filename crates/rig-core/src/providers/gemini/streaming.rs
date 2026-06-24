@@ -1,7 +1,7 @@
 use async_stream::stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tracing::{enabled, info_span, Level};
+use tracing::{Level, enabled, info_span};
 use tracing_futures::Instrument;
 
 use super::completion::gemini_api_types::{
@@ -13,8 +13,8 @@ use super::completion::{
 };
 use crate::completion::message::ReasoningContent;
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
-use crate::http_client::sse::{Event, GenericEventSource};
 use crate::http_client::HttpClientExt;
+use crate::http_client::sse::{Event, GenericEventSource};
 use crate::streaming;
 use crate::telemetry::SpanCombinator;
 
@@ -50,7 +50,8 @@ impl GetTokenUsage for PartialUsage {
         let mut usage = crate::completion::Usage::new();
 
         usage.input_tokens = self.prompt_token_count as u64;
-        usage.output_tokens = self.candidates_token_count.unwrap_or_default() as u64;
+        usage.output_tokens = self.candidates_token_count.unwrap_or_default() as u64
+            + self.thoughts_token_count.unwrap_or_default() as u64;
         usage.cached_input_tokens = self.cached_content_token_count.unwrap_or_default() as u64;
         usage.reasoning_tokens = self.thoughts_token_count.unwrap_or_default() as u64;
         usage.tool_use_prompt_tokens = self.tool_use_prompt_token_count.unwrap_or_default() as u64;
@@ -684,7 +685,7 @@ mod tests {
         let token_usage = usage.token_usage();
         assert_eq!(token_usage.input_tokens, 40);
         assert_eq!(token_usage.cached_input_tokens, 20);
-        assert_eq!(token_usage.output_tokens, 30);
+        assert_eq!(token_usage.output_tokens, 40);
         assert_eq!(token_usage.reasoning_tokens, 10);
         assert_eq!(token_usage.tool_use_prompt_tokens, 12);
         assert_eq!(token_usage.total_tokens, 100);
@@ -832,7 +833,7 @@ mod tests {
         let token_usage = usage.token_usage();
         assert_eq!(token_usage.input_tokens, 100);
         assert_eq!(token_usage.cached_input_tokens, 25);
-        assert_eq!(token_usage.output_tokens, 50);
+        assert_eq!(token_usage.output_tokens, 65);
         assert_eq!(token_usage.reasoning_tokens, 15);
         assert_eq!(token_usage.tool_use_prompt_tokens, 12);
         assert_eq!(token_usage.total_tokens, 190);

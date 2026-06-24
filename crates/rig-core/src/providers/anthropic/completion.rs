@@ -134,14 +134,13 @@ impl GetTokenUsage for Usage {
     fn token_usage(&self) -> crate::completion::Usage {
         let mut usage = crate::completion::Usage::new();
 
-        usage.input_tokens = self.input_tokens;
+        usage.input_tokens = self.input_tokens
+            + self.cache_read_input_tokens.unwrap_or_default()
+            + self.cache_creation_input_tokens.unwrap_or_default();
         usage.output_tokens = self.output_tokens;
         usage.cached_input_tokens = self.cache_read_input_tokens.unwrap_or_default();
         usage.cache_creation_input_tokens = self.cache_creation_input_tokens.unwrap_or_default();
-        usage.total_tokens = self.input_tokens
-            + self.cache_read_input_tokens.unwrap_or_default()
-            + self.cache_creation_input_tokens.unwrap_or_default()
-            + self.output_tokens;
+        usage.total_tokens = usage.input_tokens + usage.output_tokens;
 
         usage
     }
@@ -240,18 +239,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 .map_err(|_| CompletionError::ResponseError(EMPTY_RESPONSE_ERROR.to_owned()))?
         };
 
-        let usage = completion::Usage {
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-            total_tokens: response.usage.input_tokens
-                + response.usage.cache_read_input_tokens.unwrap_or(0)
-                + response.usage.cache_creation_input_tokens.unwrap_or(0)
-                + response.usage.output_tokens,
-            cached_input_tokens: response.usage.cache_read_input_tokens.unwrap_or(0),
-            cache_creation_input_tokens: response.usage.cache_creation_input_tokens.unwrap_or(0),
-            tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
-        };
+        let usage = response.usage.token_usage();
 
         Ok(completion::CompletionResponse {
             choice,
@@ -4944,6 +4932,23 @@ mod tests {
             parsed.choice.first(),
             completion::AssistantContent::Text(text) if text.text.is_empty()
         ));
+    }
+
+    #[test]
+    fn usage_token_usage_uses_canonical_input_total_with_cache_details() {
+        let usage = Usage {
+            input_tokens: 100,
+            cache_read_input_tokens: Some(30),
+            cache_creation_input_tokens: Some(20),
+            output_tokens: 40,
+        };
+
+        let token_usage = usage.token_usage();
+        assert_eq!(token_usage.input_tokens, 150);
+        assert_eq!(token_usage.cached_input_tokens, 30);
+        assert_eq!(token_usage.cache_creation_input_tokens, 20);
+        assert_eq!(token_usage.output_tokens, 40);
+        assert_eq!(token_usage.total_tokens, 190);
     }
 
     #[test]

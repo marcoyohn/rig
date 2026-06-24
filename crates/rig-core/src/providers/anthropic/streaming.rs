@@ -208,14 +208,13 @@ impl GetTokenUsage for PartialUsage {
     fn token_usage(&self) -> crate::completion::Usage {
         let mut usage = crate::completion::Usage::new();
 
-        usage.input_tokens = self.input_tokens.unwrap_or_default() as u64;
+        usage.input_tokens = self.input_tokens.unwrap_or_default() as u64
+            + self.cache_read_input_tokens.unwrap_or_default()
+            + self.cache_creation_input_tokens.unwrap_or_default();
         usage.output_tokens = self.output_tokens as u64;
         usage.cached_input_tokens = self.cache_read_input_tokens.unwrap_or(0);
         usage.cache_creation_input_tokens = self.cache_creation_input_tokens.unwrap_or(0);
-        usage.total_tokens = usage.input_tokens
-            + usage.cached_input_tokens
-            + usage.cache_creation_input_tokens
-            + usage.output_tokens;
+        usage.total_tokens = usage.input_tokens + usage.output_tokens;
         usage
     }
 }
@@ -249,14 +248,13 @@ pub struct StreamingCompletionResponse {
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> crate::completion::Usage {
         let mut usage = crate::completion::Usage::new();
-        usage.input_tokens = self.usage.input_tokens.unwrap_or(0) as u64;
+        usage.input_tokens = self.usage.input_tokens.unwrap_or(0) as u64
+            + self.usage.cache_read_input_tokens.unwrap_or_default()
+            + self.usage.cache_creation_input_tokens.unwrap_or_default();
         usage.output_tokens = self.usage.output_tokens as u64;
         usage.cached_input_tokens = self.usage.cache_read_input_tokens.unwrap_or(0);
         usage.cache_creation_input_tokens = self.usage.cache_creation_input_tokens.unwrap_or(0);
-        usage.total_tokens = usage.input_tokens
-            + usage.cached_input_tokens
-            + usage.cache_creation_input_tokens
-            + usage.output_tokens;
+        usage.total_tokens = usage.input_tokens + usage.output_tokens;
 
         usage
     }

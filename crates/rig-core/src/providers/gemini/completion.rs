@@ -1408,7 +1408,8 @@ pub mod gemini_api_types {
             let mut usage = crate::completion::Usage::new();
 
             usage.input_tokens = self.prompt_token_count as u64;
-            usage.output_tokens = self.candidates_token_count.unwrap_or_default() as u64;
+            usage.output_tokens = self.candidates_token_count.unwrap_or_default() as u64
+                + self.thoughts_token_count.unwrap_or_default() as u64;
             usage.cached_input_tokens = self.cached_content_token_count.unwrap_or_default() as u64;
             usage.reasoning_tokens = self.thoughts_token_count.unwrap_or_default() as u64;
             usage.tool_use_prompt_tokens =
@@ -2560,7 +2561,7 @@ mod tests {
 
         assert_eq!(converted.usage.input_tokens, 40);
         assert_eq!(converted.usage.cached_input_tokens, 20);
-        assert_eq!(converted.usage.output_tokens, 30);
+        assert_eq!(converted.usage.output_tokens, 40);
         assert_eq!(converted.usage.reasoning_tokens, 10);
         assert_eq!(converted.usage.tool_use_prompt_tokens, 12);
         assert_eq!(converted.usage.total_tokens, 100);
