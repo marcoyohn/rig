@@ -1,11 +1,3 @@
-#![allow(
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::unwrap_used,
-    clippy::unreachable
-)]
-
 //! Integration tests for rig-vectorize.
 //!
 //! These tests require a real Cloudflare Vectorize index and valid credentials.
@@ -22,12 +14,14 @@
 //! export VECTORIZE_INDEX_NAME="rig-integration-test"
 //! cargo test --package rig-vectorize --test integration_tests
 //! ```
+//!
 
-use rig::embeddings::{EmbedError, Embedding, EmbeddingModel, TextEmbedder};
+use rig::Embed;
+use rig::embeddings::{EmbedError, Embedding, TextEmbedder};
+use rig::vector_store::VectorSearchResult;
 use rig::vector_store::request::{SearchFilter, VectorSearchRequest};
 use rig::vector_store::{InsertDocuments, VectorStoreIndex};
 use rig::vectorize::{VectorizeClient, VectorizeFilter, VectorizeVectorStore};
-use rig::{Embed, OneOrMany};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -43,7 +37,7 @@ async fn test_insert_documents() {
         return;
     };
 
-    let model = MockEmbeddingModel::new(1536);
+    let model = mock_model(1536);
 
     let docs = vec![
         TestDocument {
@@ -59,14 +53,15 @@ async fn test_insert_documents() {
     ];
 
     let embeddings = model
-        .embed_texts(docs.iter().map(|d| d.content.clone()))
+        .call(docs.iter().map(|d| d.content.clone()).collect::<Vec<_>>())
         .await
+        .map(|response| response.embeddings)
         .expect("Failed to generate embeddings");
 
-    let documents_with_embeddings: Vec<(TestDocument, OneOrMany<Embedding>)> = docs
+    let documents_with_embeddings: Vec<(TestDocument, Vec<Embedding>)> = docs
         .into_iter()
         .zip(embeddings.into_iter())
-        .map(|(doc, emb)| (doc, OneOrMany::one(emb)))
+        .map(|(doc, emb)| (doc, vec![emb]))
         .collect();
 
     vector_store
@@ -84,7 +79,7 @@ async fn test_insert_and_query() {
         return;
     };
 
-    let model = MockEmbeddingModel::new(1536);
+    let model = mock_model(1536);
 
     let doc = TestDocument {
         id: "test-doc".to_string(),
@@ -93,14 +88,13 @@ async fn test_insert_and_query() {
     };
 
     let embeddings = model
-        .embed_texts(vec![doc.content.clone()])
+        .call(vec![doc.content.clone()])
         .await
+        .map(|response| response.embeddings)
         .expect("Failed to generate embeddings");
 
-    let documents_with_embeddings = vec![(
-        doc.clone(),
-        OneOrMany::one(embeddings.into_iter().next().unwrap()),
-    )];
+    let documents_with_embeddings =
+        vec![(doc.clone(), vec![embeddings.into_iter().next().unwrap()])];
 
     vector_store
         .insert_documents(documents_with_embeddings)
@@ -132,7 +126,7 @@ async fn test_top_n_returns_full_documents() {
         return;
     };
 
-    let model = MockEmbeddingModel::new(1536);
+    let model = mock_model(1536);
     let doc = TestDocument {
         id: "doc-rust".to_string(),
         content: "Rust is a systems programming language".to_string(),
@@ -140,14 +134,15 @@ async fn test_top_n_returns_full_documents() {
     };
 
     let embeddings = model
-        .embed_texts(vec![doc.content.clone()])
+        .call(vec![doc.content.clone()])
         .await
+        .map(|response| response.embeddings)
         .expect("Failed to generate embeddings");
 
     vector_store
         .insert_documents(vec![(
             doc.clone(),
-            OneOrMany::one(embeddings.into_iter().next().unwrap()),
+            vec![embeddings.into_iter().next().unwrap()],
         )])
         .await
         .expect("Failed to insert document");
@@ -167,7 +162,12 @@ async fn test_top_n_returns_full_documents() {
 
     assert!(!results.is_empty(), "Should return at least one result");
 
-    for (_score, _id, document) in &results {
+    for VectorSearchResult {
+        score: _score,
+        id: _id,
+        document,
+    } in &results
+    {
         assert!(!document.id.is_empty(), "Document should have an id");
         assert!(!document.content.is_empty(), "Document should have content");
         assert!(
@@ -186,7 +186,7 @@ async fn test_top_n_with_multiple_documents() {
         return;
     };
 
-    let model = MockEmbeddingModel::new(1536);
+    let model = mock_model(1536);
     let docs = vec![
         TestDocument {
             id: "doc-rust".to_string(),
@@ -201,14 +201,15 @@ async fn test_top_n_with_multiple_documents() {
     ];
 
     let embeddings = model
-        .embed_texts(docs.iter().map(|d| d.content.clone()))
+        .call(docs.iter().map(|d| d.content.clone()).collect::<Vec<_>>())
         .await
+        .map(|response| response.embeddings)
         .expect("Failed to generate embeddings");
 
-    let documents_with_embeddings: Vec<(TestDocument, OneOrMany<Embedding>)> = docs
+    let documents_with_embeddings: Vec<(TestDocument, Vec<Embedding>)> = docs
         .into_iter()
         .zip(embeddings.into_iter())
-        .map(|(doc, emb)| (doc, OneOrMany::one(emb)))
+        .map(|(doc, emb)| (doc, vec![emb]))
         .collect();
 
     vector_store
@@ -245,7 +246,7 @@ async fn test_query_with_eq_filter() {
         return;
     };
 
-    let model = MockEmbeddingModel::new(1536);
+    let model = mock_model(1536);
     let docs = vec![
         TestDocument {
             id: "doc-rust".to_string(),
@@ -260,14 +261,15 @@ async fn test_query_with_eq_filter() {
     ];
 
     let embeddings = model
-        .embed_texts(docs.iter().map(|d| d.content.clone()))
+        .call(docs.iter().map(|d| d.content.clone()).collect::<Vec<_>>())
         .await
+        .map(|response| response.embeddings)
         .expect("Failed to generate embeddings");
 
-    let documents_with_embeddings: Vec<(TestDocument, OneOrMany<Embedding>)> = docs
+    let documents_with_embeddings: Vec<(TestDocument, Vec<Embedding>)> = docs
         .into_iter()
         .zip(embeddings.into_iter())
-        .map(|(doc, emb)| (doc, OneOrMany::one(emb)))
+        .map(|(doc, emb)| (doc, vec![emb]))
         .collect();
 
     vector_store
@@ -294,7 +296,12 @@ async fn test_query_with_eq_filter() {
                 );
                 return;
             }
-            for (_score, _id, document) in &results {
+            for VectorSearchResult {
+                score: _score,
+                id: _id,
+                document,
+            } in &results
+            {
                 assert_eq!(
                     document.category, "programming",
                     "Filter should only return programming documents"
@@ -302,7 +309,7 @@ async fn test_query_with_eq_filter() {
             }
         }
         Err(e) => {
-            eprintln!("Filter test skipped - metadata may not be indexed: {:?}", e);
+            eprintln!("Filter test skipped - metadata may not be indexed: {e:?}");
         }
     }
 }
@@ -316,7 +323,7 @@ async fn test_query_with_combined_filters() {
         return;
     };
 
-    let model = MockEmbeddingModel::new(1536);
+    let model = mock_model(1536);
     let docs = vec![
         TestDocument {
             id: "doc-rust".to_string(),
@@ -336,14 +343,15 @@ async fn test_query_with_combined_filters() {
     ];
 
     let embeddings = model
-        .embed_texts(docs.iter().map(|d| d.content.clone()))
+        .call(docs.iter().map(|d| d.content.clone()).collect::<Vec<_>>())
         .await
+        .map(|response| response.embeddings)
         .expect("Failed to generate embeddings");
 
-    let documents_with_embeddings: Vec<(TestDocument, OneOrMany<Embedding>)> = docs
+    let documents_with_embeddings: Vec<(TestDocument, Vec<Embedding>)> = docs
         .into_iter()
         .zip(embeddings.into_iter())
-        .map(|(doc, emb)| (doc, OneOrMany::one(emb)))
+        .map(|(doc, emb)| (doc, vec![emb]))
         .collect();
 
     vector_store
@@ -356,7 +364,7 @@ async fn test_query_with_combined_filters() {
 
     // category = "programming" AND id != "doc-rust"
     let filter = VectorizeFilter::eq("category", serde_json::json!("programming"))
-        .and(VectorizeFilter::ne("id", serde_json::json!("doc-rust")));
+        .and(VectorizeFilter::ne("id", &serde_json::json!("doc-rust")));
 
     let request = VectorSearchRequest::builder()
         .query("programming")
@@ -372,7 +380,12 @@ async fn test_query_with_combined_filters() {
                 );
                 return;
             }
-            for (_score, _id, document) in &results {
+            for VectorSearchResult {
+                score: _score,
+                id: _id,
+                document,
+            } in &results
+            {
                 assert_ne!(document.id, "doc-rust", "Filter should exclude doc-rust");
                 assert_eq!(
                     document.category, "programming",
@@ -381,7 +394,7 @@ async fn test_query_with_combined_filters() {
             }
         }
         Err(e) => {
-            eprintln!("Filter test skipped - metadata may not be indexed: {:?}", e);
+            eprintln!("Filter test skipped - metadata may not be indexed: {e:?}");
         }
     }
 }
@@ -395,7 +408,7 @@ async fn test_query_with_in_filter() {
         return;
     };
 
-    let model = MockEmbeddingModel::new(1536);
+    let model = mock_model(1536);
     let docs = vec![
         TestDocument {
             id: "doc-rust".to_string(),
@@ -415,14 +428,15 @@ async fn test_query_with_in_filter() {
     ];
 
     let embeddings = model
-        .embed_texts(docs.iter().map(|d| d.content.clone()))
+        .call(docs.iter().map(|d| d.content.clone()).collect::<Vec<_>>())
         .await
+        .map(|response| response.embeddings)
         .expect("Failed to generate embeddings");
 
-    let documents_with_embeddings: Vec<(TestDocument, OneOrMany<Embedding>)> = docs
+    let documents_with_embeddings: Vec<(TestDocument, Vec<Embedding>)> = docs
         .into_iter()
         .zip(embeddings.into_iter())
-        .map(|(doc, emb)| (doc, OneOrMany::one(emb)))
+        .map(|(doc, emb)| (doc, vec![emb]))
         .collect();
 
     vector_store
@@ -435,7 +449,7 @@ async fn test_query_with_in_filter() {
 
     let filter = VectorizeFilter::in_values(
         "category",
-        vec![
+        &[
             serde_json::json!("programming"),
             serde_json::json!("database"),
         ],
@@ -455,7 +469,12 @@ async fn test_query_with_in_filter() {
                 );
                 return;
             }
-            for (_score, _id, document) in &results {
+            for VectorSearchResult {
+                score: _score,
+                id: _id,
+                document,
+            } in &results
+            {
                 assert!(
                     document.category == "programming" || document.category == "database",
                     "Filter should only return programming or database documents, got: {}",
@@ -464,7 +483,7 @@ async fn test_query_with_in_filter() {
             }
         }
         Err(e) => {
-            eprintln!("Filter test skipped - metadata may not be indexed: {:?}", e);
+            eprintln!("Filter test skipped - metadata may not be indexed: {e:?}");
         }
     }
 }
@@ -483,40 +502,30 @@ impl Embed for TestDocument {
     }
 }
 
-/// A mock embedding model that returns deterministic embeddings for testing.
+/// A deterministic embedding runtime: each text embeds to a hash-derived
+/// vector of `dimensions` values.
 #[derive(Clone)]
-struct MockEmbeddingModel {
+struct MockEmbeddings {
     dimensions: usize,
 }
 
-impl MockEmbeddingModel {
-    fn new(dimensions: usize) -> Self {
-        Self { dimensions }
-    }
+type MockEmbeddingModel = rig::Model<rig::driver::Local<rig::operation::Embedding>, MockEmbeddings>;
+
+/// The mock runtime as a model.
+fn mock_model(dimensions: usize) -> MockEmbeddingModel {
+    rig::Model::new(
+        rig::driver::Local::new("mock")
+            .with_capabilities(rig::wire::Capabilities::embedding(100, dimensions)),
+        MockEmbeddings { dimensions },
+    )
 }
 
-struct MockClient;
-
-impl EmbeddingModel for MockEmbeddingModel {
-    const MAX_DOCUMENTS: usize = 100;
-
-    type Client = MockClient;
-
-    fn make(_client: &Self::Client, _model: impl Into<String>, dims: Option<usize>) -> Self {
-        Self {
-            dimensions: dims.unwrap_or(1536),
-        }
-    }
-
-    fn ndims(&self) -> usize {
-        self.dimensions
-    }
-
-    async fn embed_texts(
+impl rig::driver::Transport<rig::driver::Local<rig::operation::Embedding>> for MockEmbeddings {
+    fn send(
         &self,
-        texts: impl IntoIterator<Item = String> + Send,
-    ) -> Result<Vec<rig::embeddings::Embedding>, rig::embeddings::EmbeddingError> {
-        let texts: Vec<String> = texts.into_iter().collect();
+        texts: Vec<String>,
+        _exchange: rig::driver::Exchange,
+    ) -> rig::driver::Opening<rig::driver::Step<rig::operation::Embedding>> {
         let embeddings = texts
             .into_iter()
             .map(|text| {
@@ -533,7 +542,13 @@ impl EmbeddingModel for MockEmbeddingModel {
                 }
             })
             .collect();
-        Ok(embeddings)
+        let response = rig::embeddings::EmbeddingResponse {
+            provider: "mock".into(),
+            ..rig::embeddings::EmbeddingResponse::new(embeddings)
+        };
+        rig::driver::Opening::ready(rig::driver::Opened::new(futures::stream::iter([Ok(
+            rig::driver::Step::End(response),
+        )])))
     }
 }
 
@@ -549,12 +564,12 @@ fn get_env_or_skip(var: &str) -> Option<String> {
     std::env::var(var).ok()
 }
 
-fn create_vector_store() -> Option<VectorizeVectorStore<MockEmbeddingModel>> {
+fn create_vector_store() -> Option<VectorizeVectorStore> {
     let account_id = get_env_or_skip("CLOUDFLARE_ACCOUNT_ID")?;
     let api_token = get_env_or_skip("CLOUDFLARE_API_TOKEN")?;
     let index_name = get_env_or_skip("VECTORIZE_INDEX_NAME")?;
 
-    let model = MockEmbeddingModel::new(1536);
+    let model = mock_model(1536);
 
     Some(VectorizeVectorStore::new(
         model, account_id, index_name, api_token,
@@ -579,7 +594,7 @@ async fn clear_test_index() {
         let result = match client.list_vectors(Some(1000), cursor.as_deref()).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Warning: Failed to list vectors: {:?}", e);
+                eprintln!("Warning: Failed to list vectors: {e:?}");
                 return;
             }
         };
@@ -590,7 +605,7 @@ async fn clear_test_index() {
 
         let ids: Vec<String> = result.vectors.into_iter().map(|v| v.id).collect();
         if let Err(e) = client.delete_by_ids(ids).await {
-            eprintln!("Warning: Failed to delete vectors: {:?}", e);
+            eprintln!("Warning: Failed to delete vectors: {e:?}");
             return;
         }
 

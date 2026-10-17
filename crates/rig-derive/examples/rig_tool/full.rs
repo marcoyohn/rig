@@ -1,7 +1,6 @@
-use rig_core::client::{CompletionClient, ProviderClient};
-use rig_core::completion::Prompt;
+use rig_agent::prelude::*;
 use rig_core::providers;
-use rig_core::tool::Tool;
+use rig_core::providers::openai::OpenAI;
 use rig_derive::rig_tool;
 
 /// A tool that performs string operations
@@ -11,15 +10,15 @@ fn string_processor(
     text: String,
     /// The operation to perform (uppercase, lowercase, reverse)
     operation: String,
-) -> Result<String, rig_core::tool::ToolError> {
+) -> Result<String, rig_core::tool::ToolExecutionError> {
     let result = match operation.as_str() {
         "uppercase" => text.to_uppercase(),
         "lowercase" => text.to_lowercase(),
         "reverse" => text.chars().rev().collect(),
         _ => {
-            return Err(rig_core::tool::ToolError::ToolCallError(
-                format!("Unknown operation: {operation}").into(),
-            ));
+            return Err(rig_core::tool::ToolExecutionError::other(format!(
+                "Unknown operation: {operation}"
+            )));
         }
     };
 
@@ -30,8 +29,7 @@ fn string_processor(
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt().pretty().init();
 
-    let string_agent = providers::openai::Client::from_env()?
-        .agent(providers::openai::GPT_4O)
+    let string_agent = AgentBuilder::new(OpenAI::from_env()?.completion(providers::openai::GPT_4O))
         .preamble("You are an agent with tools access, always use the tools")
         .max_tokens(1024)
         .tool(StringProcessor)
@@ -40,7 +38,7 @@ async fn main() -> Result<(), anyhow::Error> {
     println!("Tool definition:");
     println!(
         "STRINGPROCESSOR: {}",
-        serde_json::to_string_pretty(&StringProcessor.definition(String::default()).await)?
+        serde_json::to_string_pretty(&rig_agent::tool::tool_definition(&StringProcessor))?
     );
 
     for prompt in [
@@ -52,7 +50,7 @@ async fn main() -> Result<(), anyhow::Error> {
         "Perform an invalid operation on 'hello world'",
     ] {
         println!("User: {prompt}");
-        println!("Agent: {}", string_agent.prompt(prompt).await?);
+        println!("Agent: {}", string_agent.prompt(prompt).await?.output());
     }
 
     Ok(())

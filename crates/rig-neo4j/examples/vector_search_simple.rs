@@ -9,11 +9,10 @@
 use std::env;
 
 use futures::{StreamExt, TryStreamExt};
-use rig_core::client::{EmbeddingsClient, ProviderClient};
 use rig_core::providers::openai;
 use rig_core::vector_store::request::VectorSearchRequest;
 use rig_core::{
-    Embed, embeddings::EmbeddingsBuilder, providers::openai::Client,
+    Embed, embeddings::EmbeddingsBuilder, providers::openai::OpenAI,
     vector_store::VectorStoreIndex as _,
 };
 use rig_neo4j::{Neo4jClient, ToBoltType};
@@ -27,8 +26,8 @@ pub struct Word {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Initialize OpenAI client
-    let openai_client = Client::from_env()?;
+    // The OpenAI client, from `OPENAI_API_KEY`.
+    let openai_client = OpenAI::from_env()?;
 
     // Initialize Neo4j client
     let neo4j_uri = env::var("NEO4J_URI")?;
@@ -38,7 +37,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let neo4j_client = Neo4jClient::connect(&neo4j_uri, &neo4j_username, &neo4j_password).await?;
 
     // Select the embedding model and generate our embeddings
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_ADA_002, None)
+        .erase();
 
     let embeddings = EmbeddingsBuilder::new(model.clone())
         .document(Word {
@@ -71,7 +72,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 .param("id", doc.id)
                 // Here we use the first embedding but we could use any of them.
                 // Neo4j only takes primitive types or arrays as properties.
-                .param("embedding", embeddings.first().vec.clone())
+                .param(
+                    "embedding",
+                    embeddings
+                        .first()
+                        .map(|embedding| embedding.vec.clone())
+                        .unwrap_or_default(),
+                )
                 .param("document", doc.definition.to_bolt_type()),
             )
         })
@@ -135,7 +142,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .top_n::<Document>(req)
         .await?
         .into_iter()
-        .map(|(score, id, doc)| (score, id, doc.document))
+        .map(|result| (result.score, result.id, result.document.document))
         .collect::<Vec<_>>();
 
     println!("Results: {results:?}");

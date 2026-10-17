@@ -1,15 +1,24 @@
-// ================================================================
-//! Google Gemini Embeddings Integration
-//! From [Gemini API Reference](https://ai.google.dev/api/embeddings)
-// ================================================================
+//! Batch text embeddings through the [Gemini API](https://ai.google.dev/api/embeddings).
+//!
+//! ```no_run
+//! use rig_core::providers::gemini::{Gemini, embedding::EMBEDDING_001};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let model = Gemini::from_env()?.embedding(EMBEDDING_001, None);
+//! # Ok(())
+//! # }
+//! ```
 
+use crate::error::ProviderError;
+use crate::wire::Flow;
 use serde_json::json;
 
-use super::{Client, client::ApiResponse};
-use crate::{
-    embeddings::{self, EmbeddingError},
-    http_client::HttpClientExt,
-    wasm_compat::WasmCompatSend,
+use crate::embeddings;
+use crate::error::EncodeError;
+use crate::providers::internal::wire::classify_marker_keyed_frame;
+use crate::wire::{
+    Body, Capabilities, Decoder, Descriptor, Encoded, Framing, Mode, Out, Wire, WireEvent,
+    WireFrame,
 };
 
 /// `gemini-embedding-001` embedding model (3072 dimensions by default)
@@ -28,65 +37,60 @@ fn model_default_ndims(model: &str) -> Option<usize> {
     }
 }
 
-#[derive(Clone)]
-pub struct EmbeddingModel<T = reqwest::Client> {
-    client: Client<T>,
-    model: String,
-    ndims: usize,
+/// Gemini's batch embedding endpoint.
+///
+/// `POST /v1beta/models/{model}:batchEmbedContents`, authenticated by the
+/// `key` query parameter the GenerateContent family uses.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Embeddings {
+    /// The provider this wire speaks to.
+    pub provider: super::GeminiConfig,
+    /// The embedding model, as the path names it.
+    pub model: String,
+    /// The `output_dimensionality` every document in the batch asks for.
+    pub ndims: usize,
 }
 
-impl<T> EmbeddingModel<T> {
-    pub fn new(client: Client<T>, model: impl Into<String>, ndims: usize) -> Self {
-        Self {
-            client,
-            model: model.into(),
-            ndims,
-        }
-    }
-
-    pub fn with_model(client: Client<T>, model: &str, ndims: usize) -> Self {
-        Self {
-            client,
-            model: model.to_string(),
-            ndims,
-        }
-    }
-}
-
-impl<T> embeddings::EmbeddingModel for EmbeddingModel<T>
-where
-    T: Clone + HttpClientExt + 'static,
-{
-    type Client = Client<T>;
-
-    const MAX_DOCUMENTS: usize = 1024;
-
-    fn make(client: &Self::Client, model: impl Into<String>, dims: Option<usize>) -> Self {
+impl Embeddings {
+    /// Build a wire for `model` with the requested output dimensions.
+    /// If `ndims` is absent, use the model default or 768 for unknown models.
+    pub fn new(
+        provider: super::GeminiConfig,
+        model: impl Into<String>,
+        ndims: Option<usize>,
+    ) -> Self {
         let model = model.into();
-        let ndims = dims.or_else(|| model_default_ndims(&model)).unwrap_or(768);
-        Self::new(client.clone(), model, ndims)
+        let ndims = ndims.or_else(|| model_default_ndims(&model)).unwrap_or(768);
+        Self {
+            provider,
+            model,
+            ndims,
+        }
+    }
+}
+
+impl Wire for Embeddings {
+    type Op = crate::operation::Embedding;
+    type Payload = crate::wire::Encoded;
+    type Frame = crate::wire::WireFrame;
+    type Decoder<'id> = EmbeddingsDecoder;
+    type Reassembler = crate::wire::document::Unreassembled;
+
+    fn describe(&self) -> Descriptor<'_> {
+        Descriptor::new(super::PROVIDER_NAME)
+            .model(self.model.as_str())
+            .capabilities(Capabilities::embedding(1024, self.ndims))
     }
 
-    fn ndims(&self) -> usize {
-        self.ndims
-    }
-
-    /// <https://ai.google.dev/api/embeddings#batch_embed_contents-SHELL>
-    async fn embed_texts(
-        &self,
-        documents: impl IntoIterator<Item = String> + WasmCompatSend,
-    ) -> Result<Vec<embeddings::Embedding>, EmbeddingError> {
-        let documents: Vec<String> = documents.into_iter().collect();
-
-        // Google batch embed requests. See docstrings for API ref link.
-        let requests: Vec<_> = documents
+    fn encode(&self, request: Vec<String>, _mode: Mode) -> Result<Encoded, EncodeError> {
+        let requests: Vec<_> = request
             .iter()
             .map(|doc| {
                 json!({
                     "model": format!("models/{}", self.model),
                     "content": json!({
                         "parts": [json!({
-                            "text": doc.to_string()
+                            "text": doc
                         })]
                     }),
                     "output_dimensionality": self.ndims,
@@ -94,217 +98,93 @@ where
             })
             .collect();
 
-        let request_body = json!({ "requests": requests  });
+        let body = json!({ "requests": requests  });
 
-        if let Ok(pretty_body) = serde_json::to_string_pretty(&request_body) {
+        // Avoid allocating formatted batch JSON unless tracing consumes it.
+        if tracing::enabled!(target: "rig::embedding", tracing::Level::TRACE)
+            && let Ok(pretty_body) = serde_json::to_string_pretty(&body)
+        {
             tracing::trace!(
                 target: "rig::embedding",
                 "Sending embedding request to Gemini API {pretty_body}"
             );
         }
 
-        let request_body = serde_json::to_vec(&request_body)?;
-        let path = format!("/v1beta/models/{}:batchEmbedContents", self.model);
-        let req = self
-            .client
-            .post(path.as_str())?
-            .body(request_body)
-            .map_err(|e| EmbeddingError::HttpError(e.into()))?;
-        let response = self.client.send::<_, Vec<u8>>(req).await?;
+        let request = http::Request::post(format!(
+            "{}/v1beta/models/{}:batchEmbedContents?key={}",
+            self.provider.base_url,
+            self.model,
+            self.provider.api_key.expose()
+        ))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::Bytes(serde_json::to_vec(&body)?))?;
+        // `batchEmbedContents` has no streaming variant, so a streamed call
+        // sends the same bytes and reads the same whole reply.
+        Ok(Encoded::new(request, Framing::Whole))
+    }
 
-        let response: ApiResponse<gemini_api_types::EmbeddingResponse> =
-            serde_json::from_slice(&response.into_body().await?)?;
-
-        match response {
-            ApiResponse::Ok(response) => {
-                let docs = documents
-                    .into_iter()
-                    .zip(response.embeddings)
-                    .map(|(document, embedding)| embeddings::Embedding {
-                        document,
-                        vec: embedding
-                            .values
-                            .into_iter()
-                            .filter_map(|n| n.as_f64())
-                            .collect(),
-                    })
-                    .collect();
-
-                Ok(docs)
-            }
-            ApiResponse::Err(err) => Err(EmbeddingError::ProviderError(err.message)),
-        }
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
+        EmbeddingsDecoder
     }
 }
 
-// =================================================================
-// Gemini API Types
-// =================================================================
-/// Rust Implementation of the Gemini Types from [Gemini API Reference](https://ai.google.dev/api/embeddings)
-#[allow(dead_code)]
-mod gemini_api_types {
+/// Decode a `batchEmbedContents` reply containing vectors without usage or identity.
+#[derive(Default)]
+pub struct EmbeddingsDecoder;
+
+impl<'id> Decoder<'id, crate::operation::Embedding> for EmbeddingsDecoder {
+    type Event = gemini_api_types::EmbeddingResponse;
+
+    fn classify(&self, frame: WireFrame) -> WireEvent<Self::Event> {
+        classify_marker_keyed_frame(&frame.as_str(), &["embeddings"])
+    }
+
+    fn decode(
+        &mut self,
+        event: Self::Event,
+        out: Out<'id, crate::operation::Embedding>,
+    ) -> Result<Flow, ProviderError> {
+        let vectors = event.embeddings.into_iter().map(|embedding| {
+            embedding
+                .values
+                .into_iter()
+                .filter_map(|value| value.as_f64())
+                .collect()
+        });
+        // Gemini supplies no usage or response id; the driver attaches the raw body.
+        Ok(out.end(embeddings::EmbeddingResponse::from_vectors(vectors)))
+    }
+}
+
+/// Request and response types for [Gemini embeddings](https://ai.google.dev/api/embeddings).
+///
+/// ```
+/// use rig_core::providers::gemini::embedding::gemini_api_types::EmbeddingValues;
+///
+/// let vector = EmbeddingValues { values: vec![1.into(), 2.into()] };
+/// ```
+pub mod gemini_api_types {
     use serde::{Deserialize, Serialize};
-    use serde_json::Value;
 
-    use crate::providers::gemini::gemini_api_types::{CodeExecutionResult, ExecutableCode};
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct EmbedContentRequest {
-        model: String,
-        content: EmbeddingContent,
-        task_type: TaskType,
-        title: String,
-        output_dimensionality: i32,
-    }
-
-    #[derive(Serialize)]
-    pub struct EmbeddingContent {
-        parts: Vec<EmbeddingContentPart>,
-        /// Optional. The producer of the content. Must be either 'user' or 'model'. Useful to set for multi-turn
-        /// conversations, otherwise can be left blank or unset.
-        role: Option<String>,
-    }
-
-    /// A datatype containing media that is part of a multi-part Content message.
-    ///  - A Part consists of data which has an associated datatype. A Part can only contain one of the accepted types in Part.data.
-    ///  - A Part must have a fixed IANA MIME type identifying the type and subtype of the media if the inlineData field is filled with raw bytes.
-    #[derive(Serialize)]
-    pub struct EmbeddingContentPart {
-        /// Inline text.
-        text: String,
-        /// Inline media bytes.
-        inline_data: Option<Blob>,
-        /// A predicted FunctionCall returned from the model that contains a string representing the [FunctionDeclaration.name]
-        /// with the arguments and their values.
-        function_call: Option<FunctionCall>,
-        /// The result output of a FunctionCall that contains a string representing the [FunctionDeclaration.name] and a structured
-        /// JSON object containing any output from the function is used as context to the model.
-        function_response: Option<FunctionResponse>,
-        /// URI based data.
-        file_data: Option<FileData>,
-        /// Code generated by the model that is meant to be executed.
-        executable_code: Option<ExecutableCode>,
-        /// Result of executing the ExecutableCode.
-        code_execution_result: Option<CodeExecutionResult>,
-    }
-
-    /// Raw media bytes.
-    /// Text should not be sent as raw bytes, use the 'text' field.
-    #[derive(Serialize)]
-    pub struct Blob {
-        /// Raw bytes for media formats.A base64-encoded string.
-        data: String,
-        /// The IANA standard MIME type of the source data. Examples: - image/png - image/jpeg If an unsupported MIME type is
-        /// provided, an error will be returned. For a complete list of supported types, see Supported file formats.
-        mime_type: String,
-    }
-
-    #[derive(Serialize)]
-    pub struct FunctionCall {
-        /// The name of the function to call. Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length of 63.
-        name: String,
-        /// The function parameters and values in JSON object format.
-        args: Option<Value>,
-    }
-
-    #[derive(Serialize)]
-    pub struct FunctionResponse {
-        /// The name of the function to call. Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length of 63.
-        name: String,
-        /// The result of the function call in JSON object format.
-        result: Value,
-    }
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct FileData {
-        /// The URI of the file.
-        file_uri: String,
-        /// The IANA standard MIME type of the source data.
-        mime_type: String,
-    }
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-    pub enum TaskType {
-        /// Unset value, which will default to one of the other enum values.
-        Unspecified,
-        /// Specifies the given text is a query in a search/retrieval setting.
-        RetrievalQuery,
-        /// Specifies the given text is a document from the corpus being searched.
-        RetrievalDocument,
-        /// Specifies the given text will be used for STS.
-        SemanticSimilarity,
-        /// Specifies that the given text will be classified.
-        Classification,
-        /// Specifies that the embeddings will be used for clustering.
-        Clustering,
-        /// Specifies that the given text will be used for question answering.
-        QuestionAnswering,
-        /// Specifies that the given text will be used for fact verification.
-        FactVerification,
-    }
-
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct EmbeddingResponse {
         pub embeddings: Vec<EmbeddingValues>,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct EmbeddingValues {
+        #[serde(default)]
         pub values: Vec<serde_json::Number>,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_model_default_ndims_lookup() {
-        assert_eq!(model_default_ndims(EMBEDDING_001), Some(3072));
-        assert_eq!(model_default_ndims(EMBEDDING_004), Some(768));
-        assert_eq!(model_default_ndims("unknown-model"), None);
-    }
-
-    #[test]
-    fn test_make_resolves_default_dims() {
-        let client = Client::new("test_key").unwrap();
-
-        // EMBEDDING_001 defaults to 3072
-        let model =
-            <EmbeddingModel as embeddings::EmbeddingModel>::make(&client, EMBEDDING_001, None);
-        assert_eq!(embeddings::EmbeddingModel::ndims(&model), 3072);
-
-        // EMBEDDING_004 defaults to 768
-        let model =
-            <EmbeddingModel as embeddings::EmbeddingModel>::make(&client, EMBEDDING_004, None);
-        assert_eq!(embeddings::EmbeddingModel::ndims(&model), 768);
-
-        // Unknown model falls back to 768
-        let model = <EmbeddingModel as embeddings::EmbeddingModel>::make(
-            &client,
-            "some-future-model",
-            None,
-        );
-        assert_eq!(embeddings::EmbeddingModel::ndims(&model), 768);
-    }
-
-    #[test]
-    fn test_make_respects_explicit_dims() {
-        let client = Client::new("test_key").unwrap();
-
-        let model =
-            <EmbeddingModel as embeddings::EmbeddingModel>::make(&client, EMBEDDING_001, Some(256));
-        assert_eq!(embeddings::EmbeddingModel::ndims(&model), 256);
-    }
-
-    #[test]
-    fn test_new_uses_provided_ndims() {
-        let client = Client::new("test_key").unwrap();
-
-        let model = EmbeddingModel::new(client, EMBEDDING_001, 512);
-        assert_eq!(embeddings::EmbeddingModel::ndims(&model), 512);
+impl super::GeminiConfig {
+    /// The `batchEmbedContents` embedding wire. `ndims` defaults from the
+    /// model identifier.
+    pub(crate) fn embedding(&self, model: impl Into<String>, ndims: Option<usize>) -> Embeddings {
+        Embeddings::new(self.clone(), model, ndims)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,7 +1,5 @@
 //! Hugging Face context smoke test.
 
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::Prompt;
 use rig::providers::huggingface;
 
 use crate::support::{CONTEXT_DOCS, CONTEXT_PROMPT, assert_contains_any_case_insensitive};
@@ -9,13 +7,13 @@ use crate::support::{CONTEXT_DOCS, CONTEXT_PROMPT, assert_contains_any_case_inse
 #[tokio::test]
 #[ignore = "requires HUGGINGFACE_API_KEY"]
 async fn context_smoke() {
-    let client = huggingface::Client::from_env().expect("client should build");
+    let provider = huggingface::from_env().expect("config should build from env");
     let agent = CONTEXT_DOCS
         .iter()
         .copied()
         .fold(
-            client.agent("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"),
-            |builder, doc| builder.context(doc),
+            rig::AgentBuilder::new(provider.completion("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B")),
+            rig::AgentBuilder::context,
         )
         .build();
 
@@ -25,7 +23,7 @@ async fn context_smoke() {
         .expect("context prompt should succeed");
 
     assert_contains_any_case_insensitive(
-        &response,
+        &response.output(),
         &[
             "ancient tool",
             "farming tool",

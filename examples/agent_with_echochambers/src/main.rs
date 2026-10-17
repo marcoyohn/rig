@@ -2,9 +2,8 @@ use anyhow::Result;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rig::prelude::*;
 use rig::{
-    completion::ToolDefinition,
     integrations::cli_chatbot::ChatBotBuilder,
-    providers::openai::{self, Client},
+    providers::openai::{self, OpenAI},
     tool::Tool,
 };
 use serde::{Deserialize, Serialize};
@@ -52,40 +51,44 @@ impl Tool for SendMessage {
     type Error = EchoChamberError;
     type Args = SendMessageArgs;
     type Output = serde_json::Value;
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "send_message".to_string(),
-            description: "Send a message to a specified EchoChambers room".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": "The message content to send"
-                    },
-                    "room_id": {
-                        "type": "string",
-                        "description": "The ID of the room to send the message to"
-                    },
-                    "sender": {
-                        "type": "object",
-                        "properties": {
-                            "username": {
-                                "type": "string",
-                                "description": "Username of the sender"
-                            },
-                            "model": {
-                                "type": "string",
-                                "description": "Model identifier of the sender"
-                            }
+    fn description(&self) -> String {
+        "Send a message to a specified EchoChambers room".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The message content to send"
+                },
+                "room_id": {
+                    "type": "string",
+                    "description": "The ID of the room to send the message to"
+                },
+                "sender": {
+                    "type": "object",
+                    "properties": {
+                        "username": {
+                            "type": "string",
+                            "description": "Username of the sender"
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Model identifier of the sender"
                         }
                     }
                 }
-            }),
-        }
+            }
+        })
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let client = reqwest::Client::new();
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -138,27 +141,31 @@ impl Tool for GetHistory {
     type Error = EchoChamberError;
     type Args = GetHistoryArgs;
     type Output = serde_json::Value;
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "get_history".to_string(),
-            description: "Retrieve message history from a specified room".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "room_id": {
-                        "type": "string",
-                        "description": "The ID of the room to get history from"
-                    },
-                    "limit": {
-                        "type": "number",
-                        "description": "Optional limit on number of messages to retrieve"
-                    }
-                }
-            }),
-        }
+    fn description(&self) -> String {
+        "Retrieve message history from a specified room".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "room_id": {
+                    "type": "string",
+                    "description": "The ID of the room to get history from"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Optional limit on number of messages to retrieve"
+                }
+            }
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let client = reqwest::Client::new();
         let mut url = format!("https://echochambers.ai/api/rooms/{}/history", args.room_id);
         if let Some(limit) = args.limit {
@@ -187,23 +194,27 @@ impl Tool for GetRoomMetrics {
     type Args = GetMetricsArgs;
     type Output = serde_json::Value;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "get_room_metrics".to_string(),
-            description: "Retrieve overall metrics for a room".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "room_id": {
-                        "type": "string",
-                        "description": "The ID of the room to get metrics for"
-                    }
-                }
-            }),
-        }
+    fn description(&self) -> String {
+        "Retrieve overall metrics for a room".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "room_id": {
+                    "type": "string",
+                    "description": "The ID of the room to get metrics for"
+                }
+            }
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let client = reqwest::Client::new();
         let response = client
             .get(format!(
@@ -228,22 +239,26 @@ impl Tool for GetAgentMetrics {
     type Error = EchoChamberError;
     type Args = GetMetricsArgs;
     type Output = serde_json::Value;
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "get_agent_metrics".to_string(),
-            description: "Retrieve metrics for agents in a room".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "room_id": {
-                        "type": "string",
-                        "description": "The ID of the room to get agent metrics for"
-                    }
-                }
-            }),
-        }
+    fn description(&self) -> String {
+        "Retrieve metrics for agents in a room".to_string()
     }
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "room_id": {
+                    "type": "string",
+                    "description": "The ID of the room to get agent metrics for"
+                }
+            }
+        })
+    }
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let client = reqwest::Client::new();
         let response = client
             .get(format!(
@@ -268,22 +283,26 @@ impl Tool for GetMetricsHistory {
     type Error = EchoChamberError;
     type Args = GetMetricsArgs;
     type Output = serde_json::Value;
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "get_metrics_history".to_string(),
-            description: "Retrieve historical metrics for a room".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "room_id": {
-                        "type": "string",
-                        "description": "The ID of the room to get metrics history for"
-                    }
-                }
-            }),
-        }
+    fn description(&self) -> String {
+        "Retrieve historical metrics for a room".to_string()
     }
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "room_id": {
+                    "type": "string",
+                    "description": "The ID of the room to get metrics history for"
+                }
+            }
+        })
+    }
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let client = reqwest::Client::new();
         let response = client
             .get(format!(
@@ -305,12 +324,11 @@ async fn main() -> Result<(), anyhow::Error> {
     // Get API keys from environment
     let echochambers_api_key = env::var("ECHOCHAMBERS_API_KEY")?;
 
-    // Create OpenAI client
-    let openai_client = Client::from_env()?;
+    // The OpenAI client, from `OPENAI_API_KEY`.
+    let openai_client = OpenAI::from_env()?;
 
     // Create agent with all tools
-    let echochambers_agent = openai_client
-        .agent(openai::GPT_4O)
+    let echochambers_agent = AgentBuilder::new(openai_client.completion(openai::GPT_4O))
         .preamble(
             "You are an assistant designed to help users interact with EchoChambers rooms.
             You can send messages, retrieve message history, and analyze various metrics.

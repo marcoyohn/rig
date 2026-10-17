@@ -6,6 +6,76 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.44.0](https://github.com/0xPlaygrounds/rig/compare/rig-s3vectors-v0.43.0...rig-s3vectors-v0.44.0) - 2026-10-07
+
+### Other
+
+- *(vector_store)* [**breaking**] named VectorStoreIndex search results ([#2688](https://github.com/0xPlaygrounds/rig/pull/2688)) (by [gold-silver-copper](https://github.com/gold-silver-copper))
+- *(vector_store)* [**breaking**] tighten the VectorSearchRequest surface ([#2683](https://github.com/0xPlaygrounds/rig/pull/2683)) (by [gold-silver-copper](https://github.com/gold-silver-copper))
+
+### Contributors
+
+* [gold-silver-copper](https://github.com/gold-silver-copper)
+## [0.43.0](https://github.com/0xPlaygrounds/rig/compare/rig-s3vectors-v0.42.0...rig-s3vectors-v0.43.0) - 2026-09-30
+
+### Added
+
+- [**breaking**] the effect-bus critical path — one protocol, one channel, typed views ([#2443](https://github.com/0xPlaygrounds/rig/pull/2443)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2443
+- [**breaking**] rig-reqwest — cut the bundled transport into its own crate; rig-core has no default transport and no reqwest/tokio ([#2397](https://github.com/0xPlaygrounds/rig/pull/2397)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2397
+- [**breaking**] finish the type-erasure sweep — normalize transcription/image/audio responses, move construction off every model trait, erase the embedding model in vector stores ([#2385](https://github.com/0xPlaygrounds/rig/pull/2385)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2385
+
+### Fixed
+
+- pre-0.43 release fixes (docs.rs, opt-in rig::cassette, rust-version, READMEs) ([#2638](https://github.com/0xPlaygrounds/rig/pull/2638)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2638
+- publish the facade, not the repository — and stop asking for dependencies nothing uses ([#2563](https://github.com/0xPlaygrounds/rig/pull/2563)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2563
+- honour the WASM bounds in every vector store ([#2545](https://github.com/0xPlaygrounds/rig/pull/2545)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2545
+
+### Other
+
+- [**breaking**] provider clients own their transport; conversations use plain values ([#2611](https://github.com/0xPlaygrounds/rig/pull/2611)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2611
+- finish the comment cleanup across the workspace ([#2575](https://github.com/0xPlaygrounds/rig/pull/2575)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2575
+- Unify every provider onto one wire model ([#2538](https://github.com/0xPlaygrounds/rig/pull/2538)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2538
+- [**breaking**] retire five clippy heuristics and unbox everything they made us write ([#2536](https://github.com/0xPlaygrounds/rig/pull/2536)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2536
+- move every inline test module to a sibling file ([#2433](https://github.com/0xPlaygrounds/rig/pull/2433)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2433
+- idiomatic Rust sweep across the workspace ([#2409](https://github.com/0xPlaygrounds/rig/pull/2409)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2409
+- [**breaking**] ownership audit round 2 — borrow-shaped telemetry getters, slice-shaped embed seams, Copy usage types, dead Default/Debug transport bounds ([#2392](https://github.com/0xPlaygrounds/rig/pull/2392)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2392
+- [**breaking**] ownership audit — borrow-shaped signatures, dead clones, clone_from in accumulators, minimal bounds ([#2391](https://github.com/0xPlaygrounds/rig/pull/2391)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2391
+
+### Contributors
+
+* [gold-silver-copper](https://github.com/gold-silver-copper)
+## [0.42.0](https://github.com/0xPlaygrounds/rig/compare/rig-s3vectors-v0.41.0...rig-s3vectors-v0.42.0) - 2026-08-16
+
+### Other
+
+- reconcile the changelogs and the migration guide with what actually merged ([#2353](https://github.com/0xPlaygrounds/rig/pull/2353)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2353
+- workspace-wide LOC consolidation pass 8 (net −1,353 production lines) ([#2320](https://github.com/0xPlaygrounds/rig/pull/2320)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2320
+- *(rig-core)* consolidate provider boilerplate ([#2317](https://github.com/0xPlaygrounds/rig/pull/2317)) (by [gold-silver-copper](https://github.com/gold-silver-copper))
+- workspace-wide LOC consolidation pass 7 (net −366 production lines) ([#2310](https://github.com/0xPlaygrounds/rig/pull/2310)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2310
+- workspace-wide LOC consolidation pass 6 (net −3,424 lines) ([#2308](https://github.com/0xPlaygrounds/rig/pull/2308)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2308
+- [**breaking**] `OneOrMany<T>` becomes `Vec<T>` — the fake is deleted, the enforcement moves ([#2273](https://github.com/0xPlaygrounds/rig/pull/2273)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2273
+
+### Contributors
+
+* [gold-silver-copper](https://github.com/gold-silver-copper)
+
+### Removed
+
+- *(filter)* [**breaking**] the exported `document!` macro. It was `#[macro_export]`ed from the crate root to spell `aws_smithy_types::Document` filter literals; `S3SearchFilter`'s constructors now build those values through the private `document_object`/`document_comparison` helpers, and there is no public replacement
+
+### Changed
+
+- *(vector-store)* [**breaking**] `InsertDocuments::insert_documents` takes `Vec<(Doc, Vec<Embedding>)>` instead of `Vec<(Doc, OneOrMany<Embedding>)>`, following rig-core's removal of the non-empty container — a source-only signature change; serialized embeddings are unchanged
+
+## [0.41.0](https://github.com/0xPlaygrounds/rig/compare/rig-s3vectors-v0.40.0...rig-s3vectors-v0.41.0) - 2026-07-28
+
+### Fixed
+
+- *(aws)* remove legacy rustls connector ([#2152](https://github.com/0xPlaygrounds/rig/pull/2152)) (by [gold-silver-copper](https://github.com/gold-silver-copper))
+
+### Contributors
+
+* [gold-silver-copper](https://github.com/gold-silver-copper)
 ## [0.38.1](https://github.com/0xPlaygrounds/rig/compare/rig-s3vectors-v0.2.7...rig-s3vectors-v0.38.1) - 2026-06-02
 
 ### Other

@@ -1,13 +1,12 @@
 //! Migrated from `examples/agent_with_mira.rs`.
 
-use rig::client::ProviderClient;
 use rig::providers::mira;
 
 #[tokio::test]
 #[ignore = "requires MIRA_API_KEY"]
 async fn list_models_smoke() {
-    let client = mira::Client::from_env().expect("client should build");
-    let models = client
+    let provider = mira::from_env().expect("config should build from env");
+    let models = provider
         .list_models()
         .await
         .expect("listing models should succeed");

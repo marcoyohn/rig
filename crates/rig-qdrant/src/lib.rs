@@ -1,11 +1,8 @@
-//! Qdrant vector store integration for Rig.
+//! Qdrant vector store for Rig.
 //!
-//! This crate provides [`QdrantVectorStore`], a Rig vector store index backed
-//! by Qdrant collections. It supports dense vector search and Qdrant filter
-//! expressions through [`QdrantFilter`].
-//!
-//! The root `rig` facade re-exports this crate as `rig::qdrant` when the
-//! `qdrant` feature is enabled.
+//! [`QdrantVectorStore`] runs dense vector search against a Qdrant collection,
+//! optionally narrowed by a [`QdrantFilter`]. The `rig` facade re-exports this
+//! crate as `rig::qdrant` under the `qdrant` feature.
 
 mod filter;
 
@@ -18,40 +15,38 @@ use qdrant_client::{
     },
 };
 use rig_core::{
-    Embed, OneOrMany,
-    embeddings::{Embedding, EmbeddingModel},
+    Embed,
+    embeddings::Embedding,
     vector_store::{
-        InsertDocuments, VectorStoreError, VectorStoreIndex, request::VectorSearchRequest,
+        InsertDocuments, VectorSearchIdResult, VectorSearchResult, VectorStoreError,
+        VectorStoreIndex, request::VectorSearchRequest,
     },
+    wasm_compat::WasmCompatSend,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-/// Represents a vector store implementation using Qdrant - <https://qdrant.tech/> as the backend.
-pub struct QdrantVectorStore<M: EmbeddingModel> {
-    /// Model used to generate embeddings for the vector store
-    model: M,
-    /// Client instance for Qdrant server communication
+/// Vector store backed by a Qdrant collection.
+///
+/// Queries are embedded with the same model that populated the collection,
+/// so results are meaningless under another model.
+pub struct QdrantVectorStore {
+    model: rig_core::DynModel<rig_core::operation::Embedding>,
     client: Qdrant,
-    /// Default search parameters
     query_params: QueryPoints,
 }
 
-impl<M> QdrantVectorStore<M>
-where
-    M: EmbeddingModel,
-{
-    /// Creates a new instance of `QdrantVectorStore`.
-    ///
-    /// # Arguments
-    /// * `client` - Qdrant client instance
-    /// * `model` - Embedding model instance
-    /// * `query_params` - Search parameters for vector queries
-    ///   Reference: <https://api.qdrant.tech/v-1-12-x/api-reference/search/query-points>
-    pub fn new(client: Qdrant, model: M, query_params: QueryPoints) -> Self {
+impl QdrantVectorStore {
+    /// Creates a store over the collection named by `query_params`. Each search
+    /// clones `query_params` and overrides its query, limit, threshold, and filter.
+    pub fn new(
+        client: Qdrant,
+        model: impl Into<rig_core::DynModel<rig_core::operation::Embedding>>,
+        query_params: QueryPoints,
+    ) -> Self {
         Self {
             client,
-            model,
+            model: model.into(),
             query_params,
         }
     }
@@ -60,13 +55,12 @@ where
         &self.client
     }
 
-    /// Embed query based on `QdrantVectorStore` model and modify the vector in the required format.
+    /// Embeds the query and narrows each component to `f32` for Qdrant.
     async fn generate_query_vector(&self, query: &str) -> Result<Vec<f32>, VectorStoreError> {
         let embedding = self.model.embed_text(query).await?;
         Ok(embedding.vec.iter().map(|&x| x as f32).collect())
     }
 
-    /// Fill in query parameters with the given query and limit.
     fn prepare_query_params(
         &self,
         query: Option<Query>,
@@ -81,22 +75,50 @@ where
         params.filter = filter;
         params
     }
+
+    /// Runs the search and returns scored points. A query preset in
+    /// `query_params` takes precedence over embedding the request text.
+    async fn run_query(
+        &self,
+        req: &VectorSearchRequest<QdrantFilter>,
+    ) -> Result<Vec<qdrant_client::qdrant::ScoredPoint>, VectorStoreError> {
+        let query = match self.query_params.query {
+            Some(ref q) => Some(q.clone()),
+            None => Some(Query::new_nearest(
+                self.generate_query_vector(req.query()).await?,
+            )),
+        };
+
+        let filter = req
+            .filter()
+            .cloned()
+            .map(QdrantFilter::interpret)
+            .transpose()?
+            .flatten();
+
+        let params =
+            self.prepare_query_params(query, req.samples() as usize, req.threshold(), filter);
+
+        Ok(self
+            .client
+            .query(params)
+            .await
+            .map_err(VectorStoreError::datastore)?
+            .result)
+    }
 }
 
-impl<Model> InsertDocuments for QdrantVectorStore<Model>
-where
-    Model: EmbeddingModel + Send + Sync,
-{
-    async fn insert_documents<Doc: Serialize + Embed + Send>(
+impl InsertDocuments for QdrantVectorStore {
+    async fn insert_documents<Doc: Serialize + Embed + WasmCompatSend>(
         &self,
-        documents: Vec<(Doc, OneOrMany<Embedding>)>,
+        documents: Vec<(Doc, Vec<Embedding>)>,
     ) -> Result<(), VectorStoreError> {
         let collection_name = self.query_params.collection_name.clone();
 
         for (document, embeddings) in documents {
             let json_document = serde_json::to_value(&document)?;
-            let doc_as_payload = Payload::try_from(json_document)
-                .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
+            let doc_as_payload =
+                Payload::try_from(json_document).map_err(VectorStoreError::datastore)?;
 
             let embeddings_as_point_structs = embeddings
                 .into_iter()
@@ -113,116 +135,70 @@ where
 
             let request =
                 UpsertPointsBuilder::new(&collection_name, embeddings_as_point_structs).wait(true);
-            self.client.upsert_points(request).await.map_err(|err| {
-                VectorStoreError::DatastoreError(format!("Error while upserting: {err}").into())
-            })?;
+            self.client
+                .upsert_points(request)
+                .await
+                .map_err(VectorStoreError::datastore)?;
         }
 
         Ok(())
     }
 }
 
-/// Converts a `PointId` to its string representation.
+/// Renders a point id as a string, erroring when the id is absent.
 fn stringify_id(id: PointId) -> Result<String, VectorStoreError> {
     match id.point_id_options {
         Some(PointIdOptions::Num(num)) => Ok(num.to_string()),
-        Some(PointIdOptions::Uuid(uuid)) => Ok(uuid.to_string()),
-        None => Err(VectorStoreError::DatastoreError(
-            "Invalid point ID format".into(),
+        Some(PointIdOptions::Uuid(uuid)) => Ok(uuid),
+        None => Err(VectorStoreError::MissingIdError(
+            "Qdrant point carries no id".to_string(),
         )),
     }
 }
 
-impl<M> VectorStoreIndex for QdrantVectorStore<M>
-where
-    M: EmbeddingModel + std::marker::Sync + Send,
-{
+fn missing_point_id() -> VectorStoreError {
+    VectorStoreError::MissingIdError("Qdrant search result carries no point id".to_string())
+}
+
+impl VectorStoreIndex for QdrantVectorStore {
     type Filter = QdrantFilter;
 
-    /// Search for the top `n` nearest neighbors to the given query within the Qdrant vector store.
-    /// Returns a vector of tuples containing the score, ID, and payload of the nearest neighbors.
-    async fn top_n<T: for<'a> Deserialize<'a> + Send>(
+    /// Returns the nearest points with their payloads as documents. Errors when a point
+    /// lacks an id or its payload does not deserialize into `T`.
+    async fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         req: VectorSearchRequest<Self::Filter>,
-    ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
-        let query = match self.query_params.query {
-            Some(ref q) => Some(q.clone()),
-            None => Some(Query::new_nearest(
-                self.generate_query_vector(req.query()).await?,
-            )),
-        };
-
-        let filter = req
-            .filter()
-            .as_ref()
-            .cloned()
-            .map(QdrantFilter::interpret)
-            .transpose()?
-            .flatten();
-
-        let params =
-            self.prepare_query_params(query, req.samples() as usize, req.threshold(), filter);
-
-        let result = self
-            .client
-            .query(params)
-            .await
-            .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
-
-        result
-            .result
+    ) -> Result<Vec<VectorSearchResult<T>>, VectorStoreError> {
+        self.run_query(&req)
+            .await?
             .into_iter()
             .map(|item| {
-                let id =
-                    stringify_id(item.id.ok_or_else(|| {
-                        VectorStoreError::DatastoreError("Missing point ID".into())
-                    })?)?;
+                let id = stringify_id(item.id.ok_or_else(missing_point_id)?)?;
                 let score = item.score as f64;
                 let payload = serde_json::from_value(serde_json::to_value(item.payload)?)?;
-                Ok((score, id, payload))
+                Ok(VectorSearchResult {
+                    score,
+                    id,
+                    document: payload,
+                })
             })
             .collect()
     }
 
-    /// Search for the top `n` nearest neighbors to the given query within the Qdrant vector store.
-    /// Returns a vector of tuples containing the score and ID of the nearest neighbors.
+    /// Like `top_n` but returns only scores and ids, without deserializing payloads.
     async fn top_n_ids(
         &self,
         req: VectorSearchRequest<Self::Filter>,
-    ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-        let query = match self.query_params.query {
-            Some(ref q) => Some(q.clone()),
-            None => Some(Query::new_nearest(
-                self.generate_query_vector(req.query()).await?,
-            )),
-        };
-
-        let filter = req
-            .filter()
-            .as_ref()
-            .cloned()
-            .map(QdrantFilter::interpret)
-            .transpose()?
-            .flatten();
-
-        let params =
-            self.prepare_query_params(query, req.samples() as usize, req.threshold(), filter);
-
-        let points = self
-            .client
-            .query(params)
-            .await
-            .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?
-            .result;
-
-        points
+    ) -> Result<Vec<VectorSearchIdResult>, VectorStoreError> {
+        self.run_query(&req)
+            .await?
             .into_iter()
             .map(|point| {
-                let id =
-                    stringify_id(point.id.ok_or_else(|| {
-                        VectorStoreError::DatastoreError("Missing point ID".into())
-                    })?)?;
-                Ok((point.score as f64, id))
+                let id = stringify_id(point.id.ok_or_else(missing_point_id)?)?;
+                Ok(VectorSearchIdResult {
+                    score: point.score as f64,
+                    id,
+                })
             })
             .collect()
     }

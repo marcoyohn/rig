@@ -3,10 +3,9 @@
 //! Run it to see a classifier agent choose which second prompt should run.
 
 use anyhow::{Result, bail};
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::Prompt;
-use rig::providers::openai;
-use rig::providers::openai::client::Client;
+use rig::operation::Completion;
+use rig::prelude::*;
+use rig::providers::openai::{self, OpenAI};
 
 const INPUT_PROMPT: &str = "Sheep can self-medicate";
 const ROUTER_PREAMBLE: &str = "
@@ -14,19 +13,12 @@ const ROUTER_PREAMBLE: &str = "
     Return only the category.
 ";
 
-fn build_router_agent(
-    client: &Client,
-) -> rig::agent::Agent<openai::responses_api::ResponsesCompletionModel> {
-    client
-        .agent(openai::GPT_4)
-        .preamble(ROUTER_PREAMBLE)
-        .build()
+fn build_router_agent(model: impl Into<DynModel<Completion>>) -> rig::agent::Agent {
+    AgentBuilder::new(model).preamble(ROUTER_PREAMBLE).build()
 }
 
-fn build_response_agent(
-    client: &Client,
-) -> rig::agent::Agent<openai::responses_api::ResponsesCompletionModel> {
-    client.agent(openai::GPT_4).build()
+fn build_response_agent(model: impl Into<DynModel<Completion>>) -> rig::agent::Agent {
+    AgentBuilder::new(model).build()
 }
 
 fn follow_up_prompt(category: &str) -> Result<&'static str> {
@@ -40,10 +32,14 @@ fn follow_up_prompt(category: &str) -> Result<&'static str> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Client::from_env()?;
-    let category = build_router_agent(&client).prompt(INPUT_PROMPT).await?;
+    // One model serves both agents: erase it once, clone the handle.
+    let gpt4 = OpenAI::from_env()?.completion(openai::GPT_4).erase();
+    let category = build_router_agent(gpt4.clone())
+        .prompt(INPUT_PROMPT)
+        .await?
+        .output();
     let follow_up = follow_up_prompt(category.trim())?;
-    let response = build_response_agent(&client).prompt(follow_up).await?;
+    let response = build_response_agent(gpt4).prompt(follow_up).await?.output();
 
     println!("Classifier chose: {}", category.trim());
     println!("Follow-up prompt: {follow_up}");

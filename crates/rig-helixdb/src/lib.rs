@@ -1,22 +1,21 @@
-//! HelixDB vector store integration for Rig.
+//! HelixDB vector store for Rig.
 //!
-//! This crate provides a small HTTP client for HelixDB query endpoints and a
-//! [`HelixDBVectorStore`] implementation of Rig's vector store traits.
-//!
-//! The root `rig` facade re-exports this crate as `rig::helixdb` when the
-//! `helixdb` feature is enabled.
-
-use std::future::Future;
+//! [`HelixDBVectorStore`] runs the `VectorSearch` and `InsertVector` HelixDB
+//! queries through the [`HelixDB`] HTTP client. The `rig` facade re-exports
+//! this crate as `rig::helixdb` under the `helixdb` feature.
 
 use reqwest::{Client, StatusCode};
 use rig_core::{
-    embeddings::EmbeddingModel,
-    vector_store::{InsertDocuments, VectorStoreError, VectorStoreIndex, request::Filter},
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
+    vector_store::{
+        InsertDocuments, VectorSearchIdResult, VectorSearchResult, VectorStoreError,
+        VectorStoreIndex, request::Filter,
+    },
+    wasm_compat::WasmCompatSend,
 };
 use serde::{Deserialize, Serialize};
 
-/// A minimal HelixDB HTTP client for running generated Helix queries.
+/// HTTP client posting to HelixDB query endpoints, authenticating with an
+/// `x-api-key` header when an API key is configured.
 #[derive(Debug, Clone)]
 pub struct HelixDB {
     port: Option<u16>,
@@ -26,7 +25,7 @@ pub struct HelixDB {
 }
 
 impl HelixDB {
-    /// Creates a HelixDB client using the default reqwest client.
+    /// Creates a client, defaulting the endpoint to `http://localhost`.
     pub fn new(endpoint: Option<&str>, port: Option<u16>, api_key: Option<&str>) -> Self {
         Self::with_client(endpoint, port, api_key, Client::new())
     }
@@ -62,28 +61,11 @@ pub enum HelixError {
     },
 }
 
-/// Client interface used by [`HelixDBVectorStore`] to execute HelixDB queries.
-pub trait HelixDBClient {
-    /// Error type returned by this client.
-    type Err: std::error::Error;
-
-    /// Sends a query payload to a HelixDB endpoint and decodes the response body.
-    fn query<T, R>(
-        &self,
-        endpoint: &str,
-        data: &T,
-    ) -> impl Future<Output = Result<R, Self::Err>> + WasmCompatSend
+impl HelixDB {
+    /// Posts `data` to the named HelixDB query and decodes its response.
+    pub async fn query<T, R>(&self, endpoint: &str, data: &T) -> Result<R, HelixError>
     where
-        T: Serialize + WasmCompatSync,
-        R: for<'de> Deserialize<'de>;
-}
-
-impl HelixDBClient for HelixDB {
-    type Err = HelixError;
-
-    async fn query<T, R>(&self, endpoint: &str, data: &T) -> Result<R, HelixError>
-    where
-        T: Serialize + WasmCompatSync,
+        T: Serialize,
         R: for<'de> Deserialize<'de>,
     {
         let port = self.port.map(|port| format!(":{port}")).unwrap_or_default();
@@ -101,59 +83,42 @@ impl HelixDBClient for HelixDB {
             code => match response.text().await {
                 Ok(details) => Err(HelixError::RemoteError { details }),
                 Err(_) => Err(HelixError::RemoteError {
-                    details: code
-                        .canonical_reason()
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| format!("unknown error with code: {code}")),
+                    details: code.canonical_reason().map_or_else(
+                        || format!("unknown error with code: {code}"),
+                        ToString::to_string,
+                    ),
                 }),
             },
         }
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-fn datastore_error<E>(error: E) -> VectorStoreError
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    VectorStoreError::DatastoreError(Box::new(error))
-}
-
-#[cfg(target_family = "wasm")]
-fn datastore_error<E>(error: E) -> VectorStoreError
-where
-    E: std::error::Error + 'static,
-{
-    VectorStoreError::DatastoreError(Box::new(error))
-}
-
-/// A client for easily carrying out Rig-related vector store operations.
+/// Vector store backed by HelixDB queries.
 ///
-/// If you are unsure what type to use for the client, [`HelixDB`] is the typical default.
+/// Queries are embedded with the same model that populated the store, so
+/// results are meaningless under another model.
 ///
-/// Usage:
 /// ```no_run
-/// use rig_core::client::{EmbeddingsClient, ProviderClient};
+/// use rig_core::providers::openai::OpenAI;
 /// use rig_helixdb::{HelixDB, HelixDBVectorStore};
 ///
 /// # fn example() -> anyhow::Result<()> {
-/// let openai_model = rig_core::providers::openai::Client::from_env()?
-///     .embedding_model("text-embedding-ada-002");
+/// let openai_model = OpenAI::from_env()?.embedding("text-embedding-ada-002", None);
 ///
 /// let helixdb_client = HelixDB::new(None, Some(6969), None);
-/// let vector_store = HelixDBVectorStore::new(helixdb_client, openai_model.clone());
+/// let vector_store = HelixDBVectorStore::new(helixdb_client, openai_model);
 /// # let _ = vector_store;
 /// # Ok(())
 /// # }
 /// ```
-pub struct HelixDBVectorStore<C, E> {
-    client: C,
-    model: E,
+pub struct HelixDBVectorStore {
+    client: HelixDB,
+    model: rig_core::DynModel<rig_core::operation::Embedding>,
 }
 
 pub type HelixDBFilter = Filter<serde_json::Value>;
 
-/// The result of a query. Only used internally as this is a representative type required for the relevant HelixDB query (`VectorSearch`).
+/// One `VectorSearch` hit, whose `score` is a cosine distance.
 #[derive(Deserialize, Serialize, Clone, Debug)]
 struct QueryResult {
     id: String,
@@ -162,7 +127,7 @@ struct QueryResult {
     json_payload: String,
 }
 
-/// An input query. Only used internally as this is a representative type required for the relevant HelixDB query (`VectorSearch`).
+/// `VectorSearch` request body.
 #[derive(Deserialize, Serialize, Clone, Debug)]
 struct QueryInput {
     vector: Vec<f64>,
@@ -170,42 +135,57 @@ struct QueryInput {
     threshold: f64,
 }
 
-impl QueryInput {
-    /// Makes a new instance of `QueryInput`.
-    pub(crate) fn new(vector: Vec<f64>, limit: u64, threshold: f64) -> Self {
-        Self {
-            vector,
-            limit,
-            threshold,
-        }
-    }
+/// `VectorSearch` response body.
+#[derive(Serialize, Deserialize, Debug)]
+struct VecResult {
+    vec_docs: Vec<QueryResult>,
 }
 
-impl<C, E> HelixDBVectorStore<C, E>
-where
-    C: HelixDBClient + WasmCompatSend,
-    E: EmbeddingModel,
-{
+impl HelixDBVectorStore {
     /// Creates a new HelixDB vector store.
-    pub fn new(client: C, model: E) -> Self {
-        Self { client, model }
+    pub fn new(
+        client: HelixDB,
+        model: impl Into<rig_core::DynModel<rig_core::operation::Embedding>>,
+    ) -> Self {
+        Self {
+            client,
+            model: model.into(),
+        }
     }
 
     /// Returns the underlying HelixDB client.
-    pub fn client(&self) -> &C {
+    pub fn client(&self) -> &HelixDB {
         &self.client
+    }
+
+    /// Embeds the query and runs `VectorSearch`. An absent request threshold is
+    /// sent as zero.
+    async fn vector_search(
+        &self,
+        req: &rig_core::vector_store::VectorSearchRequest<HelixDBFilter>,
+    ) -> Result<Vec<QueryResult>, VectorStoreError> {
+        let vector = self.model.embed_text(req.query()).await?.vec;
+
+        let query_input = QueryInput {
+            vector,
+            limit: req.samples(),
+            threshold: req.threshold().unwrap_or_default(),
+        };
+
+        let result: VecResult = self
+            .client
+            .query::<QueryInput, VecResult>("VectorSearch", &query_input)
+            .await
+            .map_err(VectorStoreError::datastore)?;
+
+        Ok(result.vec_docs)
     }
 }
 
-impl<C, E> InsertDocuments for HelixDBVectorStore<C, E>
-where
-    C: HelixDBClient + WasmCompatSend + WasmCompatSync,
-    C::Err: std::error::Error + WasmCompatSend + WasmCompatSync + 'static,
-    E: EmbeddingModel + WasmCompatSend + WasmCompatSync,
-{
+impl InsertDocuments for HelixDBVectorStore {
     async fn insert_documents<Doc: Serialize + rig_core::Embed + WasmCompatSend>(
         &self,
-        documents: Vec<(Doc, rig_core::OneOrMany<rig_core::embeddings::Embedding>)>,
+        documents: Vec<(Doc, Vec<rig_core::embeddings::Embedding>)>,
     ) -> Result<(), VectorStoreError> {
         #[derive(Serialize, Deserialize, Clone, Debug, Default)]
         struct QueryInput {
@@ -219,117 +199,84 @@ where
             doc: String,
         }
 
-        for (document, embeddings) in documents {
-            let json_document = serde_json::to_value(&document)?;
-            let json_document_as_string = serde_json::to_string(&json_document)?;
+        let queries =
+            rig_core::vector_store::flatten_embedded(documents, |json_document, embedding| {
+                Ok(QueryInput {
+                    vector: embedding.vec,
+                    doc: embedding.document,
+                    json_payload: serde_json::to_string(json_document)?,
+                })
+            })?;
 
-            for embedding in embeddings {
-                let embedded_text = embedding.document;
-                let vector: Vec<f64> = embedding.vec;
-
-                let query = QueryInput {
-                    vector,
-                    doc: embedded_text,
-                    json_payload: json_document_as_string.clone(),
-                };
-
-                self.client
-                    .query::<QueryInput, QueryOutput>("InsertVector", &query)
-                    .await
-                    .map_err(datastore_error)?;
-            }
+        for query in queries {
+            self.client
+                .query::<QueryInput, QueryOutput>("InsertVector", &query)
+                .await
+                .map_err(VectorStoreError::datastore)?;
         }
         Ok(())
     }
 }
 
-impl<C, E> VectorStoreIndex for HelixDBVectorStore<C, E>
-where
-    C: HelixDBClient + WasmCompatSend + WasmCompatSync,
-    C::Err: std::error::Error + WasmCompatSend + WasmCompatSync + 'static,
-    E: EmbeddingModel + WasmCompatSend + WasmCompatSync,
-{
+impl VectorStoreIndex for HelixDBVectorStore {
     type Filter = HelixDBFilter;
 
+    // HelixDB reports cosine distance; `-(score - 1)` converts it to similarity.
+
+    /// Returns matches scored by cosine similarity, discarding hits
+    /// below the threshold or rejected by the request filter, which is evaluated
+    /// client-side against each stored JSON payload.
     async fn top_n<T: for<'a> serde::Deserialize<'a> + WasmCompatSend>(
         &self,
         req: rig_core::vector_store::VectorSearchRequest<HelixDBFilter>,
-    ) -> Result<Vec<(f64, String, T)>, rig_core::vector_store::VectorStoreError> {
-        let vector = self.model.embed_text(req.query()).await?.vec;
-
-        let query_input =
-            QueryInput::new(vector, req.samples(), req.threshold().unwrap_or_default());
-
-        #[derive(Serialize, Deserialize, Debug)]
-        struct VecResult {
-            vec_docs: Vec<QueryResult>,
-        }
-
-        let result: VecResult = self
-            .client
-            .query::<QueryInput, VecResult>("VectorSearch", &query_input)
-            .await
-            .map_err(datastore_error)?;
-
-        let docs = result
-            .vec_docs
+    ) -> Result<Vec<VectorSearchResult<T>>, VectorStoreError> {
+        let docs = self
+            .vector_search(&req)
+            .await?
             .into_iter()
             .filter(|x| {
-                let is_threshold = req
-                    .threshold()
-                    .map(|t| -(x.score - 1.) >= t)
-                    .unwrap_or(true);
+                let is_threshold = req.threshold().is_none_or(|t| -(x.score - 1.) >= t);
 
                 is_threshold
                     && req
                         .filter()
-                        .clone()
                         .zip(serde_json::from_str(&x.json_payload).ok())
-                        .map(
-                            |(filter, payload): (Filter<serde_json::Value>, serde_json::Value)| {
+                        .is_none_or(
+                            |(filter, payload): (&Filter<serde_json::Value>, serde_json::Value)| {
                                 filter.satisfies(&payload)
                             },
                         )
-                        .unwrap_or(true)
             })
             .map(|x| {
                 let doc: T = serde_json::from_str(&x.json_payload)?;
 
-                // HelixDB gives us the cosine distance, so we need to use `-(cosine_dist - 1)` to get the cosine similarity score.
-                Ok((-(x.score - 1.), x.id, doc))
+                Ok(VectorSearchResult {
+                    score: -(x.score - 1.),
+                    id: x.id,
+                    document: doc,
+                })
             })
             .collect::<Result<Vec<_>, VectorStoreError>>()?;
 
         Ok(docs)
     }
 
+    /// Like `top_n` but returns only scores and ids, and ignores the
+    /// request filter.
     async fn top_n_ids(
         &self,
         req: rig_core::vector_store::VectorSearchRequest<HelixDBFilter>,
-    ) -> Result<Vec<(f64, String)>, rig_core::vector_store::VectorStoreError> {
-        let vector = self.model.embed_text(req.query()).await?.vec;
-
-        let query_input =
-            QueryInput::new(vector, req.samples(), req.threshold().unwrap_or_default());
-
-        #[derive(Serialize, Deserialize, Debug)]
-        struct VecResult {
-            vec_docs: Vec<QueryResult>,
-        }
-
-        let result: VecResult = self
-            .client
-            .query::<QueryInput, VecResult>("VectorSearch", &query_input)
-            .await
-            .map_err(datastore_error)?;
-
-        // HelixDB gives us the cosine distance, so we need to use `-(cosine_dist - 1)` to get the cosine similarity score.
-        let docs = result
-            .vec_docs
+    ) -> Result<Vec<VectorSearchIdResult>, VectorStoreError> {
+        let docs = self
+            .vector_search(&req)
+            .await?
             .into_iter()
             .filter(|x| -(x.score - 1.) >= req.threshold().unwrap_or_default())
-            .map(|x| Ok((-(x.score - 1.), x.id)))
-            .collect::<Result<Vec<_>, VectorStoreError>>()?;
+            .map(|x| VectorSearchIdResult {
+                score: -(x.score - 1.),
+                id: x.id,
+            })
+            .collect();
 
         Ok(docs)
     }

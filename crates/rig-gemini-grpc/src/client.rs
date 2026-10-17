@@ -1,130 +1,129 @@
-use rig_core::prelude::*;
+//! The Gemini gRPC transport: a tonic channel with the API-key interceptor.
+//!
+//! ```no_run
+//! use rig_gemini_grpc::{GeminiGrpc, GeminiGrpcError};
+//!
+//! # async fn example() -> Result<(), GeminiGrpcError> {
+//! let transport = GeminiGrpc::from_env().await?;
+//! # let _ = transport;
+//! # Ok(())
+//! # }
+//! ```
+
 use std::fmt::Debug;
-use tonic::metadata::MetadataValue;
-use tonic::service::Interceptor;
-use tonic::transport::{Channel, Endpoint};
-use tonic::{Request, Status};
+use tonic::metadata::errors::InvalidMetadataValue;
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use super::GenerativeServiceClient;
-use crate::completion::CompletionModel;
-use crate::embedding::EmbeddingModel;
+pub use crate::auth::ApiKeyInterceptor;
+use crate::completion::GenerateContent;
+use crate::embedding::Embeddings;
+use rig_core::Model;
+use rig_core::client::env::{self, EnvError};
+use rig_core::wire::Secret;
 
-// ================================================================
-// Google Gemini gRPC Client
-// ================================================================
 const GEMINI_GRPC_ENDPOINT: &str = "https://generativelanguage.googleapis.com";
+
+/// The variable [`GeminiGrpc::from_env`] reads the API key from.
+const GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
 
 /// User agent identifier for API tracking
 const RIG_GRPC_CLIENT_IDENTIFIER: &str = "rig-grpc/0.1.0";
 
+/// A [`GeminiGrpc`] transport could not be constructed.
+#[derive(Debug, thiserror::Error)]
+pub enum GeminiGrpcError {
+    /// The API key could not be read from the environment.
+    #[error(transparent)]
+    Env(#[from] EnvError),
+    /// The API key cannot be sent as gRPC metadata, for example because it
+    /// contains a control character.
+    #[error("the Gemini API key is not a valid gRPC metadata value")]
+    InvalidApiKey(#[source] InvalidMetadataValue),
+    /// TLS setup or the connection to the Gemini endpoint failed.
+    #[error("failed to connect to the Gemini gRPC endpoint")]
+    Transport(#[from] tonic::transport::Error),
+}
+
+/// The transport every Gemini gRPC wire is sent through. Clones share one
+/// channel.
 #[derive(Clone)]
-pub struct Client {
-    api_key: String,
+pub struct GeminiGrpc {
+    interceptor: ApiKeyInterceptor,
     channel: Channel,
 }
 
-impl Debug for Client {
+impl Debug for GeminiGrpc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Client")
+        f.debug_struct("GeminiGrpc")
             .field("api_key", &"******")
             .field("channel", &"Channel")
             .finish()
     }
 }
 
-// Interceptor to add API key and client identification to metadata
-#[derive(Clone)]
-pub struct ApiKeyInterceptor {
-    api_key: MetadataValue<tonic::metadata::Ascii>,
-    client_id: MetadataValue<tonic::metadata::Ascii>,
-}
-
-impl Interceptor for ApiKeyInterceptor {
-    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-        request
-            .metadata_mut()
-            .insert("x-goog-api-key", self.api_key.clone());
-        request
-            .metadata_mut()
-            .insert("x-goog-api-client", self.client_id.clone());
-        Ok(request)
-    }
-}
-
-impl Client {
-    /// Create a gRPC client with the given API key
-    pub async fn new(
-        api_key: impl Into<String>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let api_key = api_key.into();
-        let endpoint = Endpoint::from_static(GEMINI_GRPC_ENDPOINT).tls_config(
-            tonic::transport::ClientTlsConfig::new()
-                .with_webpki_roots()
-                .domain_name("generativelanguage.googleapis.com"),
-        )?;
-
-        let channel = endpoint.connect().await?;
-
-        Ok(Self { api_key, channel })
-    }
-
-    /// Get a gRPC client with API key interceptor
-    pub(crate) fn grpc_client(
-        &self,
-    ) -> Result<
-        GenerativeServiceClient<
-            tonic::service::interceptor::InterceptedService<Channel, ApiKeyInterceptor>,
-        >,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        let api_key = MetadataValue::try_from(&self.api_key)?;
-        let client_id = MetadataValue::try_from(RIG_GRPC_CLIENT_IDENTIFIER)?;
-        let interceptor = ApiKeyInterceptor { api_key, client_id };
-
-        Ok(GenerativeServiceClient::with_interceptor(
-            self.channel.clone(),
+impl GeminiGrpc {
+    /// Connect to the Gemini gRPC endpoint with `api_key`.
+    ///
+    /// Returns [`GeminiGrpcError::InvalidApiKey`] when the key cannot be sent
+    /// as gRPC metadata, before connecting, and [`GeminiGrpcError::Transport`]
+    /// when TLS setup or the connection fails.
+    pub async fn new(api_key: impl Into<Secret>) -> Result<Self, GeminiGrpcError> {
+        let mut api_key = MetadataValue::<Ascii>::try_from(api_key.into().expose())
+            .map_err(GeminiGrpcError::InvalidApiKey)?;
+        api_key.set_sensitive(true);
+        let interceptor = ApiKeyInterceptor {
+            api_key,
+            client_id: MetadataValue::from_static(RIG_GRPC_CLIENT_IDENTIFIER),
+        };
+        let channel = Endpoint::from_static(GEMINI_GRPC_ENDPOINT)
+            .tls_config(
+                ClientTlsConfig::new()
+                    .with_webpki_roots()
+                    .domain_name("generativelanguage.googleapis.com"),
+            )?
+            .connect()
+            .await?;
+        Ok(Self {
             interceptor,
-        ))
-    }
-}
-
-impl ProviderClient for Client {
-    type Input = String;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
-
-    /// Create a new Google Gemini gRPC client from the `GEMINI_API_KEY` environment variable.
-    fn from_env() -> Result<Self, Self::Error> {
-        let api_key = std::env::var("GEMINI_API_KEY")?;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(Self::new(api_key))
+            channel,
         })
     }
 
-    fn from_val(input: Self::Input) -> Result<Self, Self::Error> {
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(Self::new(input)))
+    /// Connect with the API key in `GEMINI_API_KEY`.
+    ///
+    /// Returns [`GeminiGrpcError::Env`] when the variable is unset or not
+    /// Unicode, and otherwise the errors of [`Self::new`].
+    pub async fn from_env() -> Result<Self, GeminiGrpcError> {
+        Self::new(env::required(GEMINI_API_KEY_ENV)?).await
+    }
+
+    /// A service client that sends through this transport's channel.
+    pub(crate) fn grpc_client(
+        &self,
+    ) -> GenerativeServiceClient<
+        tonic::service::interceptor::InterceptedService<Channel, ApiKeyInterceptor>,
+    > {
+        GenerativeServiceClient::with_interceptor(self.channel.clone(), self.interceptor.clone())
     }
 }
 
-impl CompletionClient for Client {
-    type CompletionModel = CompletionModel;
-
-    fn completion_model(&self, model: impl Into<String>) -> Self::CompletionModel {
-        CompletionModel::new(self.clone(), model)
-    }
-}
-
-impl EmbeddingsClient for Client {
-    type EmbeddingModel = EmbeddingModel;
-
-    fn embedding_model(&self, model: impl Into<String>) -> Self::EmbeddingModel {
-        EmbeddingModel::new(self.clone(), model, None)
+impl GeminiGrpc {
+    /// The `GenerateContent` model for `model`.
+    pub fn completion(&self, model: impl Into<String>) -> Model<GenerateContent, Self> {
+        Model::new(GenerateContent::new(model), self.clone())
     }
 
-    fn embedding_model_with_ndims(
+    /// The embedding model for `model`, `dims` wide when set.
+    pub fn embedding(
         &self,
         model: impl Into<String>,
-        ndims: usize,
-    ) -> Self::EmbeddingModel {
-        EmbeddingModel::new(self.clone(), model, Some(ndims))
+        dims: Option<usize>,
+    ) -> Model<Embeddings, Self> {
+        Model::new(Embeddings::new(model, dims), self.clone())
     }
 }
+
+#[cfg(test)]
+mod tests;

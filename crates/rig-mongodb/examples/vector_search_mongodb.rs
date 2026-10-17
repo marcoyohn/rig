@@ -3,16 +3,13 @@ use mongodb::{
     bson::{self, doc},
     options::ClientOptions,
 };
-use rig_core::{
-    client::ProviderClient, providers::openai, vector_store::request::VectorSearchRequest,
-};
+use rig_core::{providers::openai, vector_store::request::VectorSearchRequest};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::env;
 
-use rig_core::client::EmbeddingsClient;
 use rig_core::{
-    Embed, embeddings::EmbeddingsBuilder, providers::openai::Client, vector_store::VectorStoreIndex,
+    Embed, embeddings::EmbeddingsBuilder, providers::openai::OpenAI, vector_store::VectorStoreIndex,
 };
 use rig_mongodb::{MongoDbVectorIndex, SearchParams};
 
@@ -50,8 +47,8 @@ where
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Initialize OpenAI client
-    let openai_client = Client::from_env()?;
+    // The OpenAI client, from `OPENAI_API_KEY`.
+    let openai_client = OpenAI::from_env()?;
 
     // Initialize MongoDB client
     let mongodb_connection_string = env::var("MONGODB_CONNECTION_STRING")?;
@@ -65,7 +62,9 @@ async fn main() -> Result<(), anyhow::Error> {
         .collection("context");
 
     // Select the embedding model and generate our embeddings
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_ADA_002, None)
+        .erase();
 
     let words = vec![
         Word {
@@ -93,7 +92,7 @@ async fn main() -> Result<(), anyhow::Error> {
             doc! {
                 "id": id.clone(),
                 "definition": definition.clone(),
-                "embedding": embedding.first().vec.clone(),
+                "embedding": embedding.first().map(|embedding| embedding.vec.clone()),
             }
         })
         .collect::<Vec<_>>();

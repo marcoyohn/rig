@@ -1,15 +1,13 @@
-use rig_bedrock::{client::Client, completion::AMAZON_NOVA_LITE};
-use rig_core::agent::stream_to_stdout;
-use rig_core::client::{CompletionClient, ProviderClient};
-use rig_core::streaming::StreamingPrompt;
+use rig_agent::{agent::stream_to_stdout, prelude::*};
+use rig_bedrock::client::BedrockRuntime;
+use rig_bedrock::completion::AMAZON_NOVA_LITE;
 mod common;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt().init();
     // Create agent with a single context prompt and two tools
-    let agent = Client::from_env()?
-        .agent(AMAZON_NOVA_LITE)
+    let agent = AgentBuilder::new(BedrockRuntime::from_env().completion(AMAZON_NOVA_LITE))
         .preamble(
             "You are a calculator here to help the user perform arithmetic
             operations. Use the tools provided to answer the user's question.
@@ -21,7 +19,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .build();
 
     println!("Calculate 2 + 5");
-    let mut stream = agent.stream_prompt("Calculate 2 + 5").await;
+    let mut stream = agent.prompt("Calculate 2 + 5").stream();
     let _ = stream_to_stdout(&mut stream).await?;
     Ok(())
 }

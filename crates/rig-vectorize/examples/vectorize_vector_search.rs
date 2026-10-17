@@ -13,9 +13,8 @@
 
 use rig_core::{
     Embed,
-    client::{EmbeddingsClient, ProviderClient},
     embeddings::EmbeddingsBuilder,
-    providers::openai::{self, Client},
+    providers::openai::{self, OpenAI},
     vector_store::request::VectorSearchRequest,
     vector_store::{InsertDocuments, VectorStoreIndex},
 };
@@ -30,8 +29,10 @@ struct Word {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let openai_client = Client::from_env()?;
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_3_SMALL);
+    let openai_client = OpenAI::from_env()?;
+    let model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_3_SMALL, None)
+        .erase();
 
     let vector_store = VectorizeVectorStore::new(
         model.clone(),
@@ -64,7 +65,7 @@ async fn main() -> Result<(), anyhow::Error> {
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     let query = "What is a linglingdong?";
-    println!("\nSearching for: {}", query);
+    println!("\nSearching for: {query}");
 
     let request = VectorSearchRequest::builder()
         .query(query)
@@ -74,9 +75,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let results = vector_store.top_n::<Word>(request).await?;
 
     println!("\nResults:");
-    for (score, id, word) in results {
-        println!("  Score: {:.4}, ID: {}", score, id);
-        println!("    Definition: {}", word.definition);
+    for result in results {
+        println!("  Score: {:.4}, ID: {}", result.score, result.id);
+        println!("    Definition: {}", result.document.definition);
     }
 
     Ok(())

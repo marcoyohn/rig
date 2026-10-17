@@ -1,7 +1,4 @@
-//! Cloudflare Vectorize HTTP client.
-//!
-//! This module contains the HTTP client for interacting with the Cloudflare Vectorize API.
-//! It is designed to be potentially extracted into a standalone crate in the future.
+//! HTTP client for the Cloudflare Vectorize v2 API.
 
 mod error;
 mod filter;
@@ -15,13 +12,50 @@ pub use types::{
 };
 
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use tracing::instrument;
 use types::ApiResponse;
 
-/// Base URL for the Cloudflare API.
+/// Reads a response body, logs it, and unwraps the API envelope. `what` names
+/// the operation in log and error messages.
+async fn unwrap_api<T: DeserializeOwned>(
+    response: reqwest::Response,
+    what: &str,
+) -> Result<T, VectorizeError> {
+    let response_text = response.text().await?;
+    tracing::debug!("Raw Vectorize {} response: {}", what, response_text);
+
+    parse_api(&response_text, what)
+}
+
+/// Unwraps an API envelope, reporting envelope errors and a missing result as
+/// [`VectorizeError::ApiError`].
+fn parse_api<T: DeserializeOwned>(text: &str, what: &str) -> Result<T, VectorizeError> {
+    let api_response: ApiResponse<T> = serde_json::from_str(text)?;
+
+    if !api_response.success {
+        let error = api_response.errors.first().map_or_else(
+            || VectorizeError::ApiError {
+                code: 0,
+                message: "Unknown error".to_string(),
+            },
+            |e| VectorizeError::ApiError {
+                code: e.code,
+                message: e.message.clone(),
+            },
+        );
+        return Err(error);
+    }
+
+    api_response.result.ok_or_else(|| VectorizeError::ApiError {
+        code: 0,
+        message: format!("No result in successful {what} response"),
+    })
+}
+
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 
-/// HTTP client wrapper for Vectorize API operations.
+/// Client for one Vectorize index, authenticating with a bearer token.
 #[derive(Debug, Clone)]
 pub struct VectorizeClient {
     http_client: Client,
@@ -31,12 +65,7 @@ pub struct VectorizeClient {
 }
 
 impl VectorizeClient {
-    /// Creates a new Vectorize client.
-    ///
-    /// # Arguments
-    /// * `account_id` - Cloudflare account ID
-    /// * `index_name` - Name of the Vectorize index
-    /// * `api_token` - Cloudflare API token with Vectorize permissions
+    /// Creates a client for the named index of a Cloudflare account.
     pub fn new(
         account_id: impl Into<String>,
         index_name: impl Into<String>,
@@ -50,7 +79,6 @@ impl VectorizeClient {
         }
     }
 
-    /// Returns the base URL for the index endpoints.
     fn index_url(&self) -> String {
         format!(
             "{}/accounts/{}/vectorize/v2/indexes/{}",
@@ -58,7 +86,7 @@ impl VectorizeClient {
         )
     }
 
-    /// Performs a vector similarity query.
+    /// Runs a similarity query against the index.
     #[instrument(skip(self, request), fields(index = %self.index_name, top_k = request.top_k))]
     pub async fn query(&self, request: QueryRequest) -> Result<QueryResult, VectorizeError> {
         let url = format!("{}/query", self.index_url());
@@ -73,36 +101,11 @@ impl VectorizeClient {
             .send()
             .await?;
 
-        let response_text = response.text().await?;
-        tracing::debug!("Raw Vectorize response: {}", response_text);
-
-        let api_response: ApiResponse<QueryResult> = serde_json::from_str(&response_text)?;
-
-        if !api_response.success {
-            let error = api_response
-                .errors
-                .first()
-                .map(|e| VectorizeError::ApiError {
-                    code: e.code,
-                    message: e.message.clone(),
-                })
-                .unwrap_or_else(|| VectorizeError::ApiError {
-                    code: 0,
-                    message: "Unknown error".to_string(),
-                });
-            return Err(error);
-        }
-
-        api_response.result.ok_or_else(|| VectorizeError::ApiError {
-            code: 0,
-            message: "No result in successful response".to_string(),
-        })
+        unwrap_api(response, "query").await
     }
 
-    /// Upserts vectors (inserts or updates if ID already exists).
-    ///
-    /// This is the preferred method for inserting documents as it's idempotent.
-    /// Up to 5000 vectors can be upserted per request via the HTTP API.
+    /// Inserts vectors, replacing any sharing an existing identifier. The API
+    /// accepts up to five thousand vectors per request.
     #[instrument(skip(self, request), fields(index = %self.index_name, count = request.vectors.len()))]
     pub async fn upsert(&self, request: UpsertRequest) -> Result<UpsertResult, VectorizeError> {
         let url = format!("{}/upsert", self.index_url());
@@ -120,35 +123,11 @@ impl VectorizeClient {
             .send()
             .await?;
 
-        let response_text = response.text().await?;
-        tracing::debug!("Raw Vectorize upsert response: {}", response_text);
-
-        let api_response: ApiResponse<UpsertResult> = serde_json::from_str(&response_text)?;
-
-        if !api_response.success {
-            let error = api_response
-                .errors
-                .first()
-                .map(|e| VectorizeError::ApiError {
-                    code: e.code,
-                    message: e.message.clone(),
-                })
-                .unwrap_or_else(|| VectorizeError::ApiError {
-                    code: 0,
-                    message: "Unknown error".to_string(),
-                });
-            return Err(error);
-        }
-
-        api_response.result.ok_or_else(|| VectorizeError::ApiError {
-            code: 0,
-            message: "No result in successful upsert response".to_string(),
-        })
+        unwrap_api(response, "upsert").await
     }
 
-    /// Deletes vectors by their IDs.
-    ///
-    /// Up to 1000 vector IDs can be deleted per request.
+    /// Deletes the identified vectors. The API accepts up to a thousand
+    /// identifiers per request.
     #[instrument(skip(self, ids), fields(index = %self.index_name, count = ids.len()))]
     pub async fn delete_by_ids(&self, ids: Vec<String>) -> Result<DeleteResult, VectorizeError> {
         let url = format!("{}/delete_by_ids", self.index_url());
@@ -163,36 +142,12 @@ impl VectorizeClient {
             .send()
             .await?;
 
-        let response_text = response.text().await?;
-        tracing::debug!("Raw Vectorize delete response: {}", response_text);
-
-        let api_response: ApiResponse<DeleteResult> = serde_json::from_str(&response_text)?;
-
-        if !api_response.success {
-            let error = api_response
-                .errors
-                .first()
-                .map(|e| VectorizeError::ApiError {
-                    code: e.code,
-                    message: e.message.clone(),
-                })
-                .unwrap_or_else(|| VectorizeError::ApiError {
-                    code: 0,
-                    message: "Unknown error".to_string(),
-                });
-            return Err(error);
-        }
-
-        api_response.result.ok_or_else(|| VectorizeError::ApiError {
-            code: 0,
-            message: "No result in successful delete response".to_string(),
-        })
+        unwrap_api(response, "delete").await
     }
 
-    /// Lists vector IDs in the index (paginated).
-    ///
-    /// Returns up to `limit` vector IDs (max 1000, default 100).
-    /// Use the `next_cursor` from the response to fetch the next page.
+    /// Lists one page of vector identifiers, at most `limit` of them. The
+    /// response cursor requests the following page. `cursor` is placed in the
+    /// query string without escaping.
     #[instrument(skip(self), fields(index = %self.index_name))]
     pub async fn list_vectors(
         &self,
@@ -203,10 +158,10 @@ impl VectorizeClient {
 
         let mut query_params = Vec::new();
         if let Some(limit) = limit {
-            query_params.push(format!("count={}", limit));
+            query_params.push(format!("count={limit}"));
         }
         if let Some(cursor) = cursor {
-            query_params.push(format!("cursor={}", cursor));
+            query_params.push(format!("cursor={cursor}"));
         }
         if !query_params.is_empty() {
             url = format!("{}?{}", url, query_params.join("&"));
@@ -219,29 +174,10 @@ impl VectorizeClient {
             .send()
             .await?;
 
-        let response_text = response.text().await?;
-        tracing::debug!("Raw Vectorize list response: {}", response_text);
-
-        let api_response: ApiResponse<ListVectorsResult> = serde_json::from_str(&response_text)?;
-
-        if !api_response.success {
-            let error = api_response
-                .errors
-                .first()
-                .map(|e| VectorizeError::ApiError {
-                    code: e.code,
-                    message: e.message.clone(),
-                })
-                .unwrap_or_else(|| VectorizeError::ApiError {
-                    code: 0,
-                    message: "Unknown error".to_string(),
-                });
-            return Err(error);
-        }
-
-        api_response.result.ok_or_else(|| VectorizeError::ApiError {
-            code: 0,
-            message: "No result in successful list response".to_string(),
-        })
+        unwrap_api(response, "list").await
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod tests;

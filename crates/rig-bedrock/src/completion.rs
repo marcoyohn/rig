@@ -1,92 +1,71 @@
-//! All supported models <https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html>
+//! The Bedrock Converse completion wire and model identifiers.
+//! Model availability and inference-profile support depend on the AWS region.
+//!
+//! A request is built as Converse JSON and a reply is read as the JSON
+//! Bedrock sent. The AWS SDK signs and transports both; its typed request
+//! and response shapes play no part.
+//!
+//! ```no_run
+//! use rig_bedrock::{client::BedrockRuntime, completion::{AMAZON_NOVA_LITE, Converse}};
+//! use rig_core::Model;
+//!
+//! let model = BedrockRuntime::from_env().completion(AMAZON_NOVA_LITE);
+//! # let _ = model;
+//! ```
 
-use crate::{
-    client::Client,
-    types::{
-        assistant_content::AwsConverseOutput, completion_request::AwsCompletionRequest,
-        converse_output::InternalConverseOutput, errors::AwsSdkConverseError,
-    },
-};
+use aws_sdk_bedrockruntime::config::http::HttpResponse;
+use aws_sdk_bedrockruntime::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_bedrockruntime::operation::RequestId;
+use rig_core::catalog::{Catalog, ModelSpec};
+use rig_core::completion::options::FinalBody;
+use rig_core::completion::{Accepts, CompletionRequest, Media, Pairing, ReplayTarget};
+use rig_core::driver::{Exchange, Opened, Opening, Transport};
+use rig_core::error::{EncodeError, ProviderError};
+use rig_core::json_utils::Lenient;
+use rig_core::message::{Api, DocumentSourceKind, Origin, ToolChoice};
+use rig_core::operation::Completion;
+use rig_core::providers::registry::ProviderId;
+use rig_core::wire::{Descriptor, Mode, Wire};
+use serde_json::Value;
 
-use rig_core::completion::{self, CompletionError, CompletionRequest};
-use rig_core::streaming::StreamingCompletionResponse;
-use rig_core::telemetry::SpanCombinator;
-use tracing::Instrument;
+use crate::capture::{self, Capture, Events};
+use crate::client::BedrockRuntime;
+use crate::request;
+use crate::streaming::StreamState;
+use crate::types::errors::sdk_error;
 
-/// `ai21.jamba-1-5-large-v1:0`
-pub const AI21_JAMBA_1_5_LARGE: &str = "ai21.jamba-1-5-large-v1:0";
-/// `ai21.jamba-1-5-mini-v1:0`
-pub const AI21_JAMBA_1_5_MINI: &str = "ai21.jamba-1-5-mini-v1:0";
-/// `amazon.nova-canvas-v1:0`
-pub const AMAZON_NOVA_CANVAS: &str = "amazon.nova-canvas-v1:0";
+/// Stable descriptor name reported on normalized Bedrock responses.
+pub const PROVIDER_NAME: &str = "aws_bedrock";
+
+// Profile identifiers with a us. prefix route inference within the US region
+// family; callers elsewhere must select a supported regional profile.
+
+// Profile identifiers with a us. prefix route inference within the US region
+// family; callers elsewhere must select a supported regional profile.
+
 /// `amazon.nova-lite-v1:0`
 pub const AMAZON_NOVA_LITE: &str = "amazon.nova-lite-v1:0";
 /// `amazon.nova-micro-v1:0`
 pub const AMAZON_NOVA_MICRO: &str = "amazon.nova-micro-v1:0";
-/// `amazon.nova-premier-v1:0`
-pub const AMAZON_NOVA_PREMIER: &str = "amazon.nova-premier-v1:0";
 /// `amazon.nova-pro-v1:0`
 pub const AMAZON_NOVA_PRO: &str = "amazon.nova-pro-v1:0";
-/// `amazon.nova-reel-v1:0`
-pub const AMAZON_NOVA_REEL_V1_0: &str = "amazon.nova-reel-v1:0";
-/// `amazon.nova-reel-v1:1`
-pub const AMAZON_NOVA_REEL_V1_1: &str = "amazon.nova-reel-v1:1";
-/// `amazon.nova-sonic-v1:0`
-pub const AMAZON_NOVA_SONIC: &str = "amazon.nova-sonic-v1:0";
-/// `amazon.rerank-v1:0`
-pub const AMAZON_RERANK_1_0: &str = "amazon.rerank-v1:0";
-/// `amazon.titan-embed-text-v1`
-pub const AMAZON_TITAN_EMBEDDINGS_G1_TEXT: &str = "amazon.titan-embed-text-v1";
-/// `amazon.titan-image-generator-v2:0`
-pub const AMAZON_TITAN_IMAGE_GENERATOR_G1_V2: &str = "amazon.titan-image-generator-v2:0";
-/// `amazon.titan-image-generator-v1`
-pub const AMAZON_TITAN_IMAGE_GENERATOR_G1: &str = "amazon.titan-image-generator-v1";
-/// `amazon.titan-embed-image-v1`
-pub const AMAZON_TITAN_MULTIMODAL_EMBEDDINGS_G1: &str = "amazon.titan-embed-image-v1";
-/// `amazon.titan-embed-text-v2:0`
-pub const AMAZON_TITAN_TEXT_EMBEDDINGS_V2: &str = "amazon.titan-embed-text-v2:0";
-/// `amazon.titan-text-express-v1`
-pub const AMAZON_TITAN_TEXT_EXPRESS_V1: &str = "amazon.titan-text-express-v1";
-/// `amazon.titan-text-lite-v1`
-pub const AMAZON_TITAN_TEXT_LITE_V1: &str = "amazon.titan-text-lite-v1";
-/// `amazon.titan-text-premier-v1:0`
-pub const AMAZON_TITAN_TEXT_PREMIER_V1_0: &str = "amazon.titan-text-premier-v1:0";
-/// `anthropic.claude-3-haiku-20240307-v1:0`
-pub const ANTHROPIC_CLAUDE_3_HAIKU: &str = "anthropic.claude-3-haiku-20240307-v1:0";
-/// `anthropic.claude-3-opus-20240229-v1:0`
-pub const ANTHROPIC_CLAUDE_3_OPUS: &str = "anthropic.claude-3-opus-20240229-v1:0";
-/// `anthropic.claude-3-sonnet-20240229-v1:0`
-pub const ANTHROPIC_CLAUDE_3_SONNET: &str = "anthropic.claude-3-sonnet-20240229-v1:0";
-/// `anthropic.claude-3-5-haiku-20241022-v1:0`
-pub const ANTHROPIC_CLAUDE_3_5_HAIKU: &str = "anthropic.claude-3-5-haiku-20241022-v1:0";
-/// `anthropic.claude-3-5-sonnet-20241022-v2:0`
-pub const ANTHROPIC_CLAUDE_3_5_SONNET_V2: &str = "anthropic.claude-3-5-sonnet-20241022-v2:0";
-/// `anthropic.claude-3-5-sonnet-20240620-v1:0`
-pub const ANTHROPIC_CLAUDE_3_5_SONNET: &str = "anthropic.claude-3-5-sonnet-20240620-v1:0";
-/// `anthropic.claude-3-7-sonnet-20250219-v1:0`
-pub const ANTHROPIC_CLAUDE_3_7_SONNET: &str = "anthropic.claude-3-7-sonnet-20250219-v1:0";
-/// `anthropic.claude-opus-4-20250514-v1:0`
-pub const ANTHROPIC_CLAUDE_OPUS_4: &str = "anthropic.claude-opus-4-20250514-v1:0";
-/// `anthropic.claude-sonnet-4-20250514-v1:0`
-pub const ANTHROPIC_CLAUDE_SONNET_4: &str = "anthropic.claude-sonnet-4-20250514-v1:0";
-/// `cohere.command-light-text-v14`
-pub const COHERE_COMMAND_LIGHT_TEXT: &str = "cohere.command-light-text-v14";
-/// `cohere.command-r-plus-v1:0`
-pub const COHERE_COMMAND_R_PLUS: &str = "cohere.command-r-plus-v1:0";
-/// `cohere.command-r-v1:0`
-pub const COHERE_COMMAND_R: &str = "cohere.command-r-v1:0";
-/// `cohere.command-text-v14`
-pub const COHERE_COMMAND: &str = "cohere.command-text-v14";
-/// `cohere.embed-english-v3`
-pub const COHERE_EMBED_ENGLISH: &str = "cohere.embed-english-v3";
-/// `cohere.embed-multilingual-v3`
-pub const COHERE_EMBED_MULTILINGUAL: &str = "cohere.embed-multilingual-v3";
-/// `cohere.rerank-v3-5:0`
-pub const COHERE_RERANK_V3_5: &str = "cohere.rerank-v3-5:0";
-/// `deepseek.r1-v1:0`
-pub const DEEPSEEK_R1: &str = "deepseek.r1-v1:0";
-/// `luma.ray-v2:0`
-pub const LUMA_RAY_V2_0: &str = "luma.ray-v2:0";
+
+/// `us.anthropic.claude-haiku-4-5-20251001-v1:0` (cross-region profile)
+pub const ANTHROPIC_CLAUDE_HAIKU_4_5: &str = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
+/// `us.anthropic.claude-sonnet-4-5-20250929-v1:0` (cross-region profile)
+pub const ANTHROPIC_CLAUDE_SONNET_4_5: &str = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+/// `us.anthropic.claude-opus-4-5-20251101-v1:0` (cross-region profile)
+pub const ANTHROPIC_CLAUDE_OPUS_4_5: &str = "us.anthropic.claude-opus-4-5-20251101-v1:0";
+/// `us.anthropic.claude-sonnet-4-6` (cross-region profile)
+pub const ANTHROPIC_CLAUDE_SONNET_4_6: &str = "us.anthropic.claude-sonnet-4-6";
+/// `us.anthropic.claude-sonnet-5` (cross-region profile)
+pub const ANTHROPIC_CLAUDE_SONNET_5: &str = "us.anthropic.claude-sonnet-5";
+/// `us.anthropic.claude-opus-5` (cross-region profile)
+pub const ANTHROPIC_CLAUDE_OPUS_5: &str = "us.anthropic.claude-opus-5";
+
+/// `us.deepseek.r1-v1:0` (cross-region profile)
+pub const DEEPSEEK_R1: &str = "us.deepseek.r1-v1:0";
+
 /// `meta.llama3-8b-instruct-v1:0`
 pub const LLAMA_3_8B_INSTRUCT: &str = "meta.llama3-8b-instruct-v1:0";
 /// `meta.llama3-70b-instruct-v1:0`
@@ -95,203 +74,391 @@ pub const LLAMA_3_70B_INSTRUCT: &str = "meta.llama3-70b-instruct-v1:0";
 pub const LLAMA_3_1_8B_INSTRUCT: &str = "meta.llama3-1-8b-instruct-v1:0";
 /// `meta.llama3-1-70b-instruct-v1:0`
 pub const LLAMA_3_1_70B_INSTRUCT: &str = "meta.llama3-1-70b-instruct-v1:0";
-/// `meta.llama3-1-405b-instruct-v1:0`
-pub const LLAMA_3_1_405B_INSTRUCT: &str = "meta.llama3-1-405b-instruct-v1:0";
-/// `meta.llama3-2-1b-instruct-v1:0`
-pub const LLAMA_3_2_1B_INSTRUCT: &str = "meta.llama3-2-1b-instruct-v1:0";
-/// `meta.llama3-2-3b-instruct-v1:0`
-pub const LLAMA_3_2_3B_INSTRUCT: &str = "meta.llama3-2-3b-instruct-v1:0";
-/// `meta.llama3-2-11b-instruct-v1:0`
-pub const LLAMA_3_2_11B_INSTRUCT: &str = "meta.llama3-2-11b-instruct-v1:0";
-/// `meta.llama3-2-90b-instruct-v1:0`
-pub const LLAMA_3_2_90B_INSTRUCT: &str = "meta.llama3-2-90b-instruct-v1:0";
-/// `meta.llama3-3-70b-instruct-v1:0`
-pub const META_LLAMA_3_3_70B_INSTRUCT: &str = "meta.llama3-3-70b-instruct-v1:0";
-/// `meta.llama4-maverick-17b-instruct-v1:0`
-pub const META_LLAMA_4_MAVERICK_17B_INSTRUCT: &str = "meta.llama4-maverick-17b-instruct-v1:0";
-/// `meta.llama4-scout-17b-instruct-v1:0`
-pub const META_LLAMA_4_SCOUT_17B_INSTRUCT: &str = "meta.llama4-scout-17b-instruct-v1:0";
+/// `us.meta.llama3-3-70b-instruct-v1:0` (cross-region profile)
+pub const META_LLAMA_3_3_70B_INSTRUCT: &str = "us.meta.llama3-3-70b-instruct-v1:0";
+/// `us.meta.llama4-maverick-17b-instruct-v1:0` (cross-region profile)
+pub const META_LLAMA_4_MAVERICK_17B_INSTRUCT: &str = "us.meta.llama4-maverick-17b-instruct-v1:0";
+/// `us.meta.llama4-scout-17b-instruct-v1:0` (cross-region profile)
+pub const META_LLAMA_4_SCOUT_17B_INSTRUCT: &str = "us.meta.llama4-scout-17b-instruct-v1:0";
+
 /// `mistral.mistral-7b-instruct-v0:2`
 pub const MISTRAL_7B_INSTRUCT: &str = "mistral.mistral-7b-instruct-v0:2";
 /// `mistral.mistral-large-2402-v1:0`
 pub const MISTRAL_LARGE_24_02: &str = "mistral.mistral-large-2402-v1:0";
-/// `mistral.mistral-large-2407-v1:0`
-pub const MISTRAL_LARGE_24_07: &str = "mistral.mistral-large-2407-v1:0";
 /// `mistral.mistral-small-2402-v1:0`
 pub const MISTRAL_SMALL_24_02: &str = "mistral.mistral-small-2402-v1:0";
 /// `mistral.mixtral-8x7b-instruct-v0:1`
 pub const MISTRAL_MIXTRAL_8X7B_INSTRUCT_V0: &str = "mistral.mixtral-8x7b-instruct-v0:1";
-/// `mistral.pixtral-large-2502-v1:0`
-pub const MISTRAL_PIXTRAL_LARGE_2502: &str = "mistral.pixtral-large-2502-v1:0";
-/// `stability.sd3-5-large-v1:0`
-pub const STABILITY_SD3_5_LARGE: &str = "stability.sd3-5-large-v1:0";
-/// `stability.stable-image-core-v1:1`
-pub const STABILITY_STABLE_IMAGE_CORE_1_0: &str = "stability.stable-image-core-v1:1";
-/// `stability.stable-image-ultra-v1:1`
-pub const STABILITY_STABLE_IMAGE_ULTRA_1_0: &str = "stability.stable-image-ultra-v1:1";
-/// `twelvelabs.marengo-embed-2-7-v1:0`
-pub const TWELVELABS_MARENGO_EMBED_V2_7: &str = "twelvelabs.marengo-embed-2-7-v1:0";
-/// `twelvelabs.pegasus-1-2-v1:0`
-pub const TWELVELABS_PEGASUS_V1_2: &str = "twelvelabs.pegasus-1-2-v1:0";
-/// `writer.palmyra-x4-v1:0`
-pub const WRITER_PALMYRA_X4: &str = "writer.palmyra-x4-v1:0";
-/// `writer.palmyra-x5-v1:0`
-pub const WRITER_PALMYRA_X5: &str = "writer.palmyra-x5-v1:0";
-/// `ai21.jamba-instruct-v1:0`
-pub const AI21_JAMBA_INSTRUCT: &str = "ai21.jamba-instruct-v1:0";
-/// `anthropic.claude-v2:1`
-pub const ANTHROPIC_CLAUDE_2_1: &str = "anthropic.claude-v2:1";
-/// `anthropic.claude-v2`
-pub const ANTHROPIC_CLAUDE_2: &str = "anthropic.claude-v2";
-/// `anthropic.claude-instant-v1`
-pub const ANTHROPIC_CLAUDE_INSTANT: &str = "anthropic.claude-instant-v1";
-/// `anthropic.claude-instant-v1:2`
-pub const ANTHROPIC_CLAUDE_INSTANT_V1_2: &str = "anthropic.claude-instant-v1:2";
-/// `anthropic.claude-v2:0`
-pub const ANTHROPIC_CLAUDE: &str = "anthropic.claude-v2:0";
-/// `stability.sd3-large-v1:0`
-pub const STABILITY_SD3_LARGE_1_0: &str = "stability.sd3-large-v1:0";
-/// `stability.stable-diffusion-xl-v1`
-pub const STABILITY_SDXL_1_0: &str = "stability.stable-diffusion-xl-v1";
-/// `stability.stable-image-core-v1:0`
-pub const STABILITY_STABLE_IMAGE_CORE_1_0_V1_0: &str = "stability.stable-image-core-v1:0";
-/// `stability.stable-image-ultra-v1:0`
-pub const STABILITY_STABLE_IMAGE_ULTRA_1_0_V1_0: &str = "stability.stable-image-ultra-v1:0";
+/// `us.mistral.pixtral-large-2502-v1:0` (cross-region profile)
+pub const MISTRAL_PIXTRAL_LARGE_2502: &str = "us.mistral.pixtral-large-2502-v1:0";
 
-#[derive(Clone)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
-    pub model: String,
-    /// When enabled, cache checkpoints are inserted into Converse API requests
-    /// to take advantage of [Bedrock prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html).
-    /// A checkpoint is placed after the system prompt and after the last message
-    /// in the chat history. Disabled by default.
-    pub prompt_caching: bool,
+/// `us.writer.palmyra-x4-v1:0` (cross-region profile)
+pub const WRITER_PALMYRA_X4: &str = "us.writer.palmyra-x4-v1:0";
+/// `us.writer.palmyra-x5-v1:0` (cross-region profile)
+pub const WRITER_PALMYRA_X5: &str = "us.writer.palmyra-x5-v1:0";
+
+/// The model family behind a Converse model id. It decides what history a
+/// model reads back: Claude reads reasoning signatures, rejects unsigned
+/// reasoning, and reads images; Nova reads S3 objects and video; both read
+/// a tool result's status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family {
+    /// Anthropic Claude.
+    Claude,
+    /// Amazon Nova.
+    Nova,
+    /// Any other model.
+    Other,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: impl Into<String>) -> Self {
+impl Family {
+    /// The family of the provider a Bedrock model id names. A base model id
+    /// or a system inference profile is `[geography.]provider.model`, also
+    /// the last part of a foundation-model or inference-profile ARN. An
+    /// application inference profile or provisioned model ARN names no
+    /// provider, so it is [`Family::Other`] unless the caller states its
+    /// family with [`Converse::with_family`].
+    ///
+    /// ```
+    /// use rig_bedrock::completion::{AMAZON_NOVA_PRO, ANTHROPIC_CLAUDE_SONNET_4_5, Family};
+    ///
+    /// assert_eq!(Family::of(ANTHROPIC_CLAUDE_SONNET_4_5), Family::Claude);
+    /// assert_eq!(Family::of(AMAZON_NOVA_PRO), Family::Nova);
+    /// assert_eq!(
+    ///     Family::of("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3"),
+    ///     Family::Other
+    /// );
+    /// ```
+    pub fn of(model: &str) -> Self {
+        let id = model.rsplit('/').next().unwrap_or(model);
+        let mut parts = id.rsplit('.');
+        match (parts.next(), parts.next()) {
+            (_, Some("anthropic")) => Self::Claude,
+            (Some(name), Some("amazon")) if name.starts_with("nova") => Self::Nova,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The Converse endpoint for one model: `Converse` for a unary call,
+/// `ConverseStream` for a streamed one.
+#[derive(Clone, Debug)]
+pub struct Converse {
+    pub model: String,
+    /// The family of `model` when the caller states it, which an
+    /// application inference profile ARN needs: its id names no provider.
+    /// Set through [`Converse::with_family`]; otherwise [`Family::of`]
+    /// the model id decides.
+    pub family: Option<Family>,
+}
+
+impl Converse {
+    pub fn new(model: impl Into<String>) -> Self {
         Self {
-            client,
             model: model.into(),
-            prompt_caching: false,
+            family: None,
         }
     }
 
-    /// Enable Bedrock prompt caching for this model.
+    /// State the family of this wire's model, for a model id that names no
+    /// provider, such as an application inference profile ARN.
     ///
-    /// When enabled, `CachePoint` blocks are inserted after the serialized
-    /// `system` content and after the final `messages` entry in each Converse
-    /// API request. This allows Bedrock to cache and reuse repeated prompt
-    /// prefixes, reducing both latency and input token costs.
+    /// ```
+    /// use rig_bedrock::completion::{Converse, Family};
     ///
-    /// This currently covers the `system` and `messages` request fields only.
-    /// Some Bedrock models also support caching `tools`, but that is not wired
-    /// up here yet.
-    ///
-    /// Cacheability and token thresholds are model-specific. If the cached
-    /// prefix is too short or the model does not support caching for a given
-    /// field, Bedrock ignores the checkpoint. See the Bedrock prompt caching
-    /// support table for current limits and field support.
-    pub fn with_prompt_caching(mut self) -> Self {
-        self.prompt_caching = true;
+    /// let profile = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3";
+    /// let wire = Converse::new(profile).with_family(Family::Claude);
+    /// assert_eq!(wire.family(profile), Family::Claude);
+    /// ```
+    pub fn with_family(mut self, family: Family) -> Self {
+        self.family = Some(family);
         self
     }
-}
 
-pub(crate) fn resolve_request_model(
-    default_model: &str,
-    completion_request: &CompletionRequest,
-) -> String {
-    completion_request
-        .model
-        .clone()
-        .unwrap_or_else(|| default_model.to_string())
-}
-
-impl completion::CompletionModel for CompletionModel {
-    type Response = AwsConverseOutput;
-    type StreamingResponse = crate::streaming::BedrockStreamingResponse;
-
-    type Client = Client;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
-    }
-
-    async fn completion(
-        &self,
-        completion_request: completion::CompletionRequest,
-    ) -> Result<completion::CompletionResponse<AwsConverseOutput>, CompletionError> {
-        let request_model = resolve_request_model(&self.model, &completion_request);
-
-        let span = if tracing::Span::current().is_disabled() {
-            tracing::info_span!(
-                target: "rig_core::completions",
-                "chat",
-                gen_ai.operation.name = "chat",
-                gen_ai.provider.name = "aws_bedrock",
-                gen_ai.request.model = &request_model,
-                gen_ai.system_instructions = &completion_request.preamble,
-                gen_ai.response.id = tracing::field::Empty,
-                gen_ai.response.model = tracing::field::Empty,
-                gen_ai.usage.output_tokens = tracing::field::Empty,
-                gen_ai.usage.input_tokens = tracing::field::Empty,
-                gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
-                gen_ai.usage.cache_creation.input_tokens = tracing::field::Empty,
-            )
-        } else {
-            tracing::Span::current()
-        };
-
-        let request = AwsCompletionRequest {
-            inner: completion_request,
-            prompt_caching: self.prompt_caching,
-        };
-
-        let mut converse_builder = self
-            .client
-            .get_inner()
-            .await
-            .converse()
-            .model_id(request_model.clone());
-
-        let tool_config = request.tools_config()?;
-        let messages = request.messages()?;
-        let output_config = request.output_config()?;
-        converse_builder = converse_builder
-            .set_additional_model_request_fields(request.additional_params())
-            .set_inference_config(request.inference_config())
-            .set_tool_config(tool_config)
-            .set_system(request.system_prompt()?)
-            .set_messages(Some(messages))
-            .set_output_config(output_config);
-
-        async move {
-            let response = converse_builder.send().await.map_err(|sdk_error| {
-                Into::<CompletionError>::into(AwsSdkConverseError(sdk_error))
-            })?;
-
-            let response: InternalConverseOutput = response.try_into().map_err(|x| {
-                CompletionError::ProviderError(format!("Type conversion error: {x}"))
-            })?;
-
-            let aws_output = AwsConverseOutput(response);
-
-            let span = tracing::Span::current();
-            span.record_response_metadata(&aws_output);
-            span.record_token_usage(&aws_output);
-
-            aws_output.try_into()
+    /// The family of `model`: the stated one for this wire's own model,
+    /// otherwise [`Family::of`] its id.
+    pub fn family(&self, model: &str) -> Family {
+        match self.family {
+            Some(family) if model == self.model => family,
+            _ => Family::of(model),
         }
-        .instrument(span)
-        .await
+    }
+}
+
+/// One Converse request: the model it addresses and its JSON body.
+#[derive(Clone, Debug)]
+pub struct ConverseRequest {
+    pub model: String,
+    pub body: FinalBody,
+}
+
+/// One unit of a Converse reply, as the JSON Bedrock sent.
+#[derive(Clone, Debug)]
+pub enum ConverseFrame {
+    /// A whole unary reply. It is also the response's `raw`.
+    Whole(Value),
+    /// One stream event or in-band exception, as `{"<type>": <payload>}`.
+    Event(Value),
+}
+
+impl Wire for Converse {
+    type Op = Completion;
+    type Payload = ConverseRequest;
+    type Frame = ConverseFrame;
+    type Decoder<'id> = StreamState;
+    type Reassembler = crate::streaming::document::ConverseOutput;
+
+    fn describe(&self) -> Descriptor<'_> {
+        Descriptor::new(PROVIDER_NAME)
+            .model(self.model.as_str())
+            .replay(self)
     }
 
-    async fn stream(
+    fn encode(
         &self,
         request: CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
-        CompletionModel::stream(self, request).await
+        _mode: Mode,
+    ) -> Result<ConverseRequest, EncodeError> {
+        let model = request.model.clone().unwrap_or_else(|| self.model.clone());
+        let body = request::body(self, &request, &model)?;
+        Ok(ConverseRequest { model, body })
+    }
+
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
+        StreamState::default()
     }
 }
+
+/// Model families pi's catalog lists as text-only on Bedrock, separated by
+/// spaces: the rule for a model the catalog does not list under Bedrock (a
+/// region inference profile, a dated or `-v2` revision).
+const TEXT_ONLY: &str = "amazon.nova-micro deepseek. meta.llama3-8b meta.llama3-70b \
+    meta.llama3-1- meta.llama3-3- minimax. mistral.devstral mistral.mistral-7b \
+    mistral.mistral-large-2402 mistral.mistral-small-2402 mistral.mixtral mistral.voxtral \
+    moonshot.kimi-k2-thinking nvidia.nemotron-nano-3 nvidia.nemotron-nano-9b \
+    nvidia.nemotron-super openai.gpt-oss qwen.qwen3-2 qwen.qwen3-3 qwen.qwen3-coder \
+    qwen.qwen3-next writer.palmyra zai.glm";
+
+/// The catalog entry of the Bedrock `model`. A Claude id is read as every
+/// wire that serves Claude reads it ([`claude_spec`]: the Anthropic model's
+/// entry, past a region prefix, a `-v1:N` revision or a dated snapshot), so
+/// its reasoning, sampling and context binding match Anthropic's own API.
+/// Any other id is a base model id or system inference profile, or the last
+/// part of its ARN, listed under Bedrock. `None` for a model the catalog
+/// does not list.
+///
+/// [`claude_spec`]: rig_core::providers::anthropic::completion::claude_spec
+pub fn spec(model: &str) -> Option<&'static ModelSpec> {
+    let id = model.rsplit('/').next().unwrap_or(model);
+    if id.contains("anthropic.") || id.starts_with("claude") {
+        return rig_core::providers::anthropic::completion::claude_spec(id);
+    }
+    ProviderId::catalog(PROVIDER_NAME).and_then(|provider| Catalog::builtin().get(provider, id))
+}
+
+impl ReplayTarget for Converse {
+    /// Section 6.5 of the typed-options design: reasoning in the model's
+    /// own request fields, by family and Claude class.
+    fn map_options(
+        &self,
+        request: &CompletionRequest,
+        fields: rig_core::completion::options::OptionFields<'_>,
+    ) -> rig_core::completion::options::OptionMap {
+        let model = request.model.as_deref().unwrap_or(&self.model);
+        crate::options::converse(self.family(model), model, request, fields)
+    }
+
+    fn api(&self) -> Api {
+        Api::from_static("bedrock.converse")
+    }
+
+    fn provider(&self) -> &str {
+        PROVIDER_NAME
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Converse reads images in user turns and tool results, never in
+    /// assistant turns. Claude reads them; so does every other model but
+    /// those the catalog lists as reading no images, or, for a model the
+    /// catalog does not list (a region inference profile such as
+    /// `eu.meta.llama3-3-70b-instruct-v1:0`), the text-only families.
+    fn accepts(&self, model: &str) -> Accepts {
+        let images = self.family(model) == Family::Claude
+            || spec(model).map_or_else(
+                || {
+                    !TEXT_ONLY
+                        .split_whitespace()
+                        .any(|family| model.contains(family))
+                },
+                |spec| spec.input.image,
+            );
+        Accepts {
+            user_images: images,
+            assistant_images: false,
+            tool_result_images: images,
+            tools: true,
+        }
+    }
+
+    /// Claude binds its thinking to the request's tools and system prompt
+    /// on Converse as on Anthropic's own API.
+    fn binds_context(&self, model: &str) -> bool {
+        self.family(model) == Family::Claude
+            && spec(model).is_some_and(|spec| spec.compat.binds_context)
+    }
+
+    /// Converse rejects a conversation that does not start with a user
+    /// message.
+    fn starts_with_user(&self) -> bool {
+        true
+    }
+
+    /// A later system message goes as user text where it stands, so adding
+    /// one never changes the cached prefix before it.
+    fn later_system(&self, _model: &str) -> rig_core::completion::LaterSystem {
+        rig_core::completion::LaterSystem::UserText
+    }
+
+    /// Converse takes user and assistant messages only in alternation.
+    fn alternates_roles(&self) -> bool {
+        true
+    }
+
+    /// Converse takes a hosted tool's use and result only beside a
+    /// `toolConfig`, which only the request's own tools make.
+    fn hosted_needs_tools(&self) -> bool {
+        true
+    }
+
+    /// Only the request's tools reach Converse's `toolConfig`;
+    /// `additional_params` go to `additionalModelRequestFields`. Converse
+    /// has no `none` tool choice, so `ToolChoice::None` sends no
+    /// `toolConfig`, and Converse rejects tool blocks without one.
+    fn declares_tools(&self, request: &CompletionRequest) -> bool {
+        !request.tools.is_empty() && !matches!(request.tool_choice, Some(ToolChoice::None))
+    }
+
+    fn sends_alone(&self, block: &rig_core::message::AssistantContent) -> bool {
+        crate::request::sends(block, self)
+    }
+
+    /// Converse carries images in its four formats, documents in a format it
+    /// lists, and inline data, which must be valid base64. Only Nova reads S3
+    /// objects and video. Converse rejects a document's text source and
+    /// takes no audio, so a string document goes as its text.
+    fn encodes(&self, model: &str, media: Media<'_>) -> bool {
+        let nova = self.family(model) == Family::Nova;
+        let stored = |data: &DocumentSourceKind| {
+            nova || !matches!(data, DocumentSourceKind::Url(url) if url.starts_with("s3://"))
+        };
+        match media {
+            Media::Image(image, _) => stored(&image.data) && request::image(image).is_ok(),
+            Media::Document(document) => {
+                stored(&document.data) && request::document(document).is_ok()
+            }
+            Media::Video(video) => {
+                nova && self.accepts(model).user_images && request::video(video).is_ok()
+            }
+            Media::Audio(_) => false,
+        }
+    }
+
+    /// Converse tool-use ids match `[a-zA-Z0-9_-]{1,64}`.
+    fn normalize_tool_call_id(&self, id: &str, _model: &str, _source: Option<&Origin>) -> String {
+        rig_core::providers::internal::wire_ids::legal_call_id(id, 64)
+    }
+
+    fn call_id_slot(&self) -> Option<&'static str> {
+        Some("/toolUse/toolUseId")
+    }
+
+    /// A hosted tool's use is a typed `toolUse`; its result is the
+    /// `toolResult` in the same turn. Converse rejects one without the other.
+    fn hosted_pair(&self, item: &Value) -> Option<(Pairing, String)> {
+        let (side, body) = match item.get("toolUse") {
+            Some(body) => (Pairing::Use, body),
+            None => (Pairing::Result, item.get("toolResult")?),
+        };
+        Some((side, body.str("toolUseId")?.to_owned()))
+    }
+}
+
+/// The request id of a sent Converse call, and its failure, if the SDK
+/// read one.
+fn sent<O: RequestId, E: ProvideErrorMetadata>(
+    sent: Result<O, SdkError<E, HttpResponse>>,
+) -> (Option<String>, Option<ProviderError>) {
+    match sent {
+        Ok(output) => (output.request_id().map(str::to_owned), None),
+        Err(error) => (
+            error.request_id().map(str::to_owned),
+            Some(sdk_error(error)),
+        ),
+    }
+}
+
+impl Transport<Converse> for BedrockRuntime {
+    fn send(&self, payload: ConverseRequest, exchange: Exchange) -> Opening<ConverseFrame> {
+        let ConverseRequest { model, body } = payload;
+        let capture = match serde_json::to_vec(&body) {
+            Ok(body) => Capture::new(body),
+            Err(error) => return Opening::failed(ProviderError::request(error)),
+        };
+        let runtime = self.clone();
+        Opening::new(async move {
+            let client = runtime.inner().await;
+            let unary = exchange.mode == Mode::Unary;
+            let interceptor = capture.clone();
+            let (request_id, failure) = if unary {
+                let call = client.converse().model_id(model).customize();
+                sent(call.interceptor(interceptor).send().await)
+            } else {
+                let call = client.converse_stream().model_id(model).customize();
+                sent(call.interceptor(interceptor).send().await)
+            };
+            // A success's body is never the SDK's to read, so the SDK fails a
+            // unary call it could not deserialize; the reply is decoded here.
+            let Some(mut body) = capture.reply() else {
+                let failure = failure.unwrap_or_else(|| {
+                    ProviderError::Response("Converse sent no reply".to_owned())
+                });
+                return Ok(Opened::failed(failure));
+            };
+            if unary {
+                let mut bytes = Vec::new();
+                while let Some(chunk) = capture::chunk(&mut body).await {
+                    bytes.extend(chunk?);
+                }
+                let document: Value = serde_json::from_slice(&bytes)
+                    .map_err(|error| ProviderError::Json(error.into()))?;
+                let frames = futures::stream::iter([Ok(ConverseFrame::Whole(document.clone()))]);
+                return Ok(Opened::new(frames)
+                    .with_request_id(request_id)
+                    .with_document(document));
+            }
+            let frames = async_stream::stream! {
+                let mut events = Events::default();
+                while let Some(chunk) = capture::chunk(&mut body).await {
+                    match chunk {
+                        Ok(chunk) => {
+                            for event in events.read(&chunk) {
+                                yield Ok(ConverseFrame::Event(event));
+                            }
+                        }
+                        Err(error) => {
+                            yield Err(error);
+                            break;
+                        }
+                    }
+                }
+            };
+            Ok(Opened::new(frames).with_request_id(request_id))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,12 +1,9 @@
 use fixture::{Word, as_record_batch, words};
 use lancedb::index::vector::IvfPqIndexBuilder;
-use rig_core::client::{EmbeddingsClient, ProviderClient};
 use rig_core::providers::openai;
 use rig_core::vector_store::request::VectorSearchRequest;
 use rig_core::{
-    embeddings::{EmbeddingModel, EmbeddingsBuilder},
-    providers::openai::Client,
-    vector_store::VectorStoreIndex,
+    embeddings::EmbeddingsBuilder, providers::openai::OpenAI, vector_store::VectorStoreIndex,
 };
 use rig_lancedb::{LanceDbVectorIndex, SearchParams};
 
@@ -15,11 +12,13 @@ mod fixture;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Initialize OpenAI client. Use this to generate embeddings (and generate test data for RAG demo).
-    let openai_client = Client::from_env()?;
+    // Initialize the OpenAI embeddings endpoint. Use this to generate embeddings (and generate test data for RAG demo).
+    let openai_client = OpenAI::from_env()?;
 
     // Select an embedding model.
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_ADA_002, None)
+        .erase();
 
     // Initialize LanceDB locally.
     let db = lancedb::connect("data/lancedb-store").execute().await?;
@@ -48,7 +47,7 @@ async fn main() -> Result<(), anyhow::Error> {
     } else {
         db.create_table(
             "definitions",
-            vec![as_record_batch(embeddings, model.ndims())?],
+            vec![as_record_batch(embeddings, model.capabilities().ndims)?],
         )
         .execute()
         .await?

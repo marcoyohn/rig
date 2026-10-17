@@ -1,7 +1,5 @@
 //! Together context smoke test.
 
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::Prompt;
 use rig::providers::together;
 
 use crate::support::{CONTEXT_DOCS, CONTEXT_PROMPT, assert_contains_any_case_insensitive};
@@ -9,13 +7,13 @@ use crate::support::{CONTEXT_DOCS, CONTEXT_PROMPT, assert_contains_any_case_inse
 #[tokio::test]
 #[ignore = "requires TOGETHER_API_KEY"]
 async fn context_smoke() {
-    let client = together::Client::from_env().expect("client should build");
+    let provider = together::from_env().expect("config should build from env");
     let agent = CONTEXT_DOCS
         .iter()
         .copied()
         .fold(
-            client.agent(together::MIXTRAL_8X7B_INSTRUCT_V0_1),
-            |builder, doc| builder.context(doc),
+            rig::AgentBuilder::new(provider.completion(together::MIXTRAL_8X7B_INSTRUCT_V0_1)),
+            rig::AgentBuilder::context,
         )
         .build();
 
@@ -25,7 +23,7 @@ async fn context_smoke() {
         .expect("context prompt should succeed");
 
     assert_contains_any_case_insensitive(
-        &response,
+        &response.output(),
         &[
             "ancient tool",
             "farming tool",

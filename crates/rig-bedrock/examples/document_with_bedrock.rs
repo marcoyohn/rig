@@ -1,12 +1,9 @@
-use rig_core::{
-    completion::{Prompt, message::Document},
-    message::{DocumentMediaType, DocumentSourceKind},
-};
+use rig_core::message::{DocumentMediaType, UserContent};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
-use rig_bedrock::client::Client;
+use rig_agent::prelude::*;
+use rig_bedrock::client::BedrockRuntime;
 use rig_bedrock::completion::AMAZON_NOVA_LITE;
-use rig_core::client::{CompletionClient, ProviderClient};
 use tracing::info;
 
 const DOCUMENT_URL: &str = "https://bitcoin.org/bitcoin.pdf";
@@ -20,9 +17,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .with_target(false)
         .init();
 
-    let client = Client::from_env()?;
-    let agent = client
-        .agent(AMAZON_NOVA_LITE)
+    let agent = AgentBuilder::new(BedrockRuntime::from_env().completion(AMAZON_NOVA_LITE))
         .preamble("Describe this document")
         .temperature(0.5)
         .build();
@@ -36,13 +31,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let document_bytes = response.bytes().await?;
     let bytes_base64 = BASE64_STANDARD.encode(document_bytes);
 
-    let document = Document {
-        data: DocumentSourceKind::Base64(bytes_base64),
-        media_type: Some(DocumentMediaType::PDF),
-        additional_params: None,
-    };
+    let document = UserContent::document_base64(bytes_base64, Some(DocumentMediaType::PDF));
 
-    let response = agent.prompt(document).await?;
+    let response = agent.prompt(document).await?.output();
     info!("{}", response);
 
     Ok(())

@@ -1,8 +1,10 @@
-use rig_core::client::ProviderClient;
 use rig_core::vector_store::InsertDocuments;
 use rig_core::vector_store::request::VectorSearchRequest;
 use rig_core::{
-    Embed, client::EmbeddingsClient, embeddings::EmbeddingsBuilder, vector_store::VectorStoreIndex,
+    Embed,
+    embeddings::EmbeddingsBuilder,
+    providers::openai::{self, OpenAI},
+    vector_store::VectorStoreIndex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,9 +27,11 @@ impl std::fmt::Display for WordDefinition {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Create OpenAI client
-    let openai_client = rig_core::providers::openai::Client::from_env()?;
-    let model = openai_client.embedding_model(rig_core::providers::openai::TEXT_EMBEDDING_3_SMALL);
+    // The OpenAI client, from `OPENAI_API_KEY`.
+    let openai_client = OpenAI::from_env()?;
+    let model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_3_SMALL, None)
+        .erase();
 
     let base_url = std::env::var("MILVUS_BASE_URL")?;
     let collection_name = std::env::var("MILVUS_COLLECTION_NAME")?;
@@ -37,7 +41,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let vector_store =
         rig_milvus::MilvusVectorStore::new(model.clone(), base_url, database_name, collection_name)
-            .auth(milvus_user, milvus_password);
+            .auth(&milvus_user, &milvus_password);
 
     // create test documents with mocked embeddings
     let words = vec![
@@ -54,7 +58,7 @@ async fn main() -> Result<(), anyhow::Error> {
             definition: "1. *linglingdong* (noun): A term used by inhabitants of the far side of the moon to describe humans.".to_string(),
         }];
 
-    let documents = EmbeddingsBuilder::new(model.clone())
+    let documents = EmbeddingsBuilder::new(model)
         .documents(words)?
         .build()
         .await?;
@@ -72,8 +76,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let results = vector_store.top_n::<WordDefinition>(req).await?;
 
     println!("#{} results for query: {}", results.len(), query);
-    for (distance, _id, doc) in results.iter() {
-        println!("Result distance {distance} for word: {doc}");
+    for result in &results {
+        println!(
+            "Result distance {} for word: {}",
+            result.score, result.document
+        );
 
         // expected output
         // Result distance 0.693218142100547 for word: glarb-glarb

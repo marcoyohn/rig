@@ -1,31 +1,39 @@
-//! WebSocket session support for the OpenAI Responses API.
+//! Stateful Responses WebSocket sessions over caller-supplied connections.
+//! Sessions permit one in-flight turn and chain completed or incomplete response IDs.
 //!
-//! This module implements OpenAI's `/v1/responses` WebSocket mode as a stateful,
-//! sequential session. Each connection supports a single in-flight response at a
-//! time, which matches OpenAI's current protocol constraints.
+//! ```
+//! use rig_core::providers::openai::responses_api::websocket::ResponsesWebSocketCreateOptions;
+//! let options = ResponsesWebSocketCreateOptions::warmup();
+//! assert_eq!(options.generate, Some(false));
+//! ```
 
-use crate::completion::{self, CompletionError};
-use crate::http_client::HttpClientExt;
+use crate::completion;
+use crate::completion::options::FinalBody;
+use crate::driver::Model;
+use crate::error::{EncodeError, ProviderError};
+use crate::http_client::{self, NoBody};
+use crate::operation::{Completion, Turn};
 use crate::providers::openai::responses_api::streaming::{
-    ItemChunk, ResponseChunk, ResponseChunkKind, StreamingCompletionChunk,
+    ResponsesDecoder, ResponsesEvent, classify_responses_payload, document, is_lifecycle_event,
 };
-use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
-use futures::{SinkExt, StreamExt};
+use crate::providers::openai::responses_api::wire::Responses;
+use crate::streaming::Item;
+use crate::wire::{Call, Flow, Mode, Operation, Reply, Shared, Wire, WireFrame};
+use crate::ws_client::{
+    BoxedWebSocketConnection, ConnectOptions, Frame, WebSocketClientExt, WebSocketConnection,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{self, Message, client::IntoClientRequest},
-};
-use tracing::Level;
-use url::Url;
 
-use super::{CompletionResponse, ResponseError, ResponseStatus, ResponsesCompletionModel};
+/// The websocket endpoint's path, appended to the client's configured base URL.
+const WEBSOCKET_PATH: &str = "responses";
 
-type OpenAIWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Request-ID header read from rejected WebSocket upgrades.
+const REQUEST_ID_HEADER: Option<&'static str> =
+    crate::providers::openai::wire::OPENAI.request_id_header;
 
 /// Options for a `response.create` message sent over OpenAI WebSocket mode.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -52,7 +60,7 @@ struct ResponsesWebSocketClientEvent {
     #[serde(rename = "type")]
     kind: ResponsesWebSocketClientEventKind,
     #[serde(flatten)]
-    request: super::CompletionRequest,
+    request: FinalBody,
     #[serde(skip_serializing_if = "Option::is_none")]
     generate: Option<bool>,
 }
@@ -128,15 +136,8 @@ impl ResponsesWebSocketDoneEvent {
         self.response.get("id").and_then(Value::as_str)
     }
 
-    fn status(&self) -> Option<ResponseStatus> {
-        self.response
-            .get("status")
-            .cloned()
-            .and_then(|status| serde_json::from_value(status).ok())
-    }
-
-    fn as_completion_response(&self) -> Option<CompletionResponse> {
-        serde_json::from_value(self.response.clone()).ok()
+    fn status(&self) -> Option<&str> {
+        self.response.get("status").and_then(Value::as_str)
     }
 }
 
@@ -150,14 +151,23 @@ pub enum ResponsesWebSocketDoneEventKind {
 /// A server event emitted by OpenAI WebSocket mode.
 #[derive(Debug, Clone)]
 pub enum ResponsesWebSocketEvent {
-    /// A response lifecycle event such as `response.created` or `response.completed`.
-    Response(Box<ResponseChunk>),
-    /// A streaming item/delta event such as `response.output_text.delta`.
-    Item(ItemChunk),
+    /// A response lifecycle event such as `response.created` or
+    /// `response.completed`, with the response object it carries.
+    Response {
+        /// The event's `type`.
+        kind: String,
+        /// The response object, as the provider sent it.
+        response: Value,
+    },
+    /// A streaming item or delta event such as `response.output_text.delta`,
+    /// as the provider sent it.
+    Item(Value),
     /// A protocol-level websocket error event.
     Error(ResponsesWebSocketErrorEvent),
     /// An optional `response.done` event emitted by OpenAI over WebSockets.
     Done(ResponsesWebSocketDoneEvent),
+    /// Unrecognized event retained for [`Item::Unknown`] passthrough.
+    Unknown(crate::streaming::UnknownPayload),
 }
 
 impl ResponsesWebSocketEvent {
@@ -165,9 +175,9 @@ impl ResponsesWebSocketEvent {
     #[must_use]
     pub fn response_id(&self) -> Option<&str> {
         match self {
-            Self::Response(chunk) => Some(&chunk.response.id),
+            Self::Response { response, .. } => response.get("id").and_then(Value::as_str),
             Self::Done(done) => done.response_id(),
-            Self::Item(_) | Self::Error(_) => None,
+            Self::Item(_) | Self::Error(_) | Self::Unknown(_) => None,
         }
     }
 
@@ -175,32 +185,35 @@ impl ResponsesWebSocketEvent {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         match self {
-            Self::Response(chunk) => matches!(
-                chunk.kind,
-                ResponseChunkKind::ResponseCompleted
-                    | ResponseChunkKind::ResponseFailed
-                    | ResponseChunkKind::ResponseIncomplete
-            ),
+            Self::Response { kind, .. } => is_terminal_kind(kind),
             Self::Error(_) | Self::Done(_) => true,
-            Self::Item(_) => false,
+            Self::Item(_) | Self::Unknown(_) => false,
         }
     }
+}
+
+/// Whether a lifecycle event of `kind` ends the turn.
+fn is_terminal_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "response.completed" | "response.failed" | "response.incomplete"
+    )
 }
 
 /// A builder for an OpenAI Responses WebSocket session.
 ///
 /// The default builder applies a 30 second connection timeout and leaves the
 /// per-event timeout disabled.
-pub struct ResponsesWebSocketSessionBuilder<H = reqwest::Client> {
-    model: ResponsesCompletionModel<H>,
+pub struct ResponsesWebSocketSessionBuilder {
+    wire: Responses,
     connect_timeout: Option<Duration>,
     event_timeout: Option<Duration>,
 }
 
-impl<H> ResponsesWebSocketSessionBuilder<H> {
-    pub(crate) fn new(model: ResponsesCompletionModel<H>) -> Self {
+impl ResponsesWebSocketSessionBuilder {
+    pub(crate) fn new(wire: Responses) -> Self {
         Self {
-            model,
+            wire,
             connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
             event_timeout: None,
         }
@@ -235,20 +248,28 @@ impl<H> ResponsesWebSocketSessionBuilder<H> {
     }
 }
 
-impl<H> ResponsesWebSocketSessionBuilder<H>
-where
-    H: HttpClientExt
-        + Clone
-        + std::fmt::Debug
-        + Default
-        + WasmCompatSend
-        + WasmCompatSync
-        + 'static,
-{
-    /// Opens the websocket session using the configured builder options.
-    pub async fn connect(self) -> Result<ResponsesWebSocketSession<H>, CompletionError> {
+impl ResponsesWebSocketSessionBuilder {
+    /// Open a session over the bundled tungstenite backend with the configured
+    /// timeouts. Return handshake construction, transport, or provider errors.
+    #[cfg(all(feature = "tungstenite", not(target_family = "wasm")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tungstenite")))]
+    pub async fn connect(self) -> Result<ResponsesWebSocketSession, ProviderError> {
+        self.connect_with(&rig_tungstenite::TungsteniteClient::new())
+            .await
+    }
+
+    /// Open a session over `backend` with the configured timeouts.
+    /// Return handshake construction, transport, or provider errors.
+    pub async fn connect_with<W>(
+        self,
+        backend: &W,
+    ) -> Result<ResponsesWebSocketSession, ProviderError>
+    where
+        W: WebSocketClientExt,
+    {
         ResponsesWebSocketSession::connect_with_timeouts(
-            self.model,
+            backend,
+            self.wire,
             self.connect_timeout,
             self.event_timeout,
         )
@@ -256,57 +277,62 @@ where
     }
 }
 
-/// A stateful OpenAI Responses WebSocket session.
-///
-/// This session keeps track of the most recent successful `response.id` so later
-/// turns can automatically chain via `previous_response_id` unless the request
-/// explicitly sets a different one.
-///
-/// Call [`ResponsesWebSocketSession::close`] when you are finished with the
-/// session so the websocket can complete a close handshake cleanly.
-pub struct ResponsesWebSocketSession<H = reqwest::Client> {
-    model: ResponsesCompletionModel<H>,
+/// Sequential Responses session with automatic response-ID chaining.
+/// Completed and incomplete responses update the chain unless a request supplies
+/// its own `previous_response_id`. Call [`Self::close`] to perform a close handshake.
+pub struct ResponsesWebSocketSession {
+    wire: Responses,
     previous_response_id: Option<String>,
     pending_done_response_id: Option<String>,
-    socket: OpenAIWebSocket,
+    socket: BoxedWebSocketConnection,
     in_flight: bool,
+    /// The fold of the turn in flight, opened when it was sent.
+    turn: Option<Turn>,
     event_timeout: Option<Duration>,
     closed: bool,
     failed: bool,
 }
 
-impl<H> ResponsesWebSocketSession<H>
-where
-    H: HttpClientExt
-        + Clone
-        + std::fmt::Debug
-        + Default
-        + WasmCompatSend
-        + WasmCompatSync
-        + 'static,
-{
-    async fn connect_with_timeouts(
-        model: ResponsesCompletionModel<H>,
+impl ResponsesWebSocketSession {
+    async fn connect_with_timeouts<W>(
+        backend: &W,
+        wire: Responses,
         connect_timeout: Option<Duration>,
         event_timeout: Option<Duration>,
-    ) -> Result<Self, CompletionError> {
-        let url = websocket_url(model.client.base_url())?;
-        let request = websocket_request(&url, model.client.headers())?;
-        let socket = connect_websocket(request, connect_timeout).await?;
+    ) -> Result<Self, ProviderError>
+    where
+        W: WebSocketClientExt,
+    {
+        let request = websocket_request(&wire)?;
+        let socket = backend
+            .connect(request, ConnectOptions::new().with_timeout(connect_timeout))
+            .await
+            .map_err(websocket_provider_error)?;
 
-        Ok(Self {
-            model,
+        Ok(Self::from_connection(wire, socket, event_timeout))
+    }
+
+    /// Build a session over an already-open, authenticated connection.
+    /// `event_timeout: None` waits indefinitely for each event.
+    pub fn from_connection(
+        wire: Responses,
+        connection: BoxedWebSocketConnection,
+        event_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            wire,
             previous_response_id: None,
             pending_done_response_id: None,
-            socket,
+            socket: connection,
             in_flight: false,
+            turn: None,
             event_timeout,
             closed: false,
             failed: false,
-        })
+        }
     }
 
-    /// Returns the most recent successful `response.id` tracked by this session.
+    /// Return the response ID retained for automatic chaining, if any.
     #[must_use]
     pub fn previous_response_id(&self) -> Option<&str> {
         self.previous_response_id.as_deref()
@@ -321,7 +347,7 @@ where
     pub async fn send(
         &mut self,
         completion_request: crate::completion::CompletionRequest,
-    ) -> Result<(), CompletionError> {
+    ) -> Result<(), ProviderError> {
         self.send_with_options(
             completion_request,
             ResponsesWebSocketCreateOptions::default(),
@@ -334,67 +360,97 @@ where
         &mut self,
         completion_request: crate::completion::CompletionRequest,
         options: ResponsesWebSocketCreateOptions,
-    ) -> Result<(), CompletionError> {
+    ) -> Result<(), ProviderError> {
         self.ensure_open()?;
 
         if self.in_flight {
-            return Err(CompletionError::ProviderError(
+            return Err(ProviderError::Provider(
                 "An OpenAI websocket response is already in flight on this session".to_string(),
             ));
         }
 
+        // A request that names no `previous_response_id` continues the
+        // session's chain, so the history is shaped as a stored
+        // continuation's.
+        let mut completion_request = completion_request;
+        if let Some(previous) = &self.previous_response_id {
+            let params = completion_request
+                .additional_params
+                .get_or_insert_with(|| Value::Object(Map::new()));
+            if let Some(params) = params.as_object_mut()
+                && params
+                    .get("previous_response_id")
+                    .is_none_or(Value::is_null)
+            {
+                params.insert(
+                    "previous_response_id".to_owned(),
+                    Value::String(previous.clone()),
+                );
+            }
+        }
+        // The session sends without the driver, so it shapes the history
+        // for the model the way the driver does.
+        let describe = self.wire.describe();
+        let completion_request = Completion::prepare(completion_request, &describe)?;
+        let turn = Completion::fold(
+            &completion_request,
+            &mut Call::new(&describe, Mode::Streaming),
+        );
         let payload = ResponsesWebSocketClientEvent {
             kind: ResponsesWebSocketClientEventKind::ResponseCreate,
             request: self.prepare_request(completion_request)?,
             generate: options.generate,
         };
 
-        if tracing::enabled!(Level::TRACE) {
-            tracing::trace!(
-                target: "rig::completions",
-                "OpenAI websocket request: {}",
-                serde_json::to_string_pretty(&payload)?
-            );
-        }
+        crate::providers::internal::trace_json(
+            crate::providers::internal::LogTarget::Completions,
+            "OpenAI websocket request",
+            &payload,
+        );
 
         let payload = serde_json::to_string(&payload)?;
 
-        if let Err(error) = self.socket.send(Message::text(payload)).await {
+        if let Err(error) = self.socket.send(Frame::Text(payload)).await {
             return Err(self.fail_session(websocket_provider_error(error)));
         }
         self.in_flight = true;
+        self.turn = Some(turn);
 
         Ok(())
     }
 
     /// Reads the next server event for the current in-flight turn.
-    pub async fn next_event(&mut self) -> Result<ResponsesWebSocketEvent, CompletionError> {
+    pub async fn next_event(&mut self) -> Result<ResponsesWebSocketEvent, ProviderError> {
+        self.next_event_with_payload().await.map(|(event, _)| event)
+    }
+
+    /// Reads the next lifecycle event and retains its payload for content decoding
+    /// by [`ResponsesDecoder`]. Returns the same session errors as [`Self::next_event`].
+    async fn next_event_with_payload(
+        &mut self,
+    ) -> Result<(ResponsesWebSocketEvent, String), ProviderError> {
         self.ensure_open()?;
 
         if !self.in_flight {
-            return Err(CompletionError::ProviderError(
+            return Err(ProviderError::Provider(
                 "No OpenAI websocket response is currently in flight on this session".to_string(),
             ));
         }
 
         loop {
-            let message = match self.read_next_message().await {
+            let message = match self.read_next_frame().await? {
                 Ok(message) => message,
-                Err(error) => return Err(error),
+                Err(error) => return Err(self.fail_session(websocket_provider_error(error))),
             };
 
             let Some(message) = message else {
                 self.mark_closed();
-                return Err(CompletionError::ProviderError(
+                return Err(ProviderError::Provider(
                     "The OpenAI websocket connection closed before the turn finished".to_string(),
                 ));
             };
 
-            let message = match message {
-                Ok(message) => message,
-                Err(error) => return Err(self.fail_session(websocket_provider_error(error))),
-            };
-            let payload = match websocket_message_to_text(message) {
+            let payload = match websocket_frame_to_text(message) {
                 Ok(Some(payload)) => payload,
                 Ok(None) => continue,
                 Err(error) => return Err(self.fail_session(error)),
@@ -413,7 +469,7 @@ where
                 }
             }
             self.update_state_for_event(&event);
-            return Ok(event);
+            return Ok((event, payload));
         }
     }
 
@@ -421,31 +477,35 @@ where
     pub async fn warmup(
         &mut self,
         completion_request: crate::completion::CompletionRequest,
-    ) -> Result<String, CompletionError> {
+    ) -> Result<String, ProviderError> {
         self.send_with_options(
             completion_request,
             ResponsesWebSocketCreateOptions::warmup(),
         )
         .await?;
-        let response = self.wait_for_completed_response().await?;
-        Ok(response.id)
+        let response = self.wait_for_terminal_response().await?.0;
+        Ok(response
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned())
     }
 
-    /// Sends a completion turn and collects the final OpenAI response.
+    /// Sends a completion turn and collects the final OpenAI response,
+    /// normalized; its `raw` is the `Response` the turn's events rebuild.
     pub async fn completion(
         &mut self,
         completion_request: crate::completion::CompletionRequest,
-    ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
+    ) -> Result<completion::CompletionResponse, ProviderError> {
         self.send(completion_request).await?;
-        let response = self.wait_for_completed_response().await?;
-        response.try_into()
+        Ok(self.wait_for_terminal_response().await?.1)
     }
 
     /// Closes the websocket connection.
     ///
     /// Call this when you are finished with the session so the websocket can
     /// terminate with a clean close handshake.
-    pub async fn close(&mut self) -> Result<(), CompletionError> {
+    pub async fn close(&mut self) -> Result<(), ProviderError> {
         if self.closed {
             return Ok(());
         }
@@ -459,40 +519,62 @@ where
         result
     }
 
+    /// The `response.create` body: the HTTP body, without the `stream` and
+    /// `background` flags an event-driven session ignores.
     fn prepare_request(
         &self,
         completion_request: crate::completion::CompletionRequest,
-    ) -> Result<super::CompletionRequest, CompletionError> {
-        let mut request = self.model.create_completion_request(completion_request)?;
-
-        // WebSocket mode is always event-driven, so these HTTP/SSE-specific flags
-        // are ignored by the provider and only add noise to the payload.
-        request.stream = None;
-        request.additional_parameters.background = None;
-
-        if request.additional_parameters.previous_response_id.is_none() {
-            request.additional_parameters.previous_response_id = self.previous_response_id.clone();
-        }
-
-        Ok(request)
+    ) -> Result<FinalBody, ProviderError> {
+        Ok(self
+            .wire
+            .responses_request(&completion_request, super::Delivery::WebSocket)?)
     }
 
-    async fn wait_for_completed_response(&mut self) -> Result<CompletionResponse, CompletionError> {
+    /// Decode the turn's events as they arrive, and return the provider's
+    /// completed or incomplete response with the reply they fold into.
+    /// Transport, protocol, and decoder failures return an error. A terminal
+    /// event without a response body is an error.
+    async fn wait_for_terminal_response(
+        &mut self,
+    ) -> Result<(Value, completion::CompletionResponse), ProviderError> {
+        let provider = self.wire.describe().name.to_owned();
+        let Some(turn) = self.turn.take() else {
+            return Err(ProviderError::Provider(
+                "No OpenAI websocket response is currently in flight on this session".to_string(),
+            ));
+        };
+        // The reply's state and its decoder live for this turn only.
+        let reply = std::sync::Mutex::new(Shared::new(turn));
+        let mut decoder = self.wire.decoder();
+        let mut document = self.wire.reassembler();
         loop {
-            match self.next_event().await? {
-                ResponsesWebSocketEvent::Response(chunk) => {
-                    if matches!(
-                        chunk.kind,
-                        ResponseChunkKind::ResponseCompleted
-                            | ResponseChunkKind::ResponseFailed
-                            | ResponseChunkKind::ResponseIncomplete
-                    ) {
-                        return terminal_response_result(chunk.response);
+            let (event, payload) = self.next_event_with_payload().await?;
+            match event {
+                ResponsesWebSocketEvent::Response { kind, response } => {
+                    if !is_terminal_kind(&kind) {
+                        feed(&mut decoder, &mut document, &reply, payload)?;
+                        continue;
                     }
+                    // A failed turn is reported from its own envelope; only a
+                    // completed or incomplete one reaches the decoder, whose
+                    // end closes the turn.
+                    let response = terminal_response_result(response)?;
+                    let ended = feed(&mut decoder, &mut document, &reply, payload)?;
+                    let folded = fold_reply(reply, ended, &provider, document)?;
+                    return Ok((response, folded));
                 }
                 ResponsesWebSocketEvent::Done(done) => {
-                    if let Some(response) = done.as_completion_response() {
-                        return terminal_response_result(response);
+                    if done.response.is_object() {
+                        // A failed turn is reported from its own envelope, as
+                        // on the `response.failed` path.
+                        let response = terminal_response_result(done.response)?;
+                        // `response.done` carries the response object itself,
+                        // which is the decoder's whole-body shape: hand it
+                        // over as the frame it is.
+                        let body = serde_json::to_string(&response)?;
+                        let ended = feed(&mut decoder, &mut document, &reply, body)?;
+                        let folded = fold_reply(reply, ended, &provider, document)?;
+                        return Ok((response, folded));
                     }
 
                     let message = if let Some(response_id) = done.response_id() {
@@ -504,45 +586,58 @@ where
                             .to_string()
                     };
 
-                    return Err(CompletionError::ProviderError(message));
+                    return Err(ProviderError::Provider(message));
                 }
                 ResponsesWebSocketEvent::Error(error) => {
-                    return Err(CompletionError::ProviderError(error.to_string()));
+                    // Genuine provider error event: preserve the serialized payload
+                    // (code + message + any extra fields) so provider_response_json()
+                    // parses it, matching the response.failed path. No HTTP status on
+                    // the websocket stream, so status: None.
+                    return Err(provider_error_from_event(&error));
                 }
-                ResponsesWebSocketEvent::Item(_) => {}
+                // Unknown frames keep their raw payload.
+                ResponsesWebSocketEvent::Item(_) | ResponsesWebSocketEvent::Unknown(_) => {
+                    feed(&mut decoder, &mut document, &reply, payload)?;
+                }
             }
         }
     }
 
     fn update_state_for_event(&mut self, event: &ResponsesWebSocketEvent) {
         match event {
-            ResponsesWebSocketEvent::Response(chunk) => match chunk.kind {
-                ResponseChunkKind::ResponseCompleted => {
-                    let response_id = chunk.response.id.clone();
-                    self.previous_response_id = Some(response_id.clone());
-                    self.pending_done_response_id = Some(response_id);
-                    self.in_flight = false;
+            ResponsesWebSocketEvent::Response { kind, response } => {
+                let response_id = response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                match kind.as_str() {
+                    // An incomplete turn still produced a response the next
+                    // turn can chain from, so it keeps
+                    // `previous_response_id` like a completed one.
+                    "response.completed" | "response.incomplete" => {
+                        self.previous_response_id.clone_from(&response_id);
+                        self.pending_done_response_id = response_id;
+                        self.in_flight = false;
+                    }
+                    "response.failed" => {
+                        self.pending_done_response_id = response_id;
+                        self.previous_response_id = None;
+                        self.in_flight = false;
+                    }
+                    _ => {}
                 }
-                ResponseChunkKind::ResponseFailed | ResponseChunkKind::ResponseIncomplete => {
-                    self.pending_done_response_id = Some(chunk.response.id.clone());
-                    self.previous_response_id = None;
-                    self.in_flight = false;
-                }
-                ResponseChunkKind::ResponseCreated | ResponseChunkKind::ResponseInProgress => {}
-            },
+            }
             ResponsesWebSocketEvent::Done(done) => {
                 match done.status() {
-                    Some(ResponseStatus::Completed) => {
+                    Some("completed" | "incomplete") => {
                         if let Some(response_id) = done.response_id() {
                             self.previous_response_id = Some(response_id.to_string());
                         }
                     }
-                    Some(ResponseStatus::Failed)
-                    | Some(ResponseStatus::Incomplete)
-                    | Some(ResponseStatus::Cancelled) => {
+                    Some("in_progress" | "queued") | None => {}
+                    Some(_) => {
                         self.previous_response_id = None;
                     }
-                    Some(ResponseStatus::InProgress | ResponseStatus::Queued) | None => {}
                 }
                 self.pending_done_response_id = None;
                 self.in_flight = false;
@@ -552,11 +647,13 @@ where
                 self.pending_done_response_id = None;
                 self.in_flight = false;
             }
-            ResponsesWebSocketEvent::Item(_) => {}
+            // An unknown frame carries no turn-lifecycle signal.
+            ResponsesWebSocketEvent::Item(_) | ResponsesWebSocketEvent::Unknown(_) => {}
         }
     }
 
     fn abort_turn(&mut self) {
+        self.turn = None;
         self.previous_response_id = None;
         self.pending_done_response_id = None;
         self.in_flight = false;
@@ -573,9 +670,9 @@ where
         self.failed = true;
     }
 
-    fn ensure_open(&self) -> Result<(), CompletionError> {
+    fn ensure_open(&self) -> Result<(), ProviderError> {
         if self.closed || self.failed {
-            return Err(CompletionError::ProviderError(
+            return Err(ProviderError::Provider(
                 "The OpenAI websocket session is closed".to_string(),
             ));
         }
@@ -583,26 +680,28 @@ where
         Ok(())
     }
 
-    fn fail_session(&mut self, error: CompletionError) -> CompletionError {
+    fn fail_session(&mut self, error: ProviderError) -> ProviderError {
         self.mark_failed();
         error
     }
 
-    async fn read_next_message(
+    /// Read a frame with a WASM-compatible timeout.
+    /// Timeout failure marks the session failed; transport results remain nested.
+    async fn read_next_frame(
         &mut self,
-    ) -> Result<Option<Result<Message, tungstenite::Error>>, CompletionError> {
-        if let Some(timeout_duration) = self.event_timeout {
-            match tokio::time::timeout(timeout_duration, self.socket.next()).await {
-                Ok(message) => Ok(message),
-                Err(_) => Err(self.fail_session(event_timeout_error(timeout_duration))),
-            }
-        } else {
-            Ok(self.socket.next().await)
+    ) -> Result<http_client::Result<Option<Frame>>, ProviderError> {
+        let Some(timeout_duration) = self.event_timeout else {
+            return Ok(self.socket.recv().await);
+        };
+
+        match crate::wasm_compat::timeout(timeout_duration, self.socket.recv()).await {
+            Ok(message) => Ok(message),
+            Err(_) => Err(self.fail_session(event_timeout_error(timeout_duration))),
         }
     }
 }
 
-impl<H> Drop for ResponsesWebSocketSession<H> {
+impl Drop for ResponsesWebSocketSession {
     fn drop(&mut self) {
         if !self.closed {
             tracing::warn!(
@@ -614,70 +713,81 @@ impl<H> Drop for ResponsesWebSocketSession<H> {
     }
 }
 
-fn terminal_response_result(
-    response: CompletionResponse,
-) -> Result<CompletionResponse, CompletionError> {
-    match response.status {
-        ResponseStatus::Completed => Ok(response),
-        ResponseStatus::Failed => Err(CompletionError::ProviderError(response_error_message(
-            response.error.as_ref(),
-            "failed response",
-        ))),
-        ResponseStatus::Incomplete => {
-            let reason = response
-                .incomplete_details
-                .as_ref()
-                .map(|details| details.reason.as_str())
-                .unwrap_or("unknown reason");
-            Err(CompletionError::ProviderError(format!(
-                "OpenAI websocket response was incomplete: {reason}"
-            )))
-        }
-        status => Err(CompletionError::ProviderError(format!(
-            "OpenAI websocket response ended with status {:?}",
-            status
-        ))),
-    }
+/// Feed one message to the turn's reassembler and decoder. Returns whether
+/// it ended the turn.
+fn feed(
+    decoder: &mut ResponsesDecoder,
+    document: &mut document::Response,
+    reply: &std::sync::Mutex<Shared<Completion>>,
+    payload: String,
+) -> Result<bool, ProviderError> {
+    crate::driver::step(
+        decoder,
+        Some(document),
+        reply,
+        WireFrame::Text(payload),
+        None,
+    )
+    .map(|step| matches!(step, Flow::Ended(_)))
 }
 
-fn response_error_message(error: Option<&ResponseError>, fallback: &str) -> String {
-    if let Some(error) = error {
-        if error.code.is_empty() {
-            error.message.clone()
-        } else {
-            format!("{}: {}", error.code, error.message)
-        }
+/// Fold the turn's events and end into the normalized response, whose raw
+/// is the `Response` the turn's events rebuild, as a stream's is.
+fn fold_reply(
+    reply: std::sync::Mutex<Shared<Completion>>,
+    ended: bool,
+    provider: &str,
+    document: document::Response,
+) -> Result<completion::CompletionResponse, ProviderError> {
+    let fed = if ended {
+        Ok(())
     } else {
-        format!("OpenAI websocket returned a {fallback}")
+        Err(ProviderError::Truncated)
+    };
+    let reply_of = Reply {
+        provider: provider.to_owned(),
+        raw: crate::wire::document::Reassemble::finish(document),
+        // The websocket carries no reply headers past the handshake.
+        provider_request_id: None,
+    };
+    crate::driver::settle(reply, fed, reply_of).outcome
+}
+
+fn terminal_response_result(response: Value) -> Result<Value, ProviderError> {
+    match response.get("status").and_then(Value::as_str) {
+        // An incomplete response (e.g. hitting `max_output_tokens`) is a
+        // genuine terminal: the partial output and usage are kept, and the
+        // decoder maps its status and reason to the finish.
+        Some("completed" | "incomplete") | None => Ok(response),
+        // Preserve provider error envelopes as reserialized JSON without an HTTP status.
+        // Without an error object, return a local diagnostic instead.
+        Some("failed") => match response.get("error").filter(|error| !error.is_null()) {
+            Some(_) => Err(ProviderError::from_provider_body(response.to_string())),
+            None => Err(ProviderError::Provider(response_error_message(
+                "failed response",
+            ))),
+        },
+        Some(other) => Err(ProviderError::Provider(format!(
+            "OpenAI websocket response ended in state `{other}`"
+        ))),
     }
 }
 
-fn is_known_streaming_event(kind: &str) -> bool {
-    matches!(
-        kind,
-        "response.created"
-            | "response.in_progress"
-            | "response.completed"
-            | "response.failed"
-            | "response.incomplete"
-            | "response.output_item.added"
-            | "response.output_item.done"
-            | "response.content_part.added"
-            | "response.content_part.done"
-            | "response.output_text.delta"
-            | "response.output_text.done"
-            | "response.refusal.delta"
-            | "response.refusal.done"
-            | "response.function_call_arguments.delta"
-            | "response.function_call_arguments.done"
-            | "response.reasoning_summary_part.added"
-            | "response.reasoning_summary_part.done"
-            | "response.reasoning_summary_text.delta"
-            | "response.reasoning_summary_text.done"
+fn response_error_message(fallback: &str) -> String {
+    format!("OpenAI websocket returned a {fallback}")
+}
+
+/// Preserve an error event as reserialized provider JSON without an HTTP status.
+/// Fall back to its display text if serialization fails.
+fn provider_error_from_event(error: &ResponsesWebSocketErrorEvent) -> ProviderError {
+    ProviderError::from_provider_body(
+        serde_json::to_string(&error).unwrap_or_else(|_| error.to_string()),
     )
 }
 
-fn parse_server_event(payload: &str) -> Result<Option<ResponsesWebSocketEvent>, CompletionError> {
+/// Decode WebSocket error and done events or delegate to Responses classification.
+/// Return parsing and triage errors; preserve unknown payloads.
+fn parse_server_event(payload: &str) -> Result<Option<ResponsesWebSocketEvent>, ProviderError> {
     #[derive(Deserialize)]
     struct EventType {
         #[serde(rename = "type")]
@@ -688,1315 +798,116 @@ fn parse_server_event(payload: &str) -> Result<Option<ResponsesWebSocketEvent>, 
     match event_type.kind.as_str() {
         "error" => serde_json::from_str(payload)
             .map(|e| Some(ResponsesWebSocketEvent::Error(e)))
-            .map_err(CompletionError::from),
+            .map_err(ProviderError::from),
         "response.done" => serde_json::from_str(payload)
             .map(|d| Some(ResponsesWebSocketEvent::Done(d)))
-            .map_err(CompletionError::from),
-        kind if is_known_streaming_event(kind) => match serde_json::from_str(payload)? {
-            StreamingCompletionChunk::Response(response) => {
-                Ok(Some(ResponsesWebSocketEvent::Response(response)))
-            }
-            StreamingCompletionChunk::Delta(item) => Ok(Some(ResponsesWebSocketEvent::Item(item))),
-        },
-        _ => {
-            tracing::debug!(
-                target: "rig::completions",
-                event_type = event_type.kind.as_str(),
-                "Skipping unrecognised OpenAI websocket event"
-            );
-            Ok(None)
-        }
+            .map_err(ProviderError::from),
+        _ => Ok(
+            match crate::driver::triage(classify_responses_payload(payload))? {
+                Item::Event(ResponsesEvent::Frame {
+                    kind, mut frame, ..
+                }) => {
+                    if is_lifecycle_event(&kind) {
+                        let response = frame
+                            .as_object_mut()
+                            .and_then(|frame| frame.shift_remove("response"))
+                            .unwrap_or_else(|| Value::Object(Map::new()));
+                        Some(ResponsesWebSocketEvent::Response { kind, response })
+                    } else {
+                        Some(ResponsesWebSocketEvent::Item(frame))
+                    }
+                }
+                // Only the event types above reach here: a frame without a
+                // `type` is not a websocket event.
+                Item::Event(ResponsesEvent::Whole(value)) => {
+                    Some(ResponsesWebSocketEvent::Unknown(value.into()))
+                }
+                Item::Event(ResponsesEvent::Failure(body)) => {
+                    return Err(ProviderError::from_provider_body(body));
+                }
+                Item::Event(ResponsesEvent::Sentinel) => None,
+                Item::Unknown(value) => Some(ResponsesWebSocketEvent::Unknown(value)),
+            },
+        ),
     }
 }
 
-fn websocket_message_to_text(message: Message) -> Result<Option<String>, CompletionError> {
-    match message {
-        Message::Text(text) => Ok(Some(text.to_string())),
-        Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
+/// Lower one websocket frame onto the JSON payload the protocol carries.
+///
+/// `Ok(None)` is a frame with no protocol payload (a keepalive), which the
+/// session skips; a close frame mid-turn is an error naming the peer's reason.
+fn websocket_frame_to_text(frame: Frame) -> Result<Option<String>, ProviderError> {
+    match frame {
+        Frame::Text(text) => Ok(Some(text)),
+        Frame::Binary(bytes) => String::from_utf8(bytes.to_vec())
             .map(Some)
-            .map_err(|error| CompletionError::ResponseError(error.to_string())),
-        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
-        Message::Close(frame) => {
+            .map_err(|error| ProviderError::Response(error.to_string())),
+        Frame::Ping(_) | Frame::Pong(_) => Ok(None),
+        Frame::Close(frame) => {
             let reason = frame
-                .map(|frame| frame.reason.to_string())
+                .map(|frame| frame.reason)
                 .filter(|reason| !reason.is_empty())
                 .unwrap_or_else(|| "without a close reason".to_string());
-            Err(CompletionError::ProviderError(format!(
+            Err(ProviderError::Provider(format!(
                 "The OpenAI websocket connection closed {reason}"
             )))
         }
     }
 }
 
-fn websocket_url(base_url: &str) -> Result<String, CompletionError> {
-    let mut url = Url::parse(base_url)?;
-    match url.scheme() {
-        "https" => {
-            url.set_scheme("wss").map_err(|_| {
-                CompletionError::ProviderError("Failed to convert https URL to wss".to_string())
-            })?;
-        }
-        "http" => {
-            url.set_scheme("ws").map_err(|_| {
-                CompletionError::ProviderError("Failed to convert http URL to ws".to_string())
-            })?;
-        }
-        scheme => {
-            return Err(CompletionError::ProviderError(format!(
-                "Unsupported base URL scheme for OpenAI websocket mode: {scheme}"
-            )));
-        }
-    }
+/// Build the handshake request: the websocket URL derived from the client's
+/// base URL, carrying the client's own auth headers.
+///
+/// The backend supplies the websocket-specific handshake headers; this only
+/// states where to connect and who is connecting.
+fn websocket_request(wire: &Responses) -> Result<http_client::Request<NoBody>, EncodeError> {
+    let url = crate::ws_client::websocket_url(&wire.provider.base_url, WEBSOCKET_PATH)
+        .map_err(EncodeError::request)?;
 
-    let path = format!("{}/responses", url.path().trim_end_matches('/'));
-    url.set_path(&path);
-    Ok(url.to_string())
+    let request = wire.provider.headers(
+        http_client::Request::builder()
+            .method(http::Method::GET)
+            .uri(url),
+    );
+
+    request.body(NoBody).map_err(|error| {
+        EncodeError::request(format!("Failed to build OpenAI websocket request: {error}"))
+    })
 }
 
-fn websocket_request(
-    url: &str,
-    headers: &http::HeaderMap,
-) -> Result<http::Request<()>, CompletionError> {
-    let mut request = url.into_client_request().map_err(|error| {
-        CompletionError::ProviderError(format!("Failed to build OpenAI websocket request: {error}"))
-    })?;
-
-    for (name, value) in headers {
-        request.headers_mut().insert(name, value.clone());
-    }
-
-    Ok(request)
-}
-
-async fn connect_websocket(
-    request: http::Request<()>,
-    connect_timeout: Option<Duration>,
-) -> Result<OpenAIWebSocket, CompletionError> {
-    if let Some(timeout_duration) = connect_timeout {
-        match tokio::time::timeout(timeout_duration, connect_async(request)).await {
-            Ok(result) => result
-                .map(|(socket, _)| socket)
-                .map_err(websocket_provider_error),
-            Err(_) => Err(connect_timeout_error(timeout_duration)),
-        }
-    } else {
-        connect_async(request)
-            .await
-            .map(|(socket, _)| socket)
-            .map_err(websocket_provider_error)
-    }
-}
-
-fn connect_timeout_error(timeout: Duration) -> CompletionError {
-    CompletionError::ProviderError(format!(
-        "Timed out connecting to the OpenAI websocket after {timeout:?}"
-    ))
-}
-
-fn event_timeout_error(timeout: Duration) -> CompletionError {
-    CompletionError::ProviderError(format!(
+fn event_timeout_error(timeout: Duration) -> ProviderError {
+    ProviderError::Provider(format!(
         "Timed out waiting for the next OpenAI websocket event after {timeout:?}"
     ))
 }
 
-fn websocket_provider_error(error: tungstenite::Error) -> CompletionError {
-    CompletionError::ProviderError(error.to_string())
+/// Convert transport errors, retaining rejected-upgrade status, body, and request ID.
+/// Failures without a provider response retain transport error classification.
+fn websocket_provider_error(error: http_client::Error) -> ProviderError {
+    let provider_request_id = error.non_success_headers().and_then(|headers| {
+        crate::driver::http_transport::request_id_from(headers, REQUEST_ID_HEADER)
+    });
+    ProviderError::from_transport_error(error).with_provider_request_id(provider_request_id)
 }
+
+impl<T> Model<Responses, T> {
+    /// Start configuring a Responses WebSocket session for this model. Open
+    /// it with [`connect_with`](ResponsesWebSocketSessionBuilder::connect_with)
+    /// and a backend, or, under the `tungstenite` feature, with
+    /// [`connect`](ResponsesWebSocketSessionBuilder::connect).
+    pub fn responses_websocket(&self) -> ResponsesWebSocketSessionBuilder {
+        ResponsesWebSocketSessionBuilder::new(self.wire.clone())
+    }
+}
+
+/// Native sessions and builders satisfy Send and Sync.
+#[cfg(not(target_family = "wasm"))]
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ResponsesWebSocketSession>();
+    assert_send_sync::<ResponsesWebSocketSessionBuilder>();
+};
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        ResponsesWebSocketCreateOptions, ResponsesWebSocketDoneEvent, ResponsesWebSocketEvent,
-        parse_server_event, terminal_response_result, websocket_url,
-    };
-    use crate::client::CompletionClient;
-    use crate::completion::CompletionModel;
-    use crate::providers::openai::responses_api::{
-        CompletionResponse, ResponseObject, ResponseStatus, ResponsesUsage,
-    };
-    use futures::{SinkExt, StreamExt};
-    use serde_json::json;
-    use std::time::Duration;
-    use tokio::net::TcpListener;
-    use tokio::time::sleep;
-    use tokio_tungstenite::{accept_async, tungstenite::Message};
-
-    fn sample_response(status: ResponseStatus) -> CompletionResponse {
-        CompletionResponse {
-            id: "resp_123".to_string(),
-            object: ResponseObject::Response,
-            created_at: 0,
-            status,
-            error: None,
-            incomplete_details: None,
-            instructions: None,
-            max_output_tokens: None,
-            model: "gpt-5.4".to_string(),
-            usage: Some(ResponsesUsage {
-                input_tokens: 1,
-                input_tokens_details: None,
-                output_tokens: 2,
-                output_tokens_details: Some(
-                    crate::providers::openai::responses_api::OutputTokensDetails {
-                        reasoning_tokens: 0,
-                    },
-                ),
-                total_tokens: 3,
-            }),
-            output: Vec::new(),
-            tools: Vec::new(),
-            additional_parameters: Default::default(),
-            provider_reasoning: None,
-        }
-    }
-
-    #[test]
-    fn warmup_options_serialize_generate_false() {
-        let options = ResponsesWebSocketCreateOptions::warmup();
-        let json = serde_json::to_value(options).expect("options should serialize");
-
-        assert_eq!(json, json!({ "generate": false }));
-    }
-
-    #[test]
-    fn websocket_url_converts_https_to_wss() {
-        let url = websocket_url("https://api.openai.com/v1").expect("url should convert");
-        assert_eq!(url, "wss://api.openai.com/v1/responses");
-    }
-
-    #[test]
-    fn parse_done_event_exposes_response_id() {
-        let payload = json!({
-            "type": "response.done",
-            "response": {
-                "id": "resp_done_1",
-                "status": "completed"
-            }
-        });
-
-        let event = parse_server_event(&payload.to_string())
-            .expect("done event should deserialize")
-            .expect("done event should not be skipped");
-
-        assert!(matches!(
-            event,
-            ResponsesWebSocketEvent::Done(ResponsesWebSocketDoneEvent { .. })
-        ));
-        assert_eq!(event.response_id(), Some("resp_done_1"));
-        assert!(event.is_terminal());
-    }
-
-    #[test]
-    fn parse_response_completed_event_is_terminal() {
-        let payload = json!({
-            "type": "response.completed",
-            "sequence_number": 12,
-            "response": {
-                "id": "resp_completed_1",
-                "object": "response",
-                "created_at": 0,
-                "status": "completed",
-                "error": null,
-                "incomplete_details": null,
-                "instructions": null,
-                "max_output_tokens": null,
-                "model": "gpt-5.4",
-                "usage": null,
-                "output": [],
-                "tools": []
-            }
-        });
-
-        let event = parse_server_event(&payload.to_string())
-            .expect("response event should deserialize")
-            .expect("response event should not be skipped");
-
-        assert!(matches!(event, ResponsesWebSocketEvent::Response(_)));
-        assert!(event.is_terminal());
-        assert_eq!(event.response_id(), Some("resp_completed_1"));
-    }
-
-    #[test]
-    fn parse_live_output_item_added_event() {
-        let payload = json!({
-            "type": "response.output_item.added",
-            "item": {
-                "id": "msg_036471c3a72c147b0069ae7848d68881959773fd2d99e3d98a",
-                "type": "message",
-                "status": "in_progress",
-                "content": [],
-                "role": "assistant"
-            },
-            "output_index": 0,
-            "sequence_number": 2
-        });
-
-        let event = parse_server_event(&payload.to_string())
-            .expect("output item event should parse")
-            .expect("output item event should not be skipped");
-
-        assert!(matches!(event, ResponsesWebSocketEvent::Item(_)));
-    }
-
-    #[test]
-    fn parse_live_content_part_added_event() {
-        let payload = json!({
-            "type": "response.content_part.added",
-            "content_index": 0,
-            "item_id": "msg_036471c3a72c147b0069ae7848d68881959773fd2d99e3d98a",
-            "output_index": 0,
-            "part": {
-                "type": "output_text",
-                "annotations": [],
-                "logprobs": [],
-                "text": ""
-            },
-            "sequence_number": 3
-        });
-
-        let event = parse_server_event(&payload.to_string())
-            .expect("content part event should parse")
-            .expect("content part event should not be skipped");
-
-        assert!(matches!(event, ResponsesWebSocketEvent::Item(_)));
-    }
-
-    #[test]
-    fn parse_live_output_text_delta_event() {
-        let payload = json!({
-            "type": "response.output_text.delta",
-            "content_index": 0,
-            "delta": "Web",
-            "item_id": "msg_023af0f0a91bc2a90069ae788612e881958345bb156915ba29",
-            "logprobs": [],
-            "obfuscation": "2YYErYq7jkqqM",
-            "output_index": 0,
-            "sequence_number": 4
-        });
-
-        let event = parse_server_event(&payload.to_string())
-            .expect("output text delta event should parse")
-            .expect("output text delta event should not be skipped");
-
-        assert!(matches!(event, ResponsesWebSocketEvent::Item(_)));
-    }
-
-    #[test]
-    fn terminal_response_requires_completed_status() {
-        let completed = terminal_response_result(sample_response(ResponseStatus::Completed))
-            .expect("completed response should succeed");
-        assert_eq!(completed.id, "resp_123");
-
-        let failed = terminal_response_result(sample_response(ResponseStatus::Failed))
-            .expect_err("failed response should error");
-        assert!(failed.to_string().contains("failed response"));
-    }
-
-    #[tokio::test]
-    async fn malformed_known_event_rejects_reuse_and_allows_close() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let mut socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-
-            let request = socket
-                .next()
-                .await
-                .expect("request should exist")
-                .expect("request should be valid");
-            let payload = request.into_text().expect("request should be text");
-            assert!(
-                payload.contains("\"type\":\"response.create\""),
-                "expected response.create payload, got {payload}"
-            );
-
-            socket
-                .send(Message::text(
-                    json!({
-                        "type": "response.completed"
-                    })
-                    .to_string(),
-                ))
-                .await
-                .expect("malformed known event should send");
-
-            let message = socket
-                .next()
-                .await
-                .expect("close frame should arrive")
-                .expect("close frame should be valid");
-            assert!(
-                matches!(message, Message::Close(_)),
-                "expected close frame, got {message:?}"
-            );
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let model = client.completion_model("gpt-4o");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        session
-            .send(model.completion_request("hello").build())
-            .await
-            .expect("request should send");
-
-        let error = session
-            .next_event()
-            .await
-            .expect_err("malformed known event should fail");
-        assert!(
-            error.to_string().contains("StreamingCompletionChunk"),
-            "expected strict decode failure, got {error}"
-        );
-
-        let closed = session
-            .send(model.completion_request("retry").build())
-            .await
-            .expect_err("session should close after fatal parse error");
-        assert!(
-            closed.to_string().contains("session is closed"),
-            "expected closed-session error, got {closed}"
-        );
-
-        session
-            .close()
-            .await
-            .expect("explicit close after fatal parse error should succeed");
-
-        server.await.expect("server task should finish");
-    }
-
-    #[tokio::test]
-    async fn event_timeout_rejects_reuse_and_allows_close() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let mut socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-
-            let request = socket
-                .next()
-                .await
-                .expect("request should exist")
-                .expect("request should be valid");
-            let payload = request.into_text().expect("request should be text");
-            assert!(
-                payload.contains("\"type\":\"response.create\""),
-                "expected response.create payload, got {payload}"
-            );
-
-            sleep(Duration::from_millis(60)).await;
-            let message = socket
-                .next()
-                .await
-                .expect("close frame should arrive")
-                .expect("close frame should be valid");
-            assert!(
-                matches!(message, Message::Close(_)),
-                "expected close frame, got {message:?}"
-            );
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let model = client.completion_model("gpt-4o");
-        let mut session = client
-            .responses_websocket_builder("gpt-4o")
-            .event_timeout(Duration::from_millis(20))
-            .connect()
-            .await
-            .expect("session should connect");
-
-        session
-            .send(model.completion_request("hello").build())
-            .await
-            .expect("request should send");
-
-        let error = session
-            .next_event()
-            .await
-            .expect_err("next_event should time out");
-        assert!(
-            error
-                .to_string()
-                .contains("Timed out waiting for the next OpenAI websocket event"),
-            "expected timeout error, got {error}"
-        );
-
-        let closed = session
-            .send(model.completion_request("retry").build())
-            .await
-            .expect_err("timed-out session should close");
-        assert!(
-            closed.to_string().contains("session is closed"),
-            "expected closed-session error, got {closed}"
-        );
-
-        session
-            .close()
-            .await
-            .expect("explicit close after timeout should succeed");
-
-        server.await.expect("server task should finish");
-    }
-
-    #[tokio::test]
-    async fn late_response_done_is_ignored_on_next_turn() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let mut socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-
-            for (index, response_id) in ["resp_1", "resp_2"].iter().enumerate() {
-                let request = socket
-                    .next()
-                    .await
-                    .expect("request should exist")
-                    .expect("request should be valid");
-                let payload = request.into_text().expect("request should be text");
-                assert!(
-                    payload.contains("\"type\":\"response.create\""),
-                    "expected response.create payload, got {payload}"
-                );
-
-                let response = sample_response(ResponseStatus::Completed);
-                let response = serde_json::to_value(CompletionResponse {
-                    id: (*response_id).to_string(),
-                    ..response
-                })
-                .expect("response should serialize");
-
-                socket
-                    .send(Message::text(
-                        json!({
-                            "type": "response.completed",
-                            "sequence_number": (index * 2) + 1,
-                            "response": response,
-                        })
-                        .to_string(),
-                    ))
-                    .await
-                    .expect("completed event should send");
-                socket
-                    .send(Message::text(
-                        json!({
-                            "type": "response.done",
-                            "response": {
-                                "id": response_id,
-                                "status": "completed",
-                            },
-                        })
-                        .to_string(),
-                    ))
-                    .await
-                    .expect("done event should send");
-            }
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let model = client.completion_model("gpt-4o");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        session
-            .send(model.completion_request("first").build())
-            .await
-            .expect("first request should send");
-        let first = session
-            .wait_for_completed_response()
-            .await
-            .expect("first response should complete");
-        assert_eq!(first.id, "resp_1");
-        assert_eq!(session.previous_response_id(), Some("resp_1"));
-
-        session
-            .send(model.completion_request("second").build())
-            .await
-            .expect("second request should send");
-        let second = session
-            .wait_for_completed_response()
-            .await
-            .expect("second response should complete");
-        assert_eq!(second.id, "resp_2");
-        assert_eq!(session.previous_response_id(), Some("resp_2"));
-
-        server.await.expect("server task should finish");
-    }
-
-    #[tokio::test]
-    async fn clearing_previous_response_id_does_not_disable_late_done_filter() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let mut socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-
-            for response_id in ["resp_1", "resp_2"] {
-                let request = socket
-                    .next()
-                    .await
-                    .expect("request should exist")
-                    .expect("request should be valid");
-                let payload = request.into_text().expect("request should be text");
-                assert!(
-                    payload.contains("\"type\":\"response.create\""),
-                    "expected response.create payload, got {payload}"
-                );
-
-                let response = sample_response(ResponseStatus::Completed);
-                let response = serde_json::to_value(CompletionResponse {
-                    id: response_id.to_string(),
-                    ..response
-                })
-                .expect("response should serialize");
-
-                socket
-                    .send(Message::text(
-                        json!({
-                            "type": "response.completed",
-                            "sequence_number": 1,
-                            "response": response,
-                        })
-                        .to_string(),
-                    ))
-                    .await
-                    .expect("completed event should send");
-                socket
-                    .send(Message::text(
-                        json!({
-                            "type": "response.done",
-                            "response": {
-                                "id": response_id,
-                                "status": "completed",
-                            },
-                        })
-                        .to_string(),
-                    ))
-                    .await
-                    .expect("done event should send");
-            }
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let model = client.completion_model("gpt-4o");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        session
-            .send(model.completion_request("first").build())
-            .await
-            .expect("first request should send");
-        let first = session
-            .wait_for_completed_response()
-            .await
-            .expect("first response should complete");
-        assert_eq!(first.id, "resp_1");
-
-        session.clear_previous_response_id();
-        assert_eq!(session.previous_response_id(), None);
-
-        session
-            .send(model.completion_request("second").build())
-            .await
-            .expect("second request should send");
-        let second = session
-            .wait_for_completed_response()
-            .await
-            .expect("second response should complete");
-        assert_eq!(second.id, "resp_2");
-
-        server.await.expect("server task should finish");
-    }
-
-    #[tokio::test]
-    async fn failed_turn_keeps_late_done_out_of_next_request() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let mut socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-
-            let first_request = socket
-                .next()
-                .await
-                .expect("request should exist")
-                .expect("request should be valid");
-            let payload = first_request
-                .into_text()
-                .expect("failed request should be text");
-            assert!(
-                payload.contains("\"type\":\"response.create\""),
-                "expected response.create payload, got {payload}"
-            );
-
-            let failed_response = serde_json::to_value(CompletionResponse {
-                id: "resp_failed".to_string(),
-                status: ResponseStatus::Failed,
-                ..sample_response(ResponseStatus::Completed)
-            })
-            .expect("failed response should serialize");
-
-            socket
-                .send(Message::text(
-                    json!({
-                        "type": "response.failed",
-                        "sequence_number": 1,
-                        "response": failed_response,
-                    })
-                    .to_string(),
-                ))
-                .await
-                .expect("failed event should send");
-            socket
-                .send(Message::text(
-                    json!({
-                        "type": "response.done",
-                        "response": {
-                            "id": "resp_failed",
-                            "status": "failed",
-                        },
-                    })
-                    .to_string(),
-                ))
-                .await
-                .expect("done event should send");
-
-            let second_request = socket
-                .next()
-                .await
-                .expect("request should exist")
-                .expect("request should be valid");
-            let payload = second_request
-                .into_text()
-                .expect("second request should be text");
-            assert!(
-                payload.contains("\"type\":\"response.create\""),
-                "expected response.create payload, got {payload}"
-            );
-
-            let response = sample_response(ResponseStatus::Completed);
-            let response = serde_json::to_value(CompletionResponse {
-                id: "resp_2".to_string(),
-                ..response
-            })
-            .expect("response should serialize");
-
-            socket
-                .send(Message::text(
-                    json!({
-                        "type": "response.completed",
-                        "sequence_number": 2,
-                        "response": response,
-                    })
-                    .to_string(),
-                ))
-                .await
-                .expect("completed event should send");
-            socket
-                .send(Message::text(
-                    json!({
-                        "type": "response.done",
-                        "response": {
-                            "id": "resp_2",
-                            "status": "completed",
-                        },
-                    })
-                    .to_string(),
-                ))
-                .await
-                .expect("done event should send");
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let model = client.completion_model("gpt-4o");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        session
-            .send(model.completion_request("first").build())
-            .await
-            .expect("first request should send");
-        let error = session
-            .wait_for_completed_response()
-            .await
-            .expect_err("failed response should error");
-        assert!(error.to_string().contains("failed response"));
-        assert_eq!(session.previous_response_id(), None);
-
-        session
-            .send(model.completion_request("second").build())
-            .await
-            .expect("second request should send");
-        let second = session
-            .wait_for_completed_response()
-            .await
-            .expect("second response should complete");
-        assert_eq!(second.id, "resp_2");
-
-        server.await.expect("server task should finish");
-    }
-
-    #[tokio::test]
-    async fn done_first_completed_turn_updates_previous_response_id() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let mut socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-
-            for response_id in ["resp_1", "resp_2"] {
-                let request = socket
-                    .next()
-                    .await
-                    .expect("request should exist")
-                    .expect("request should be valid");
-                let payload = request.into_text().expect("request should be text");
-                assert!(
-                    payload.contains("\"type\":\"response.create\""),
-                    "expected response.create payload, got {payload}"
-                );
-
-                if response_id == "resp_2" {
-                    assert!(
-                        payload.contains("\"previous_response_id\":\"resp_1\""),
-                        "expected chained previous_response_id in payload, got {payload}"
-                    );
-                }
-
-                let response = serde_json::to_value(CompletionResponse {
-                    id: response_id.to_string(),
-                    ..sample_response(ResponseStatus::Completed)
-                })
-                .expect("response should serialize");
-
-                socket
-                    .send(Message::text(
-                        json!({
-                            "type": "response.done",
-                            "response": response,
-                        })
-                        .to_string(),
-                    ))
-                    .await
-                    .expect("done event should send");
-            }
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let model = client.completion_model("gpt-4o");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        session
-            .send(model.completion_request("first").build())
-            .await
-            .expect("first request should send");
-        let first = session
-            .wait_for_completed_response()
-            .await
-            .expect("first response should complete");
-        assert_eq!(first.id, "resp_1");
-        assert_eq!(session.previous_response_id(), Some("resp_1"));
-
-        session
-            .send(model.completion_request("second").build())
-            .await
-            .expect("second request should send");
-        let second = session
-            .wait_for_completed_response()
-            .await
-            .expect("second response should complete");
-        assert_eq!(second.id, "resp_2");
-        assert_eq!(session.previous_response_id(), Some("resp_2"));
-
-        server.await.expect("server task should finish");
-    }
-
-    #[tokio::test]
-    async fn done_first_failed_turn_does_not_chain_next_request() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let mut socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-
-            let first_request = socket
-                .next()
-                .await
-                .expect("request should exist")
-                .expect("request should be valid");
-            let payload = first_request
-                .into_text()
-                .expect("first request should be text");
-            assert!(
-                payload.contains("\"type\":\"response.create\""),
-                "expected response.create payload, got {payload}"
-            );
-            assert!(
-                !payload.contains("\"previous_response_id\""),
-                "did not expect previous_response_id in first payload, got {payload}"
-            );
-
-            let failed_response = serde_json::to_value(CompletionResponse {
-                id: "resp_failed".to_string(),
-                status: ResponseStatus::Failed,
-                ..sample_response(ResponseStatus::Completed)
-            })
-            .expect("failed response should serialize");
-
-            socket
-                .send(Message::text(
-                    json!({
-                        "type": "response.done",
-                        "response": failed_response,
-                    })
-                    .to_string(),
-                ))
-                .await
-                .expect("done event should send");
-
-            let second_request = socket
-                .next()
-                .await
-                .expect("request should exist")
-                .expect("request should be valid");
-            let payload = second_request
-                .into_text()
-                .expect("second request should be text");
-            assert!(
-                payload.contains("\"type\":\"response.create\""),
-                "expected response.create payload, got {payload}"
-            );
-            assert!(
-                !payload.contains("\"previous_response_id\""),
-                "did not expect chained previous_response_id in payload, got {payload}"
-            );
-
-            let response = serde_json::to_value(CompletionResponse {
-                id: "resp_2".to_string(),
-                ..sample_response(ResponseStatus::Completed)
-            })
-            .expect("response should serialize");
-
-            socket
-                .send(Message::text(
-                    json!({
-                        "type": "response.done",
-                        "response": response,
-                    })
-                    .to_string(),
-                ))
-                .await
-                .expect("done event should send");
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let model = client.completion_model("gpt-4o");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        session
-            .send(model.completion_request("first").build())
-            .await
-            .expect("first request should send");
-        let error = session
-            .wait_for_completed_response()
-            .await
-            .expect_err("failed response should error");
-        assert!(error.to_string().contains("failed response"));
-        assert_eq!(session.previous_response_id(), None);
-
-        session
-            .send(model.completion_request("second").build())
-            .await
-            .expect("second request should send");
-        let second = session
-            .wait_for_completed_response()
-            .await
-            .expect("second response should complete");
-        assert_eq!(second.id, "resp_2");
-        assert_eq!(session.previous_response_id(), Some("resp_2"));
-
-        server.await.expect("server task should finish");
-    }
-
-    #[test]
-    fn websocket_url_converts_http_to_ws() {
-        let url = websocket_url("http://localhost:8080/v1").expect("url should convert");
-        assert_eq!(url, "ws://localhost:8080/v1/responses");
-    }
-
-    #[test]
-    fn websocket_url_rejects_unsupported_scheme() {
-        let result = websocket_url("ftp://example.com/v1");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn websocket_url_trims_trailing_slash() {
-        let url = websocket_url("https://api.openai.com/v1/").expect("url should convert");
-        assert_eq!(url, "wss://api.openai.com/v1/responses");
-    }
-
-    #[test]
-    fn unknown_event_type_is_skipped() {
-        let payload = json!({
-            "type": "response.some_future_event",
-            "data": "hello"
-        });
-
-        let result =
-            parse_server_event(&payload.to_string()).expect("unknown event should not error");
-        assert!(result.is_none(), "unknown event should be skipped");
-    }
-
-    #[test]
-    fn malformed_known_event_returns_error() {
-        let payload = json!({
-            "type": "response.completed"
-        });
-
-        let error = parse_server_event(&payload.to_string())
-            .expect_err("malformed known event should error");
-        assert!(
-            error.to_string().contains("StreamingCompletionChunk"),
-            "expected strict decode failure, got {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn close_is_idempotent() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let mut socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-
-            let message = socket
-                .next()
-                .await
-                .expect("close frame should arrive")
-                .expect("close frame should be valid");
-            assert!(
-                matches!(message, Message::Close(_)),
-                "expected close frame, got {message:?}"
-            );
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        session.close().await.expect("first close should succeed");
-        session.close().await.expect("second close should succeed");
-
-        server.await.expect("server task should finish");
-    }
-
-    #[tokio::test]
-    async fn send_while_in_flight_returns_error() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let mut socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-
-            // Read the first request but don't respond — keep it in-flight
-            let _request = socket
-                .next()
-                .await
-                .expect("request should exist")
-                .expect("request should be valid");
-
-            // Wait for client to finish its test
-            sleep(Duration::from_millis(100)).await;
-            let _ = socket.close(None).await;
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let model = client.completion_model("gpt-4o");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        session
-            .send(model.completion_request("first").build())
-            .await
-            .expect("first request should send");
-
-        let error = session
-            .send(model.completion_request("second").build())
-            .await
-            .expect_err("second send while in-flight should error");
-        assert!(
-            error.to_string().contains("already in flight"),
-            "expected in-flight error, got {error}"
-        );
-
-        server.await.expect("server task should finish");
-    }
-
-    #[tokio::test]
-    async fn send_after_close_returns_error() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let _socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-            sleep(Duration::from_millis(100)).await;
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let model = client.completion_model("gpt-4o");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        session.close().await.expect("close should succeed");
-
-        let error = session
-            .send(model.completion_request("after close").build())
-            .await
-            .expect_err("send after close should error");
-        assert!(
-            error.to_string().contains("session is closed"),
-            "expected closed-session error, got {error}"
-        );
-
-        server.await.expect("server task should finish");
-    }
-
-    #[tokio::test]
-    async fn next_event_without_send_returns_error() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let _socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-            sleep(Duration::from_millis(100)).await;
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        let error = session
-            .next_event()
-            .await
-            .expect_err("next_event without send should error");
-        assert!(
-            error
-                .to_string()
-                .contains("No OpenAI websocket response is currently in flight"),
-            "expected not-in-flight error, got {error}"
-        );
-
-        server.await.expect("server task should finish");
-    }
-
-    #[tokio::test]
-    async fn unknown_event_is_skipped_during_session() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have address");
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("server should accept");
-            let mut socket = accept_async(stream)
-                .await
-                .expect("server should upgrade websocket");
-
-            let _request = socket
-                .next()
-                .await
-                .expect("request should exist")
-                .expect("request should be valid");
-
-            // Send an unknown event type first
-            socket
-                .send(Message::text(
-                    json!({
-                        "type": "response.some_future_event",
-                        "data": "should be skipped"
-                    })
-                    .to_string(),
-                ))
-                .await
-                .expect("unknown event should send");
-
-            // Then send the real completed response
-            let response = serde_json::to_value(CompletionResponse {
-                id: "resp_after_unknown".to_string(),
-                ..sample_response(ResponseStatus::Completed)
-            })
-            .expect("response should serialize");
-
-            socket
-                .send(Message::text(
-                    json!({
-                        "type": "response.completed",
-                        "sequence_number": 1,
-                        "response": response,
-                    })
-                    .to_string(),
-                ))
-                .await
-                .expect("completed event should send");
-        });
-
-        let base_url = format!("http://{address}/v1");
-        let client = crate::providers::openai::Client::builder()
-            .api_key("test-key")
-            .base_url(&base_url)
-            .build()
-            .expect("client should build");
-        let model = client.completion_model("gpt-4o");
-        let mut session = client
-            .responses_websocket("gpt-4o")
-            .await
-            .expect("session should connect");
-
-        session
-            .send(model.completion_request("hello").build())
-            .await
-            .expect("send should succeed");
-        let response = session
-            .wait_for_completed_response()
-            .await
-            .expect("response should complete despite unknown event");
-        assert_eq!(response.id, "resp_after_unknown");
-
-        server.await.expect("server task should finish");
-    }
-}
+#[allow(clippy::expect_used, clippy::panic)]
+mod tests;

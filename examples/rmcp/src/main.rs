@@ -8,9 +8,8 @@
 use std::sync::Arc;
 
 use rig::{
-    client::{CompletionClient, ProviderClient},
-    completion::Prompt,
-    providers::openai,
+    prelude::*,
+    providers::openai::{self, OpenAI},
     tool::{rmcp::McpClientHandler, server::ToolServer},
 };
 use rmcp::{
@@ -62,14 +61,14 @@ impl Counter {
     }
 
     fn _create_resource_text(&self, uri: &str, name: &str) -> Resource {
-        RawResource::new(uri, name.to_string()).no_annotation()
+        Resource::new(uri, name.to_string())
     }
 
     // #[tool(description = "Increment the counter by 1")]
     // async fn increment(&self) -> Result<CallToolResult, ErrorData> {
     //     let mut counter = self.counter.lock().await;
     //     *counter += 1;
-    //     Ok(CallToolResult::success(vec![Content::text(
+    //     Ok(CallToolResult::success(vec![ContentBlock::text(
     //         counter.to_string(),
     //     )]))
     // }
@@ -78,7 +77,7 @@ impl Counter {
     // async fn decrement(&self) -> Result<CallToolResult, ErrorData> {
     //     let mut counter = self.counter.lock().await;
     //     *counter -= 1;
-    //     Ok(CallToolResult::success(vec![Content::text(
+    //     Ok(CallToolResult::success(vec![ContentBlock::text(
     //         counter.to_string(),
     //     )]))
     // }
@@ -86,19 +85,19 @@ impl Counter {
     // #[tool(description = "Get the current counter value")]
     // async fn get_value(&self) -> Result<CallToolResult, ErrorData> {
     //     let counter = self.counter.lock().await;
-    //     Ok(CallToolResult::success(vec![Content::text(
+    //     Ok(CallToolResult::success(vec![ContentBlock::text(
     //         counter.to_string(),
     //     )]))
     // }
 
     // #[tool(description = "Say hello to the client")]
     // fn say_hello(&self) -> Result<CallToolResult, ErrorData> {
-    //     Ok(CallToolResult::success(vec![Content::text("hello")]))
+    //     Ok(CallToolResult::success(vec![ContentBlock::text("hello")]))
     // }
 
     // #[tool(description = "Repeat what you say")]
     // fn echo(&self, Parameters(object): Parameters<JsonObject>) -> Result<CallToolResult, ErrorData> {
-    //     Ok(CallToolResult::success(vec![Content::text(
+    //     Ok(CallToolResult::success(vec![ContentBlock::text(
     //         serde_json::Value::Object(object).to_string(),
     //     )]))
     // }
@@ -108,7 +107,7 @@ impl Counter {
         &self,
         Parameters(StructRequest { a, b }): Parameters<StructRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             (a + b).to_string(),
         )]))
     }
@@ -262,14 +261,13 @@ async fn main() -> anyhow::Result<()> {
     let server_info = mcp_service.peer_info();
     tracing::info!("Connected to server: {server_info:#?}");
 
-    let openai_client = openai::Client::from_env()?;
-    let agent = openai_client
-        .agent(openai::GPT_4O)
+    let openai_client = OpenAI::from_env()?;
+    let agent = AgentBuilder::new(openai_client.completion(openai::GPT_4O))
         .preamble("You are a helpful assistant who has access to a number of tools from an MCP server designed to be used for incrementing and decrementing a counter.")
         .tool_server_handle(tool_server_handle)
         .build();
 
-    let res = agent.prompt("What is 2+5?").max_turns(2).await?;
+    let res = agent.prompt("What is 2+5?").max_turns(2).await?.output();
 
     println!("GPT-4o: {res}");
 

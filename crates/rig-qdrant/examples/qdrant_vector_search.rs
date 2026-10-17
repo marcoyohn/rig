@@ -11,14 +11,13 @@ use qdrant_client::{
     Qdrant,
     qdrant::{CreateCollectionBuilder, Distance, QueryPointsBuilder, VectorParamsBuilder},
 };
+use rig_core::vector_store::request::VectorSearchRequest;
 use rig_core::{
     Embed,
-    client::ProviderClient,
     embeddings::EmbeddingsBuilder,
-    providers::openai::{self, Client},
+    providers::openai::{self, OpenAI},
     vector_store::{InsertDocuments, VectorStoreIndex, request::SearchFilter},
 };
-use rig_core::{client::EmbeddingsClient, vector_store::request::VectorSearchRequest};
 use rig_qdrant::{QdrantFilter, QdrantVectorStore};
 
 #[derive(Embed, serde::Deserialize, serde::Serialize, Debug)]
@@ -46,11 +45,13 @@ async fn main() -> Result<(), anyhow::Error> {
             .await?;
     }
 
-    // Initialize OpenAI client.
+    // The OpenAI client, from `OPENAI_API_KEY`.
     // Get your API key from https://platform.openai.com/api-keys
-    let openai_client = Client::from_env()?;
+    let openai_client = OpenAI::from_env()?;
 
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_ADA_002, None)
+        .erase();
 
     let documents = EmbeddingsBuilder::new(model.clone())
         .document(Word {

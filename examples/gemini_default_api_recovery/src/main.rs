@@ -6,17 +6,15 @@
 
 use futures::StreamExt;
 use rig::agent::{
-    FinalResponse, InvalidToolCallContext, InvalidToolCallHookAction, MultiTurnStreamItem,
-    PromptHook, StreamingResult,
+    AgentHook, HookContext, InvalidToolCallAction, InvalidToolCallContext, MultiTurnStreamItem,
+    PromptResponse, StreamingResult,
 };
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::{CompletionModel, ToolDefinition};
+use rig::message::AssistantContent;
 use rig::message::ToolResultContent;
-use rig::providers::gemini::{
-    self,
-    completion::gemini_api_types::{AdditionalParameters, GenerationConfig, ThinkingConfig},
-};
-use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
+use rig::prelude::*;
+use rig::providers::gemini::Gemini;
+use rig::streaming::Item;
+use rig::streaming::StreamEvent;
 use rig::tool::Tool;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -107,15 +105,19 @@ impl Tool for JavaScript {
     type Args = JavaScriptProgram;
     type Output = ExecutorResponse;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.into(),
-            description: "JavaScript runtime with an array of tools for completing the tasks assigned by the user. Legacy workspace agents may refer to this runtime as default_api.".into(),
-            parameters: schema_for!(JavaScriptProgram).to_value(),
-        }
+    fn description(&self) -> String {
+        "JavaScript runtime with an array of tools for completing the tasks assigned by the user. Legacy workspace agents may refer to this runtime as default_api.".into()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        schema_for!(JavaScriptProgram).to_value()
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         Ok(ExecutorResponse::ok(json!({
             "id": "collection-canary-id",
             "title": "Canary Collection",
@@ -145,23 +147,20 @@ impl DefaultApiRepairHook {
     }
 }
 
-impl<M> PromptHook<M> for DefaultApiRepairHook
-where
-    M: CompletionModel,
-{
+impl AgentHook for DefaultApiRepairHook {
     async fn on_invalid_tool_call(
         &self,
+        _ctx: &HookContext,
         context: &InvalidToolCallContext,
-    ) -> InvalidToolCallHookAction {
+    ) -> Option<InvalidToolCallAction> {
         if let Ok(mut invalid_tool_names) = self.invalid_tool_names.lock() {
             invalid_tool_names.push(context.tool_name.clone());
         }
-
-        if context.tool_name == "default_api" {
-            InvalidToolCallHookAction::repair(JavaScript::NAME)
+        Some(if context.tool_name == "default_api" {
+            InvalidToolCallAction::repair(JavaScript::NAME)
         } else {
-            InvalidToolCallHookAction::fail()
-        }
+            InvalidToolCallAction::fail()
+        })
     }
 }
 
@@ -169,7 +168,7 @@ where
 struct WorkspaceStreamObservation {
     streamed_text: String,
     reasoning_text: String,
-    final_response: Option<FinalResponse>,
+    final_response: Option<PromptResponse>,
     tool_calls: Vec<String>,
     tool_call_deltas: usize,
     executions: Vec<JavaScriptProgram>,
@@ -181,10 +180,10 @@ struct WorkspaceStreamObservation {
 }
 
 impl WorkspaceStreamObservation {
-    fn final_response_text(&self) -> Option<&str> {
+    fn final_response_text(&self) -> Option<String> {
         self.final_response
             .as_ref()
-            .map(|response| response.response())
+            .map(rig::run::PromptResponse::output)
     }
 
     fn diagnostic_summary(&self) -> String {
@@ -203,80 +202,86 @@ impl WorkspaceStreamObservation {
             self.final_response_text(),
             self.final_response
                 .as_ref()
-                .map(|response| response.usage())
+                .map(rig::run::PromptResponse::usage)
         )
     }
 }
 
-fn gemini_canary_additional_params() -> Result<serde_json::Value, serde_json::Error> {
-    let additional_params = AdditionalParameters {
-        generation_config: Some(GenerationConfig {
-            thinking_config: Some(ThinkingConfig {
-                include_thoughts: Some(true),
-                thinking_budget: Some(THINKING_BUDGET),
-                thinking_level: None,
-            }),
-            ..Default::default()
-        }),
-        additional_params: None,
-    };
-
-    serde_json::to_value(&additional_params)
+fn gemini_canary_additional_params() -> serde_json::Value {
+    json!({
+        "generationConfig": {
+            "thinkingConfig": {
+                "thinkingBudget": THINKING_BUDGET,
+                "includeThoughts": true
+            }
+        }
+    })
 }
 
 async fn consume_workspace_like_stream(
-    mut stream: StreamingResult<gemini::streaming::StreamingCompletionResponse>,
+    mut stream: StreamingResult,
 ) -> Result<WorkspaceStreamObservation, String> {
     let mut observation = WorkspaceStreamObservation::default();
 
     while let Some(item) = stream.next().await {
         match item.map_err(|error| error.to_string())? {
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
+            MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                text,
+                ..
+            })) => {
                 observation.events.push("text");
-                observation.streamed_text.push_str(&text.text);
+                observation.streamed_text.push_str(&text);
             }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(
-                reasoning,
-            )) => {
+            MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::End {
+                content: AssistantContent::Reasoning(reasoning),
+                ..
+            })) => {
                 observation.events.push("reasoning");
-                observation
-                    .reasoning_text
-                    .push_str(&reasoning.display_text());
+                observation.reasoning_text.push_str(&reasoning.text.clone());
             }
-            MultiTurnStreamItem::StreamAssistantItem(
-                StreamedAssistantContent::ReasoningDelta { reasoning, .. },
-            ) => {
+            MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Reasoning {
+                text: reasoning,
+                ..
+            })) => {
                 observation.events.push("reasoning_delta");
                 observation.reasoning_text.push_str(&reasoning);
             }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
-                tool_call,
-                ..
-            }) => {
+            MultiTurnStreamItem::ToolCall { tool_call, .. } => {
                 observation.events.push("tool_call");
-                observation.tool_calls.push(tool_call.function.name.clone());
+                observation
+                    .tool_calls
+                    .push(tool_call.function.name.clone().into());
                 let execution: JavaScriptProgram =
-                    serde_json::from_value(tool_call.function.arguments.clone())
+                    serde_json::from_value(tool_call.function.arguments_value())
                         .map_err(|error| error.to_string())?;
                 observation.executions.push(execution);
             }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCallDelta {
+            MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Arguments {
                 ..
-            }) => {
+            })) => {
                 observation.events.push("tool_call_delta");
                 observation.tool_call_deltas += 1;
             }
-            MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
-                tool_result,
-                ..
-            }) => {
+            MultiTurnStreamItem::ToolResult { tool_result, .. } => {
                 observation.events.push("tool_result");
-                let ToolResultContent::Text(text) = tool_result.content.first() else {
-                    return Err("JS Runtime can only respond with JSON text".to_string());
+                let value = match tool_result.content.first() {
+                    Some(ToolResultContent::Json { value }) => value.clone(),
+                    Some(ToolResultContent::Text(_)) => {
+                        return Err(
+                            "JS Runtime returned literal text instead of structured JSON"
+                                .to_string(),
+                        );
+                    }
+                    Some(ToolResultContent::Image(_)) => {
+                        return Err("JS Runtime returned an unexpected image".to_string());
+                    }
+                    None => {
+                        return Err("JS Runtime returned an empty tool result".to_string());
+                    }
                 };
-                observation.tool_results.push(text.text.clone());
+                observation.tool_results.push(value.to_string());
                 let result: ExecutorResponse =
-                    serde_json::from_str(&text.text).map_err(|error| error.to_string())?;
+                    serde_json::from_value(value).map_err(|error| error.to_string())?;
                 observation.executor_results.push(result);
             }
             MultiTurnStreamItem::CompletionCall(completion_call) => {
@@ -321,13 +326,12 @@ fn workspace_canary_prompt(attempt: usize) -> String {
 async fn run_workspace_canary_attempt(
     attempt: usize,
 ) -> Result<WorkspaceStreamObservation, String> {
-    let client = gemini::Client::from_env().map_err(|error| error.to_string())?;
+    let client = Gemini::from_env().map_err(|error| error.to_string())?;
     let agent_name = format!("workspace-default-api-canary-{attempt}");
-    let agent = client
-        .agent(GEMINI_CANARY_MODEL)
+    let agent = AgentBuilder::new(client.completion(GEMINI_CANARY_MODEL))
         .name(&agent_name)
         .preamble(WORKSPACE_STYLE_PREAMBLE)
-        .additional_params(gemini_canary_additional_params().map_err(|error| error.to_string())?)
+        .additional_params(gemini_canary_additional_params())
         .tool(JavaScript)
         .default_max_turns(CANARY_MAX_TURNS)
         .temperature(0.0)
@@ -335,10 +339,10 @@ async fn run_workspace_canary_attempt(
     let repair_hook = DefaultApiRepairHook::default();
 
     let stream = agent
-        .stream_prompt(workspace_canary_prompt(attempt))
-        .with_hook(repair_hook.clone())
-        .with_history(Vec::<rig::message::Message>::new())
-        .await;
+        .prompt(workspace_canary_prompt(attempt))
+        .add_hook(repair_hook.clone())
+        .history(Vec::<rig::message::Message>::new())
+        .stream();
 
     let mut observation = consume_workspace_like_stream(stream).await?;
     observation.invalid_tool_names = repair_hook.invalid_tool_names();
@@ -414,12 +418,12 @@ async fn main() -> anyhow::Result<()> {
         let Some(final_response) = observation.final_response.as_ref() else {
             anyhow::bail!("attempt {attempt}: stream should yield a final response. {diagnostics}");
         };
-        if final_response.response().trim().is_empty() {
+        if final_response.output().trim().is_empty() {
             anyhow::bail!(
                 "attempt {attempt}: final response should not be empty after the tool roundtrip. {diagnostics}"
             );
         }
-        if !final_response.response().contains(JAVASCRIPT_MARKER) {
+        if !final_response.output().contains(JAVASCRIPT_MARKER) {
             anyhow::bail!(
                 "attempt {attempt}: final response should mention the tool marker. {diagnostics}"
             );

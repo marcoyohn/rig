@@ -1,47 +1,22 @@
-//! Shared ChatGPT authentication types and target-specific dispatch.
+//! ChatGPT access-token configuration and native OAuth authentication.
+//!
+//! ```no_run
+//! use rig_core::providers::chatgpt::auth::{AuthSource, Authenticator, DeviceCodeHandler};
+//!
+//! let auth = Authenticator::new(AuthSource::OAuth, None, DeviceCodeHandler::default(), true);
+//! ```
 
+use crate::http_client::HttpClientExt;
+use crate::wire::Secret;
+use futures::lock::Mutex;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+
+pub use crate::providers::internal::auth::{DeviceCodeHandler, DeviceCodePrompt};
 
 #[cfg(not(target_family = "wasm"))]
 mod native;
-#[cfg(target_family = "wasm")]
-mod wasm;
-
-#[cfg(not(target_family = "wasm"))]
-use native as platform;
-#[cfg(target_family = "wasm")]
-use wasm as platform;
-
-#[derive(Debug, Clone)]
-pub struct DeviceCodePrompt {
-    pub verification_uri: String,
-    pub user_code: String,
-}
-
-#[derive(Clone, Default)]
-pub struct DeviceCodeHandler(Option<Arc<dyn Fn(DeviceCodePrompt) + Send + Sync>>);
-
-impl DeviceCodeHandler {
-    pub fn new<F>(handler: F) -> Self
-    where
-        F: Fn(DeviceCodePrompt) + Send + Sync + 'static,
-    {
-        Self(Some(Arc::new(handler)))
-    }
-}
-
-impl fmt::Debug for DeviceCodeHandler {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.is_some() {
-            f.write_str("DeviceCodeHandler(<callback>)")
-        } else {
-            f.write_str("DeviceCodeHandler(None)")
-        }
-    }
-}
 
 #[derive(Clone)]
 pub enum AuthSource {
@@ -61,37 +36,23 @@ impl fmt::Debug for AuthSource {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub struct Authenticator {
     source: AuthSource,
-    platform: platform::PlatformAuthenticator,
-    state_lock: Arc<Mutex<()>>,
+    auth_file: Option<PathBuf>,
+    device_code_handler: DeviceCodeHandler,
+    allow_device_flow: bool,
+    /// Held across a cache refresh to prevent concurrent updates.
+    refresh_lock: Arc<Mutex<()>>,
 }
 
-impl fmt::Debug for Authenticator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Authenticator")
-            .field("source", &self.source)
-            .field("platform", &self.platform)
-            .finish()
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AuthError {
-    #[error("{0}")]
-    Message(String),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Http(#[from] reqwest::Error),
-}
+pub use crate::providers::internal::auth::AuthError;
 
 #[derive(Debug, Clone)]
 pub struct AuthContext {
-    pub access_token: String,
+    /// Resolved credential. Use [`Secret::expose`] only when raw bytes are required.
+    pub access_token: Secret,
     pub account_id: Option<String>,
 }
 
@@ -100,27 +61,39 @@ impl Authenticator {
         source: AuthSource,
         auth_file: Option<PathBuf>,
         device_code_handler: DeviceCodeHandler,
+        allow_device_flow: bool,
     ) -> Self {
         Self {
             source,
-            platform: platform::PlatformAuthenticator::new(auth_file, device_code_handler),
-            state_lock: Arc::new(Mutex::new(())),
+            auth_file,
+            device_code_handler,
+            allow_device_flow,
+            refresh_lock: Arc::default(),
         }
     }
 
-    pub async fn auth_context(&self) -> Result<AuthContext, AuthError> {
+    /// Resolve the access token and account id, refreshing through `http` as needed.
+    /// Return cache, transport, or authorization errors. OAuth is unsupported
+    /// on WASM; explicit access tokens remain available.
+    #[cfg_attr(target_family = "wasm", allow(unused_variables))]
+    pub async fn auth_context<H>(&self, http: &H) -> Result<AuthContext, AuthError>
+    where
+        H: HttpClientExt,
+    {
         match &self.source {
             AuthSource::AccessToken {
                 access_token,
                 account_id,
             } => Ok(AuthContext {
-                access_token: access_token.clone(),
+                access_token: access_token.clone().into(),
                 account_id: account_id.clone(),
             }),
-            AuthSource::OAuth => {
-                let _guard = self.state_lock.lock().await;
-                self.platform.auth_context_oauth().await
-            }
+            #[cfg(not(target_family = "wasm"))]
+            AuthSource::OAuth => self.auth_context_oauth(http).await,
+            #[cfg(target_family = "wasm")]
+            AuthSource::OAuth => Err(AuthError::Message(
+                "ChatGPT OAuth is not supported on wasm targets".into(),
+            )),
         }
     }
 }

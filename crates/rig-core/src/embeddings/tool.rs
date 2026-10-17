@@ -1,12 +1,22 @@
-//! The module defines the [ToolSchema] struct, which is used to embed an object that implements [crate::tool::ToolEmbedding]
+//! Embeddable tool descriptions and serialized tool context.
+//!
+//! ```
+//! use rig_core::embeddings::ToolSchema;
+//!
+//! let schema = ToolSchema {
+//!     name: "search".into(),
+//!     embedding_docs: vec!["Search documents".into()],
+//!     ..Default::default()
+//! };
+//! assert_eq!(schema.embedding_docs.len(), 1);
+//! ```
 
-use crate::{Embed, tool::ToolEmbeddingDyn};
+use crate::{Embed, tool::PortableToolEmbedding};
 use serde::Serialize;
 
 use super::embed::EmbedError;
 
-/// Embeddable document that is used as an intermediate representation of a tool when
-/// RAGging tools.
+/// Tool name, serialized context, and text descriptions for embedding-based retrieval.
 #[derive(Clone, Serialize, Default, Eq, PartialEq)]
 pub struct ToolSchema {
     pub name: String,
@@ -24,72 +34,23 @@ impl Embed for ToolSchema {
 }
 
 impl ToolSchema {
-    /// Convert item that implements [ToolEmbeddingDyn] to an [ToolSchema].
+    /// Captures a tool's name, context, and embedding descriptions.
+    /// Returns an error if context serialization fails.
     ///
-    /// # Example
-    /// ```rust
-    /// use rig_core::{
-    ///     completion::ToolDefinition,
-    ///     embeddings::ToolSchema,
-    ///     tool::{Tool, ToolEmbedding, ToolEmbeddingDyn},
-    /// };
-    /// use serde_json::json;
-    ///
-    /// #[derive(Debug, thiserror::Error)]
-    /// #[error("Math error")]
-    /// struct NothingError;
-    ///
-    /// #[derive(Debug, thiserror::Error)]
-    /// #[error("Init error")]
-    /// struct InitError;
-    ///
-    /// struct Nothing;
-    /// impl Tool for Nothing {
-    ///     const NAME: &'static str = "nothing";
-    ///
-    ///     type Error = NothingError;
-    ///     type Args = ();
-    ///     type Output = ();
-    ///
-    ///     async fn definition(&self, _prompt: String) -> ToolDefinition {
-    ///         serde_json::from_value(json!({
-    ///             "name": "nothing",
-    ///             "description": "nothing",
-    ///             "parameters": {}
-    ///         }))
-    ///         .expect("Tool Definition")
-    ///     }
-    ///
-    ///     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-    ///         Ok(())
-    ///     }
-    /// }
-    ///
-    /// impl ToolEmbedding for Nothing {
-    ///     type InitError = InitError;
-    ///     type Context = ();
-    ///     type State = ();
-    ///
-    ///     fn init(_state: Self::State, _context: Self::Context) -> Result<Self, Self::InitError> {
-    ///         Ok(Nothing)
-    ///     }
-    ///
-    ///     fn embedding_docs(&self) -> Vec<String> {
-    ///         vec!["Do nothing.".into()]
-    ///     }
-    ///
-    ///     fn context(&self) -> Self::Context {}
-    /// }
-    ///
-    /// let tool = ToolSchema::try_from(&Nothing).unwrap();
-    ///
-    /// assert_eq!(tool.name, "nothing".to_string());
-    /// assert_eq!(tool.embedding_docs, vec!["Do nothing.".to_string()]);
     /// ```
-    pub fn try_from(tool: &dyn ToolEmbeddingDyn) -> Result<Self, EmbedError> {
+    /// use rig_core::{embeddings::{ToolSchema, EmbedError}, tool::PortableToolEmbedding};
+    ///
+    /// fn schema(tool: &impl PortableToolEmbedding) -> Result<ToolSchema, EmbedError> {
+    ///     ToolSchema::try_from(tool)
+    /// }
+    /// ```
+    pub fn try_from<T>(tool: &T) -> Result<Self, EmbedError>
+    where
+        T: PortableToolEmbedding,
+    {
         Ok(ToolSchema {
-            name: tool.name(),
-            context: tool.context().map_err(EmbedError::new)?,
+            name: T::NAME.to_string(),
+            context: serde_json::to_value(tool.context()).map_err(EmbedError::new)?,
             embedding_docs: tool.embedding_docs(),
         })
     }

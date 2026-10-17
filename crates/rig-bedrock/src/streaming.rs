@@ -1,641 +1,477 @@
-use crate::types::completion_request::AwsCompletionRequest;
-use crate::{
-    completion::{CompletionModel, resolve_request_model},
-    types::errors::AwsSdkConverseStreamError,
+//! The Converse reply decoder. It reads the JSON Bedrock sent through
+//! [`Lenient`]: a stream's events one by one, and a whole reply as the
+//! events that would have streamed it, so both fold into the same turn.
+//!
+//! Every Converse content block becomes a block, its Converse JSON assembled
+//! as its deltas arrive. Signed or redacted reasoning, cited text, a client
+//! call with object input, and every block Rig has no canonical form for
+//! keep that JSON as the provider item, set only when the block is
+//! complete: at its `contentBlockStop`, or in a whole reply, where the item
+//! is the block as Bedrock sent it. A hosted tool's typed `toolUse` and its
+//! `toolResult` are opaque items that replay to the same model together,
+//! never a call Rig runs.
+
+use std::collections::BTreeMap;
+
+use base64::{Engine, prelude::BASE64_STANDARD};
+use rig_core::completion::{FinishReason, Usage};
+use rig_core::error::ProviderError;
+use rig_core::json_utils::Lenient;
+use rig_core::message::{
+    DocumentRange, DocumentSourceKind, Image, ImageMediaType, Source, SourceLocation,
 };
-use async_stream::stream;
-use aws_sdk_bedrockruntime::types as aws_bedrock;
-use rig_core::completion::GetTokenUsage;
-use rig_core::streaming::StreamingCompletionResponse;
-use rig_core::{
-    completion::CompletionError,
-    message::ReasoningContent,
-    streaming::{RawStreamingChoice, RawStreamingToolCall, ToolCallDeltaContent},
-};
-use serde::{Deserialize, Serialize};
+use rig_core::operation::{Block, CallFragment, Completion, Finish, merge};
+use rig_core::wire::{Flow, Out, WireCitation, WireEvent};
+use serde_json::{Map, Value, json};
 
-#[derive(Clone, Deserialize, Serialize)]
-pub struct BedrockStreamingResponse {
-    pub usage: Option<BedrockUsage>,
+use crate::completion::ConverseFrame;
+use crate::types::errors;
+
+/// What an open block is. The writer holds its JSON.
+enum Open {
+    Text,
+    Reasoning,
+    Call,
+    Hosted,
+    Image,
+    Opaque,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-pub struct BedrockUsage {
-    pub input_tokens: i32,
-    pub output_tokens: i32,
-    pub total_tokens: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read_input_tokens: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_write_input_tokens: Option<i32>,
-}
-
-impl GetTokenUsage for BedrockStreamingResponse {
-    fn token_usage(&self) -> rig_core::completion::Usage {
-        self.usage
-            .as_ref()
-            .map(|u| rig_core::completion::Usage {
-                input_tokens: u.input_tokens as u64,
-                output_tokens: u.output_tokens as u64,
-                total_tokens: u.total_tokens as u64,
-                cached_input_tokens: u.cache_read_input_tokens.unwrap_or_default() as u64,
-                cache_creation_input_tokens: u.cache_write_input_tokens.unwrap_or_default() as u64,
-                tool_use_prompt_tokens: 0,
-                reasoning_tokens: 0,
-            })
-            .unwrap_or_default()
-    }
-}
-
+/// One Converse reply's state: a whole reply or a stream of events.
 #[derive(Default)]
-struct ToolCallState {
-    name: String,
-    id: String,
-    internal_call_id: String,
-    input_json: String,
+pub struct StreamState {
+    open: BTreeMap<usize, Open>,
+    reason: Option<String>,
 }
 
-#[derive(Default)]
-struct ReasoningState {
-    content: String,
-    signature: Option<String>,
+/// The one key of a Converse union and its value.
+fn member(value: &Value) -> Option<(&str, &Value)> {
+    let (key, value) = value.as_object()?.iter().next()?;
+    Some((key.as_str(), value))
 }
 
-/// Convert an accumulated [`ReasoningState`] into a streaming reasoning chunk.
-///
-/// Adaptive-thinking blocks from Bedrock can arrive as signature-only — i.e. a
-/// `Signature` delta with no preceding non-empty `Text` delta. Dropping such
-/// blocks loses the signature on the way back to the consumer, which then
-/// fails on the next turn with `messages.N.content.0.thinking.signature:
-/// Field required` when the conversation is replayed to Bedrock. We must emit
-/// whenever either the content or the signature is present; both-empty is
-/// still skipped.
-fn finalize_reasoning(
-    state: ReasoningState,
-) -> Option<RawStreamingChoice<BedrockStreamingResponse>> {
-    if state.content.is_empty() && state.signature.is_none() {
-        return None;
-    }
-    Some(RawStreamingChoice::Reasoning {
-        id: None,
-        content: ReasoningContent::Text {
-            text: state.content,
-            signature: state.signature,
-        },
-    })
-}
-
-impl CompletionModel {
-    pub(crate) async fn stream(
-        &self,
-        completion_request: rig_core::completion::CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<BedrockStreamingResponse>, CompletionError> {
-        let request_model = resolve_request_model(&self.model, &completion_request);
-        let request = AwsCompletionRequest {
-            inner: completion_request,
-            prompt_caching: self.prompt_caching,
+impl StreamState {
+    /// Write one event in delivery order; the reply's end at `metadata`.
+    fn event(
+        &mut self,
+        event: &Value,
+        out: &mut Out<'_, Completion>,
+    ) -> Result<Option<Finish>, ProviderError> {
+        let Some((kind, payload)) = member(event) else {
+            return Ok(None);
         };
+        let index = payload
+            .u64("contentBlockIndex")
+            .and_then(|index| usize::try_from(index).ok())
+            .unwrap_or(0);
+        let part = |key| payload.get(key).unwrap_or(&Value::Null);
+        match kind {
+            "contentBlockStart" => self.start(out, index, part("start"))?,
+            "contentBlockDelta" => self.delta(out, index, part("delta"))?,
+            "contentBlockStop" => self.stop(out, index, None)?,
+            "messageStop" => self.reason = payload.str("stopReason").map(str::to_owned),
+            // The writer closes every block still open as incomplete.
+            "metadata" => {
+                return Ok(Some(Finish {
+                    usage: payload.at("/usage").map(usage).unwrap_or_default(),
+                    reason: self.reason.as_deref().map(finish_reason),
+                    ..Finish::default()
+                }));
+            }
+            "messageStart" => {}
+            kind if kind.ends_with("Exception") => return Err(errors::exception(kind, payload)),
+            kind => skip(kind),
+        }
+        Ok(None)
+    }
 
-        let mut converse_builder = self
-            .client
-            .get_inner()
-            .await
-            .converse_stream()
-            .model_id(request_model);
-
-        let tool_config = request.tools_config()?;
-        let prompt_with_history = request.messages()?;
-        let output_config = request.output_config()?;
-        converse_builder = converse_builder
-            .set_additional_model_request_fields(request.additional_params())
-            .set_inference_config(request.inference_config())
-            .set_tool_config(tool_config)
-            .set_system(request.system_prompt()?)
-            .set_messages(Some(prompt_with_history))
-            .set_output_config(output_config);
-
-        let response = converse_builder.send().await.map_err(|sdk_error| {
-            Into::<CompletionError>::into(AwsSdkConverseStreamError(sdk_error))
-        })?;
-
-        let stream = Box::pin(stream! {
-            let mut current_tool_call: Option<ToolCallState> = None;
-            let mut current_reasoning: Option<ReasoningState> = None;
-            let mut stream = response.stream;
-            while let Ok(Some(output)) = stream.recv().await {
-                match output {
-                    aws_bedrock::ConverseStreamOutput::ContentBlockDelta(event) => {
-                        let delta = event.delta.ok_or(CompletionError::ProviderError("The delta for a content block is missing".into()))?;
-                        match delta {
-                            aws_bedrock::ContentBlockDelta::Text(text) => {
-                                if current_tool_call.is_none() {
-                                    yield Ok(RawStreamingChoice::Message(text))
-                                }
-                            },
-                            aws_bedrock::ContentBlockDelta::ToolUse(tool) => {
-                                if let Some(ref mut tool_call) = current_tool_call {
-                                    let delta = tool.input().to_string();
-                                    tool_call.input_json.push_str(&delta);
-
-                                    // Emit the delta so UI can show progress
-                                    yield Ok(RawStreamingChoice::ToolCallDelta {
-                                        id: tool_call.id.clone(),
-                                        internal_call_id: tool_call.internal_call_id.clone(),
-                                        content: ToolCallDeltaContent::Delta(delta),
-                                    });
-                                }
-                            },
-                            aws_bedrock::ContentBlockDelta::ReasoningContent(reasoning) => {
-                                match reasoning {
-                                    aws_bedrock::ReasoningContentBlockDelta::Text(text) => {
-                                        if current_reasoning.is_none() {
-                                            current_reasoning = Some(ReasoningState::default());
-                                        }
-
-                                        if let Some(ref mut state) = current_reasoning {
-                                            state.content.push_str(text.as_str());
-                                        }
-
-                                        if !text.is_empty() {
-                                            yield Ok(RawStreamingChoice::ReasoningDelta {
-                                                reasoning: text.clone(),
-                                                id: None,
-                                            })
-                                        }
-                                    },
-                                    aws_bedrock::ReasoningContentBlockDelta::Signature(signature) => {
-                                        if current_reasoning.is_none() {
-                                            current_reasoning = Some(ReasoningState::default());
-                                        }
-
-                                        if let Some(ref mut state) = current_reasoning {
-                                            state.signature = Some(signature.clone());
-                                        }
-                                    },
-                                    _ => {}
-                                }
-                            },
-                            _ => {}
-                        }
-                    },
-                    aws_bedrock::ConverseStreamOutput::ContentBlockStart(event) => {
-                        match event.start.ok_or(CompletionError::ProviderError("ContentBlockStart has no data".into()))? {
-                            aws_bedrock::ContentBlockStart::ToolUse(tool_use) => {
-                                let internal_call_id = rig_core::id::generate();
-                                current_tool_call = Some(ToolCallState {
-                                    name: tool_use.name.clone(),
-                                    id: tool_use.tool_use_id.clone(),
-                                    internal_call_id: internal_call_id.clone(),
-                                    input_json: String::new(),
-                                });
-                                yield Ok(RawStreamingChoice::ToolCallDelta {
-                                    id: tool_use.tool_use_id,
-                                    internal_call_id,
-                                    content: ToolCallDeltaContent::Name(tool_use.name),
-                                });
-                            },
-                            _ => yield Err(CompletionError::ProviderError("Stream is empty".into()))
-                        }
-                    },
-                    aws_bedrock::ConverseStreamOutput::ContentBlockStop(_event) => {
-                        if let Some(reasoning_state) = current_reasoning.take()
-                            && let Some(choice) = finalize_reasoning(reasoning_state) {
-                                yield Ok(choice)
-                            }
-                    },
-                    aws_bedrock::ConverseStreamOutput::MessageStop(message_stop_event) => {
-                        match message_stop_event.stop_reason {
-                            aws_bedrock::StopReason::ToolUse => {
-                                if let Some(tool_call) = current_tool_call.take() {
-                                    // Handle empty input_json for tools with no parameters
-                                    let tool_input = if tool_call.input_json.is_empty() {
-                                        serde_json::json!({})
-                                    } else {
-                                        serde_json::from_str(tool_call.input_json.as_str())?
-                                    };
-                                    yield Ok(RawStreamingChoice::ToolCall(
-                                        RawStreamingToolCall::new(tool_call.id, tool_call.name, tool_input)
-                                            .with_internal_call_id(tool_call.internal_call_id)
-                                    ));
-                                } else {
-                                    yield Err(CompletionError::ProviderError("Failed to call tool".into()))
-                                }
-                            }
-                            aws_bedrock::StopReason::MaxTokens => {
-                                yield Err(CompletionError::ProviderError("Exceeded max tokens".into()))
-                            }
-                            _ => {}
-                        }
-                    },
-                    aws_bedrock::ConverseStreamOutput::Metadata(metadata_event) => {
-                        // Extract usage information from metadata
-                        if let Some(usage) = metadata_event.usage {
-                            yield Ok(RawStreamingChoice::FinalResponse(BedrockStreamingResponse {
-                                usage: Some(BedrockUsage {
-                                    input_tokens: usage.input_tokens,
-                                    output_tokens: usage.output_tokens,
-                                    total_tokens: usage.total_tokens,
-                                    cache_read_input_tokens: usage.cache_read_input_tokens,
-                                    cache_write_input_tokens: usage.cache_write_input_tokens,
-                                }),
-                            }));
-                        }
-                    },
-                    _ => {}
+    /// Converse starts tool-use, tool-result and image blocks, and any
+    /// block it adds later.
+    fn start(
+        &mut self,
+        out: &mut Out<'_, Completion>,
+        index: usize,
+        start: &Value,
+    ) -> Result<(), ProviderError> {
+        let Some((kind, body)) = member(start) else {
+            return Ok(());
+        };
+        let open = match kind {
+            // A call that never names its tool is dropped at its end, since
+            // nothing can answer it.
+            "toolUse" if body.str("type").is_none() => {
+                let fragment = CallFragment {
+                    id: body.str("toolUseId"),
+                    name: body.str("name"),
+                    arguments: None,
+                };
+                out.fragment(Some(index), fragment)?;
+                out.edit(index, |slot| start.clone_into(slot))?;
+                Open::Call
+            }
+            "image" if let Some(media_type) = media_type(body.str("format")) => {
+                let image = Image {
+                    data: DocumentSourceKind::Base64(String::new()),
+                    media_type: Some(media_type),
+                    ..Image::default()
+                };
+                out.open(index, Block::Image(image), Value::Null)?;
+                Open::Image
+            }
+            // An image in a format Rig does not name keeps its JSON and does
+            // not replay.
+            kind => {
+                let replay = kind != "image";
+                out.open(index, Block::Opaque { replay }, start.clone())?;
+                if kind == "toolUse" {
+                    Open::Hosted
+                } else {
+                    Open::Opaque
                 }
             }
-        });
+        };
+        self.open.insert(index, open);
+        Ok(())
+    }
 
-        Ok(StreamingCompletionResponse::stream(stream))
+    /// One delta: its text, reasoning or arguments go out as they arrive,
+    /// and it merges into the block's JSON.
+    fn delta(
+        &mut self,
+        out: &mut Out<'_, Completion>,
+        index: usize,
+        delta: &Value,
+    ) -> Result<(), ProviderError> {
+        let Some((kind, body)) = member(delta) else {
+            return Ok(());
+        };
+        let redacted = body.get("redactedContent");
+        if !self.open.contains_key(&index) {
+            let (block, open) = match kind {
+                "text" | "citation" => (Block::Text, Open::Text),
+                "reasoningContent" => {
+                    let redacted = redacted.is_some();
+                    (Block::Reasoning { redacted }, Open::Reasoning)
+                }
+                "toolUse" => {
+                    self.start(out, index, &json!({ "toolUse": {} }))?;
+                    return self.delta(out, index, delta);
+                }
+                kind => {
+                    skip(kind);
+                    return Ok(());
+                }
+            };
+            out.open(index, block, Value::Null)?;
+            self.open.insert(index, open);
+        }
+        // Redacted bytes are kept as their chunks and encoded once whole:
+        // base64 of each chunk would not concatenate.
+        let open = self.open.get(&index);
+        if let (Some(text), Some(Open::Text | Open::Reasoning)) =
+            (body.as_str().or_else(|| body.str("text")), open)
+        {
+            out.push(index, text)?;
+        }
+        let (pointer, merged) = match (kind, open) {
+            ("text", Some(Open::Text)) => ("", json!({ "text": body })),
+            ("citation", Some(Open::Text)) => {
+                if let Some(cited) = citation_of(body) {
+                    out.cite(index, cited);
+                }
+                ("", json!({ "citations": [body] }))
+            }
+            ("reasoningContent", Some(Open::Reasoning)) => match redacted {
+                Some(chunk) => ("", json!({ "redactedContent": [chunk] })),
+                None => ("", body.clone()),
+            },
+            ("toolUse", Some(open @ (Open::Call | Open::Hosted))) => {
+                if matches!(open, Open::Call) {
+                    let arguments = body.str("input");
+                    let fragment = CallFragment {
+                        id: None,
+                        name: None,
+                        arguments,
+                    };
+                    out.fragment(Some(index), fragment)?;
+                }
+                ("/toolUse", body.clone())
+            }
+            ("toolResult", Some(Open::Opaque)) => ("/toolResult", json!({ "content": body })),
+            ("image", Some(Open::Image)) => {
+                if let Some(data) = body.at("/source/bytes").and_then(Value::as_str) {
+                    out.push(index, data)?;
+                }
+                return Ok(());
+            }
+            (kind, _) => {
+                skip(kind);
+                return Ok(());
+            }
+        };
+        out.edit(index, |item| {
+            if let (Some(at), Value::Object(merged)) = (item.pointer_mut(pointer), &merged) {
+                merge(at, merged);
+            }
+        })
+    }
+
+    /// The block at `index` stopped: it becomes whole, with `whole` as its
+    /// item when it came in a whole reply.
+    fn stop(
+        &mut self,
+        out: &mut Out<'_, Completion>,
+        index: usize,
+        whole: Option<&Value>,
+    ) -> Result<(), ProviderError> {
+        let Some(open) = self.open.remove(&index) else {
+            return Ok(());
+        };
+        let call = matches!(open, Open::Call | Open::Hosted);
+        out.edit(index, |item| {
+            let built = match open {
+                Open::Text => (!item.arr("citations").is_empty()).then(|| {
+                    let content = [json!({ "text": item.get("text") })];
+                    json!({ "citationsContent": { "content": content, "citations": item.get("citations") } })
+                }),
+                // Unsigned reasoning keeps no item: it is rebuilt from its
+                // text, as text for a family that rejects unsigned reasoning.
+                Open::Reasoning => match (item.get("redactedContent"), item.str("signature")) {
+                    (Some(chunks), _) => {
+                        let bytes: Vec<u8> = chunks
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|chunk| BASE64_STANDARD.decode(chunk.as_str()?).ok())
+                            .flatten()
+                            .collect();
+                        let redacted = BASE64_STANDARD.encode(bytes);
+                        Some(json!({ "reasoningContent": { "redactedContent": redacted } }))
+                    }
+                    (None, Some(signature)) => {
+                        let text = item.str("text").unwrap_or_default();
+                        let reasoning = json!({ "text": text, "signature": signature });
+                        Some(json!({ "reasoningContent": { "reasoningText": reasoning } }))
+                    }
+                    (None, None) => None,
+                },
+                // Converse takes a JSON object as a tool's input; a call's
+                // input is the one its arguments were read from.
+                Open::Call | Open::Hosted => {
+                    let input = item
+                        .at("/toolUse/input")
+                        .and_then(Value::as_str)
+                        .filter(|input| !input.trim().is_empty())
+                        .unwrap_or("{}");
+                    let input = serde_json::from_str::<Value>(input)
+                        .ok()
+                        .filter(Value::is_object)
+                        .or_else(|| matches!(open, Open::Hosted).then(|| json!({})));
+                    input.and_then(|input| {
+                        let mut call = item.get("toolUse")?.clone();
+                        merge(&mut call, &Map::from_iter([("input".to_owned(), input)]));
+                        Some(json!({ "toolUse": call }))
+                    })
+                }
+                Open::Image => None,
+                Open::Opaque => Some(item.clone()),
+            };
+            *item = match (built, whole) {
+                (Some(_), Some(whole)) if !call => whole.clone(),
+                (built, _) => built.unwrap_or_default(),
+            };
+        })?;
+        out.finish(index)
+    }
+
+    /// A whole reply, written as the events that would have streamed it.
+    fn whole(
+        &mut self,
+        document: &Value,
+        mut out: Out<'_, Completion>,
+    ) -> Result<Flow, ProviderError> {
+        let content = document
+            .at("/output/message")
+            .map_or(&[][..], |message| message.arr("content"));
+        for (index, block) in content.iter().enumerate() {
+            let Some((kind, body)) = member(block) else {
+                continue;
+            };
+            // A started block's streamed field arrives as its delta.
+            let (started, deltas) = match kind {
+                "text" => (None, vec![json!({ "text": body })]),
+                "citationsContent" => {
+                    let text = body
+                        .arr("content")
+                        .iter()
+                        .map(|part| json!({ "text": part.get("text") }));
+                    let cited = body
+                        .arr("citations")
+                        .iter()
+                        .map(|citation| json!({ "citation": citation }));
+                    (None, text.chain(cited).collect())
+                }
+                "reasoningContent" => {
+                    let reasoning = body.get("reasoningText").unwrap_or(body);
+                    (None, vec![json!({ "reasoningContent": reasoning })])
+                }
+                "toolUse" => {
+                    let input = body.get("input").map(Value::to_string);
+                    (
+                        Some("input"),
+                        vec![json!({ "toolUse": { "input": input } })],
+                    )
+                }
+                "toolResult" => (
+                    Some("content"),
+                    vec![json!({ "toolResult": body.get("content") })],
+                ),
+                "image" => (
+                    Some("source"),
+                    vec![json!({ "image": { "source": body.get("source") } })],
+                ),
+                _ => (Some(""), Vec::new()),
+            };
+            if let Some(field) = started {
+                let mut opened = body.clone();
+                if let Value::Object(fields) = &mut opened {
+                    fields.shift_remove(field);
+                }
+                self.start(&mut out, index, &json!({ kind: opened }))?;
+            }
+            for delta in &deltas {
+                self.delta(&mut out, index, delta)?;
+            }
+            self.stop(&mut out, index, Some(block))?;
+        }
+        self.reason = document.str("stopReason").map(str::to_owned);
+        let end = json!({ "metadata": { "usage": document.get("usage") } });
+        Ok(match self.event(&end, &mut out)? {
+            Some(end) => out.end(end),
+            None => Flow::More,
+        })
     }
 }
+
+/// One Converse citation as a whole-block [`WireCitation`]: Converse cites
+/// each `citationsContent` block as a whole. A location kind this crate does
+/// not know, or a search result without its `source`, is `None` and stays
+/// only in the block's item. Ranges are as Anthropic's, which Converse
+/// relays: end exclusive, pages from 1, characters and chunks from 0.
+fn citation_of(citation: &Value) -> Option<WireCitation> {
+    let (kind, at) = member(citation.get("location")?)?;
+    let number = |key: &str| at.u64(key).and_then(|n| u32::try_from(n).ok());
+    let range = || Some(number("start")?..number("end")?);
+    let document = |within: Option<DocumentRange>| SourceLocation::Document {
+        index: number("documentIndex"),
+        id: None,
+        within,
+    };
+    let location = match kind {
+        "documentChar" => document(
+            at.u64("start")
+                .zip(at.u64("end"))
+                .map(|(start, end)| DocumentRange::Chars(start..end)),
+        ),
+        "documentPage" => document(range().map(DocumentRange::Pages)),
+        "documentChunk" => document(range().map(DocumentRange::Blocks)),
+        "searchResultLocation" => SourceLocation::SearchResult {
+            index: number("searchResultIndex")?,
+            source: citation.str("source")?.to_owned(),
+            blocks: range(),
+        },
+        "web" => SourceLocation::Url {
+            url: at.str("url")?.to_owned(),
+        },
+        _ => return None,
+    };
+    let mut source = Source::new(location);
+    if let Some(title) = citation.str("title") {
+        source = source.title(title);
+    }
+    let quoted: Vec<&str> = citation
+        .arr("sourceContent")
+        .iter()
+        .filter_map(|part| part.str("text"))
+        .collect();
+    if !quoted.is_empty() {
+        source = source.cited_text(quoted.concat());
+    }
+    Some(WireCitation::new(None, vec![source]))
+}
+
+/// The image type a Converse image `format` names.
+fn media_type(format: Option<&str>) -> Option<ImageMediaType> {
+    match format? {
+        "gif" => Some(ImageMediaType::GIF),
+        "jpeg" => Some(ImageMediaType::JPEG),
+        "png" => Some(ImageMediaType::PNG),
+        "webp" => Some(ImageMediaType::WEBP),
+        _ => None,
+    }
+}
+
+fn skip(item: &str) {
+    tracing::warn!(item, "a Converse item this crate does not model");
+}
+
+/// Every stop reason Converse documents. An end of turn or a stop sequence
+/// is `Stop`, the token limit and an exceeded context window are `Length`,
+/// guardrail and content-filter interventions are `ContentFilter`, and any
+/// other reason keeps its wire spelling in `Other`, which fails the turn.
+fn finish_reason(reason: &str) -> FinishReason {
+    match reason {
+        "end_turn" | "stop_sequence" => FinishReason::Stop,
+        "max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
+        "tool_use" => FinishReason::ToolCalls,
+        "content_filtered" | "guardrail_intervened" => FinishReason::ContentFilter,
+        other => FinishReason::Other(other.to_owned()),
+    }
+}
+
+/// Rig's input is Bedrock's `inputTokens` plus its cache reads and writes,
+/// and its total input plus output, which is `totalTokens`.
+fn usage(usage: &Value) -> Usage {
+    let cache_read = usage.u64("cacheReadInputTokens");
+    let cache_write = usage.u64("cacheWriteInputTokens");
+    let input = [usage.u64("inputTokens"), cache_read, cache_write]
+        .into_iter()
+        .flatten()
+        .fold(0, u64::saturating_add);
+    let output = usage.u64("outputTokens").unwrap_or(0);
+    Usage::new()
+        .input_tokens(input)
+        .output_tokens(output)
+        .total_tokens(input.saturating_add(output))
+        .cached_input_tokens(cache_read)
+        .cache_creation_input_tokens(cache_write)
+}
+
+impl<'id> rig_core::wire::Decoder<'id, Completion, ConverseFrame> for StreamState {
+    type Event = ConverseFrame;
+
+    fn classify(&self, frame: ConverseFrame) -> WireEvent<Self::Event> {
+        WireEvent::Known(frame)
+    }
+
+    /// EOF without Bedrock's `metadata` event is truncation.
+    fn decode(
+        &mut self,
+        frame: ConverseFrame,
+        mut out: Out<'id, Completion>,
+    ) -> Result<Flow, ProviderError> {
+        let event = match frame {
+            ConverseFrame::Whole(document) => return self.whole(&document, out),
+            ConverseFrame::Event(event) => event,
+        };
+        let Some(end) = self.event(&event, &mut out)? else {
+            return Ok(Flow::More);
+        };
+        Ok(out.end(end))
+    }
+}
+
+pub(crate) mod document;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_bedrock_usage_creation() {
-        let usage = BedrockUsage {
-            input_tokens: 100,
-            output_tokens: 50,
-            total_tokens: 150,
-            cache_read_input_tokens: None,
-            cache_write_input_tokens: None,
-        };
-
-        assert_eq!(usage.input_tokens, 100);
-        assert_eq!(usage.output_tokens, 50);
-        assert_eq!(usage.total_tokens, 150);
-    }
-
-    #[test]
-    fn test_bedrock_streaming_response_with_usage() {
-        let response = BedrockStreamingResponse {
-            usage: Some(BedrockUsage {
-                input_tokens: 200,
-                output_tokens: 75,
-                total_tokens: 275,
-                cache_read_input_tokens: Some(40),
-                cache_write_input_tokens: Some(10),
-            }),
-        };
-
-        assert_eq!(
-            response.token_usage(),
-            rig_core::completion::Usage {
-                input_tokens: 200,
-                output_tokens: 75,
-                total_tokens: 275,
-                cached_input_tokens: 40,
-                cache_creation_input_tokens: 10,
-                tool_use_prompt_tokens: 0,
-                reasoning_tokens: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn test_bedrock_streaming_response_without_usage() {
-        let response = BedrockStreamingResponse { usage: None };
-
-        // Zero-valued usage is rig's documented sentinel for "the provider
-        // reported no usage metrics".
-        assert_eq!(response.token_usage(), rig_core::completion::Usage::new());
-        assert!(!response.token_usage().has_values());
-    }
-
-    #[test]
-    fn test_get_token_usage_trait() {
-        let response = BedrockStreamingResponse {
-            usage: Some(BedrockUsage {
-                input_tokens: 448,
-                output_tokens: 68,
-                total_tokens: 516,
-                cache_read_input_tokens: Some(80),
-                cache_write_input_tokens: Some(20),
-            }),
-        };
-
-        // Test that GetTokenUsage trait is properly implemented
-        assert_eq!(
-            response.token_usage(),
-            rig_core::completion::Usage {
-                input_tokens: 448,
-                output_tokens: 68,
-                total_tokens: 516,
-                cached_input_tokens: 80,
-                cache_creation_input_tokens: 20,
-                tool_use_prompt_tokens: 0,
-                reasoning_tokens: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn test_bedrock_usage_serde() {
-        let usage = BedrockUsage {
-            input_tokens: 100,
-            output_tokens: 50,
-            total_tokens: 150,
-            cache_read_input_tokens: Some(25),
-            cache_write_input_tokens: Some(5),
-        };
-
-        // Test serialization
-        let json = serde_json::to_string(&usage).expect("Should serialize");
-        assert!(json.contains("\"input_tokens\":100"));
-        assert!(json.contains("\"output_tokens\":50"));
-        assert!(json.contains("\"total_tokens\":150"));
-
-        // Test deserialization
-        let deserialized: BedrockUsage = serde_json::from_str(&json).expect("Should deserialize");
-        assert_eq!(deserialized.input_tokens, usage.input_tokens);
-        assert_eq!(deserialized.output_tokens, usage.output_tokens);
-        assert_eq!(deserialized.total_tokens, usage.total_tokens);
-        assert_eq!(
-            deserialized.cache_read_input_tokens,
-            usage.cache_read_input_tokens
-        );
-        assert_eq!(
-            deserialized.cache_write_input_tokens,
-            usage.cache_write_input_tokens
-        );
-    }
-
-    #[test]
-    fn test_bedrock_streaming_response_serde() {
-        let response = BedrockStreamingResponse {
-            usage: Some(BedrockUsage {
-                input_tokens: 200,
-                output_tokens: 75,
-                total_tokens: 275,
-                cache_read_input_tokens: Some(30),
-                cache_write_input_tokens: Some(15),
-            }),
-        };
-
-        // Test serialization
-        let json = serde_json::to_string(&response).expect("Should serialize");
-        assert!(json.contains("\"input_tokens\":200"));
-
-        // Test deserialization
-        let deserialized: BedrockStreamingResponse =
-            serde_json::from_str(&json).expect("Should deserialize");
-        assert!(deserialized.usage.is_some());
-        let usage = deserialized.usage.unwrap();
-        assert_eq!(usage.input_tokens, 200);
-        assert_eq!(usage.output_tokens, 75);
-        assert_eq!(usage.total_tokens, 275);
-        assert_eq!(usage.cache_read_input_tokens, Some(30));
-        assert_eq!(usage.cache_write_input_tokens, Some(15));
-    }
-
-    #[test]
-    fn test_reasoning_state_default() {
-        // Test that ReasoningState defaults are correct
-        let state = ReasoningState::default();
-        assert_eq!(state.content, "");
-        assert_eq!(state.signature, None);
-    }
-
-    #[test]
-    fn test_reasoning_state_accumulate_content() {
-        // Test accumulating content in ReasoningState
-        let mut state = ReasoningState::default();
-        state.content.push_str("First chunk");
-        state.content.push_str(" Second chunk");
-        state.content.push_str(" Third chunk");
-
-        assert_eq!(state.content, "First chunk Second chunk Third chunk");
-        assert_eq!(state.signature, None);
-    }
-
-    #[test]
-    fn test_reasoning_state_with_signature() {
-        // Test ReasoningState with signature
-        let mut state = ReasoningState::default();
-        state.content.push_str("Reasoning content");
-        state.signature = Some("test_signature_456".to_string());
-
-        assert_eq!(state.content, "Reasoning content");
-        assert_eq!(state.signature, Some("test_signature_456".to_string()));
-    }
-
-    #[test]
-    fn test_reasoning_state_empty_content() {
-        // Test that ReasoningState can have empty content
-        let state = ReasoningState {
-            signature: Some("signature_only".to_string()),
-            ..Default::default()
-        };
-
-        assert_eq!(state.content, "");
-        assert!(state.signature.is_some());
-    }
-
-    #[test]
-    fn test_tool_call_state_default() {
-        // Test that ToolCallState defaults are correct
-        let state = ToolCallState::default();
-        assert_eq!(state.name, "");
-        assert_eq!(state.id, "");
-        assert_eq!(state.input_json, "");
-    }
-
-    #[test]
-    fn test_tool_call_state_accumulate_json() {
-        // Test accumulating JSON input in ToolCallState
-        let mut state = ToolCallState {
-            name: "my_tool".to_string(),
-            id: "tool_123".to_string(),
-            internal_call_id: rig_core::id::generate(),
-            input_json: String::new(),
-        };
-
-        state.input_json.push_str("{\"arg1\":");
-        state.input_json.push_str("\"value1\"");
-        state.input_json.push('}');
-
-        assert_eq!(state.name, "my_tool");
-        assert_eq!(state.id, "tool_123");
-        assert_eq!(state.input_json, "{\"arg1\":\"value1\"}");
-    }
-
-    #[test]
-    fn test_tool_call_state_empty_accumulation() {
-        let state = ToolCallState {
-            name: "test_tool".to_string(),
-            id: "tool_abc".to_string(),
-            internal_call_id: rig_core::id::generate(),
-            input_json: String::new(),
-        };
-
-        assert_eq!(state.name, "test_tool");
-        assert_eq!(state.id, "tool_abc");
-        assert!(state.input_json.is_empty());
-    }
-
-    #[test]
-    fn test_tool_call_state_single_chunk() {
-        let mut state = ToolCallState {
-            name: "get_weather".to_string(),
-            id: "call_123".to_string(),
-            internal_call_id: rig_core::id::generate(),
-            input_json: String::new(),
-        };
-
-        state.input_json.push_str("{\"location\":\"Paris\"}");
-
-        assert_eq!(state.input_json, "{\"location\":\"Paris\"}");
-    }
-
-    #[test]
-    fn test_tool_call_state_multiple_small_chunks() {
-        let mut state = ToolCallState {
-            name: "search".to_string(),
-            id: "call_xyz".to_string(),
-            internal_call_id: rig_core::id::generate(),
-            input_json: String::new(),
-        };
-
-        // Simulate multiple small chunks arriving
-        let chunks = vec!["{", "\"q", "uery", "\":", "\"R", "ust", "\"}"];
-
-        for chunk in chunks {
-            state.input_json.push_str(chunk);
-        }
-
-        assert_eq!(state.input_json, "{\"query\":\"Rust\"}");
-    }
-
-    #[test]
-    fn test_tool_call_state_complex_json_accumulation() {
-        let mut state = ToolCallState {
-            name: "analyze_data".to_string(),
-            id: "call_456".to_string(),
-            internal_call_id: rig_core::id::generate(),
-            input_json: String::new(),
-        };
-
-        // Simulate accumulating a complex nested JSON
-        state.input_json.push_str("{\"data\":{");
-        state.input_json.push_str("\"values\":[1,2,3],");
-        state
-            .input_json
-            .push_str("\"metadata\":{\"source\":\"api\"}");
-        state.input_json.push_str("}}");
-
-        assert_eq!(
-            state.input_json,
-            "{\"data\":{\"values\":[1,2,3],\"metadata\":{\"source\":\"api\"}}}"
-        );
-
-        // Verify it's valid JSON
-        let parsed: serde_json::Value =
-            serde_json::from_str(&state.input_json).expect("Should parse as valid JSON");
-        assert!(parsed.is_object());
-    }
-
-    #[test]
-    fn test_reasoning_state_accumulation() {
-        let mut state = ReasoningState::default();
-
-        state.content.push_str("First, ");
-        state.content.push_str("I need to ");
-        state.content.push_str("analyze the problem.");
-
-        assert_eq!(state.content, "First, I need to analyze the problem.");
-        assert!(state.signature.is_none());
-    }
-
-    #[test]
-    fn test_reasoning_state_with_signature_accumulation() {
-        let mut state = ReasoningState::default();
-
-        state.content.push_str("Reasoning content here");
-        state.signature = Some("sig_part1".to_string());
-
-        // Simulate signature being built up (in practice it comes in one chunk)
-        if let Some(ref mut sig) = state.signature {
-            sig.push_str("_part2");
-        }
-
-        assert_eq!(state.content, "Reasoning content here");
-        assert_eq!(state.signature, Some("sig_part1_part2".to_string()));
-    }
-
-    #[test]
-    fn finalize_reasoning_with_content_and_signature_emits_text_block() {
-        let state = ReasoningState {
-            content: "I am thinking".to_string(),
-            signature: Some("sig-abc".to_string()),
-        };
-
-        let choice = finalize_reasoning(state).expect("should emit reasoning");
-        match choice {
-            RawStreamingChoice::Reasoning { id, content } => {
-                assert!(id.is_none());
-                match content {
-                    ReasoningContent::Text { text, signature } => {
-                        assert_eq!(text, "I am thinking");
-                        assert_eq!(signature.as_deref(), Some("sig-abc"));
-                    }
-                    other => panic!("expected ReasoningContent::Text, got {:?}", other),
-                }
-            }
-            _ => panic!("expected RawStreamingChoice::Reasoning"),
-        }
-    }
-
-    #[test]
-    fn finalize_reasoning_signature_only_still_emits_block() {
-        // Adaptive-thinking on Bedrock can produce a Signature delta with no
-        // accompanying non-empty Text delta. Previously this was silently
-        // dropped, losing the signature and breaking next-turn replay.
-        let state = ReasoningState {
-            content: String::new(),
-            signature: Some("sig-only".to_string()),
-        };
-
-        let choice =
-            finalize_reasoning(state).expect("should emit reasoning for signature-only state");
-        match choice {
-            RawStreamingChoice::Reasoning { content, .. } => match content {
-                ReasoningContent::Text { text, signature } => {
-                    assert!(text.is_empty());
-                    assert_eq!(signature.as_deref(), Some("sig-only"));
-                }
-                other => panic!("expected ReasoningContent::Text, got {:?}", other),
-            },
-            _ => panic!("expected RawStreamingChoice::Reasoning"),
-        }
-    }
-
-    #[test]
-    fn finalize_reasoning_content_only_still_emits_block() {
-        let state = ReasoningState {
-            content: "thoughts without sig".to_string(),
-            signature: None,
-        };
-
-        let choice =
-            finalize_reasoning(state).expect("should emit reasoning for content-only state");
-        match choice {
-            RawStreamingChoice::Reasoning { content, .. } => match content {
-                ReasoningContent::Text { text, signature } => {
-                    assert_eq!(text, "thoughts without sig");
-                    assert!(signature.is_none());
-                }
-                other => panic!("expected ReasoningContent::Text, got {:?}", other),
-            },
-            _ => panic!("expected RawStreamingChoice::Reasoning"),
-        }
-    }
-
-    #[test]
-    fn finalize_reasoning_both_empty_emits_nothing() {
-        let state = ReasoningState::default();
-        assert!(finalize_reasoning(state).is_none());
-    }
-}
+pub(crate) mod tests;

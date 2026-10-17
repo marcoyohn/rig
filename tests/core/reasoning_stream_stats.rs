@@ -1,47 +1,51 @@
 use futures::stream;
-use rig::OneOrMany;
 use rig::agent::MultiTurnStreamItem;
 use rig::completion::Usage;
 use rig::message::{AssistantContent, ToolCall, ToolFunction, ToolResult, ToolResultContent};
-use rig::streaming::{StreamedAssistantContent, StreamedUserContent};
+use rig::streaming::{Item, Transcript};
 
 use crate::reasoning::collect_stream_stats;
 
+/// A text fragment, cut from a stream that opened its part.
+fn text(text: &str) -> Item<rig::streaming::StreamEvent> {
+    Transcript::parse_prefix(serde_json::json!([
+        {"item": "event", "value": {"event": "start", "part": 0, "kind": "text"}},
+        {"item": "event", "value": {"event": "text", "part": 0, "text": text}},
+    ]))
+    .expect("a stream in order")
+    .into_items()
+    .pop()
+    .expect("the fragment")
+}
+
 #[tokio::test]
 async fn collect_stream_stats_tracks_only_final_turn_text() {
-    let internal_call_id = "call_internal_1".to_string();
-    let tool_call = ToolCall::new(
-        "tool_1".to_string(),
+    let tool_call = ToolCall::from_wire(
+        "tool_1",
         ToolFunction::new(
-            "get_weather".to_string(),
+            rig::message::ToolName::new("get_weather").expect("tool name"),
             serde_json::json!({ "city": "Tokyo" }),
         ),
     );
     let tool_result = ToolResult {
-        id: "tool_1".to_string(),
-        call_id: None,
-        content: OneOrMany::one(ToolResultContent::text("72F and sunny")),
+        is_error: false,
+        call: tool_call.id.clone(),
+        name: tool_call.function.name.clone(),
+        content: vec![ToolResultContent::text("72F and sunny")],
     };
 
     let items = vec![
-        Ok(MultiTurnStreamItem::StreamAssistantItem(
-            StreamedAssistantContent::<()>::text("Sure! Let me check the weather right away!"),
-        )),
-        Ok(MultiTurnStreamItem::StreamAssistantItem(
-            StreamedAssistantContent::ToolCall {
-                tool_call,
-                internal_call_id: internal_call_id.clone(),
-            },
-        )),
-        Ok(MultiTurnStreamItem::StreamUserItem(
-            StreamedUserContent::tool_result(tool_result, internal_call_id),
-        )),
-        Ok(MultiTurnStreamItem::StreamAssistantItem(
-            StreamedAssistantContent::<()>::text("It's 72F and sunny in Tokyo."),
-        )),
+        Ok(MultiTurnStreamItem::StreamAssistantItem(text(
+            "Sure! Let me check the weather right away!",
+        ))),
+        Ok(MultiTurnStreamItem::ToolCall { tool_call }),
+        Ok(MultiTurnStreamItem::ToolResult { tool_result }),
+        Ok(MultiTurnStreamItem::StreamAssistantItem(text(
+            "It's 72F and sunny in Tokyo.",
+        ))),
         Ok(MultiTurnStreamItem::final_response(
-            OneOrMany::one(AssistantContent::text("It's 72F and sunny in Tokyo.")),
-            Usage::new(),
+            vec![AssistantContent::text("It's 72F and sunny in Tokyo.")],
+            Usage::default(),
         )),
     ];
 

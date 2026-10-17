@@ -1,121 +1,109 @@
-use std::fmt;
-
 use aws_sdk_bedrockruntime::config::http::HttpResponse;
-use aws_sdk_bedrockruntime::error::SdkError;
-use aws_sdk_bedrockruntime::operation::converse::ConverseError;
-use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
-use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
-use rig_core::completion::CompletionError;
-use rig_core::embeddings::EmbeddingError;
-use rig_core::image_generation::ImageGenerationError;
+use aws_sdk_bedrockruntime::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_bedrockruntime::operation::RequestId;
+use rig_core::error::ProviderError;
+use rig_core::http_client::StatusCode;
+use rig_core::json_utils::Lenient;
 
-pub struct AwsSdkInvokeModelError(pub SdkError<InvokeModelError, HttpResponse>);
+/// Rig's diagnostic for a failed call that carried neither a provider
+/// message nor an HTTP status.
+const UNEXPECTED: &str = "An unexpected error occurred. Verify Internet connection or AWS keys";
 
-impl AwsSdkInvokeModelError {
-    pub fn into_service_error(self) -> String {
-        let error: String = match self.0.into_service_error() {
-            InvokeModelError::ModelTimeoutException(e) => e.message.unwrap_or("The request took too long to process. Processing time exceeded the model timeout length.".into()),
-            InvokeModelError::AccessDeniedException(e) => e.message.unwrap_or("The request is denied because you do not have sufficient permissions to perform the requested action.".into()),
-            InvokeModelError::ResourceNotFoundException(e) => e.message.unwrap_or("The specified resource ARN was not found.".into()),
-            InvokeModelError::ThrottlingException(e) => e.message.unwrap_or("Your request was denied due to exceeding the account quotas for Amazon Bedrock.".into()),
-            InvokeModelError::ServiceUnavailableException(e) => e.message.unwrap_or("The service isn't currently available.".into()),
-            InvokeModelError::InternalServerException(e) => e.message.unwrap_or("An internal server error occurred.".into()),
-            InvokeModelError::ValidationException(e) => e.message.unwrap_or("The input fails to satisfy the constraints specified by Amazon Bedrock.".into()),
-            InvokeModelError::ModelNotReadyException(e) => e.message.unwrap_or("The model specified in the request is not ready to serve inference requests. The AWS SDK will automatically retry the operation up to 5 times.".into()),
-            InvokeModelError::ModelErrorException(e) => e.message.unwrap_or("The request failed due to an error while processing the model.".into()),
-            InvokeModelError::ServiceQuotaExceededException(e) => e.message.unwrap_or("Your request exceeds the service quota for your account.".into()),
-            _ => "An unexpected error occurred. Verify Internet connection or AWS keys".into(),
+/// Converts a failed Bedrock SDK call into a provider error. The exception's
+/// message is the provider's reply, or the raw response body when this SDK
+/// version does not model the exception. The reply carries the HTTP status,
+/// the exception type as its code, and the AWS request id.
+pub(crate) fn sdk_error<E: ProvideErrorMetadata>(
+    error: SdkError<E, HttpResponse>,
+) -> ProviderError {
+    let raw = error.raw_response();
+    let status = raw.and_then(|raw| StatusCode::from_u16(raw.status().as_u16()).ok());
+    let message = error
+        .message()
+        .map(str::to_owned)
+        .or_else(|| raw.and_then(raw_body));
+    // Timeout and dispatch failures are retry hints; delivery is not guaranteed.
+    let transient = matches!(
+        error,
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_)
+    )
+    .then_some(true);
+    let code = error.code().map(str::to_owned);
+    reply(message, code, status, transient, UNEXPECTED)
+        .with_provider_request_id(error.request_id().map(str::to_owned))
+}
+
+/// Converts an exception Bedrock sent mid-stream, `{"<type>": <payload>}`
+/// as its event-stream message states it. The type names the code.
+pub(crate) fn exception(kind: &str, payload: &serde_json::Value) -> ProviderError {
+    let (first, rest) = kind.split_at_checked(1).unwrap_or_default();
+    let code = first.to_ascii_uppercase() + rest;
+    let message = payload.str("message").or_else(|| payload.str("Message"));
+    reply(
+        message.map(str::to_owned),
+        Some(code),
+        None,
+        None,
+        STREAM_FAILED,
+    )
+}
+
+const STREAM_FAILED: &str = "Bedrock event stream failed";
+
+/// The trimmed, nonempty UTF-8 body the SDK retained. It carries the
+/// service's diagnostic for exceptions absent from the parsed metadata.
+fn raw_body(raw: &HttpResponse) -> Option<String> {
+    let body = std::str::from_utf8(raw.body().bytes()?).ok()?.trim();
+    (!body.is_empty()).then(|| body.to_owned())
+}
+
+/// Classifies known transient exception codes when no HTTP status is available.
+/// Unlisted codes are non-transient.
+fn transient_exception(code: &str) -> bool {
+    matches!(
+        code,
+        "ThrottlingException"
+            | "ServiceUnavailableException"
+            | "InternalServerException"
+            | "ModelNotReadyException"
+            | "ModelTimeoutException"
+            | "ModelStreamErrorException"
+    )
+}
+
+/// The provider's reply when it sent a message or an HTTP status, with the
+/// exception type deciding retryability when no status does. Otherwise a
+/// transport error for a `transient` failure, or Rig's `fallback`
+/// diagnostic, which never poses as a provider body.
+fn reply(
+    message: Option<String>,
+    code: Option<String>,
+    status: Option<StatusCode>,
+    transient: Option<bool>,
+    fallback: &str,
+) -> ProviderError {
+    if message.is_none() && status.is_none() {
+        let fallback = match code {
+            Some(code) => format!("{fallback} ({code})"),
+            None => fallback.to_owned(),
         };
-        error
-    }
-}
-
-impl From<AwsSdkInvokeModelError> for ImageGenerationError {
-    fn from(value: AwsSdkInvokeModelError) -> Self {
-        ImageGenerationError::ProviderError(value.into_service_error())
-    }
-}
-
-impl From<AwsSdkInvokeModelError> for EmbeddingError {
-    fn from(value: AwsSdkInvokeModelError) -> Self {
-        EmbeddingError::ProviderError(value.into_service_error())
-    }
-}
-
-pub struct AwsSdkConverseError(pub SdkError<ConverseError, HttpResponse>);
-
-impl From<AwsSdkConverseError> for CompletionError {
-    fn from(value: AwsSdkConverseError) -> Self {
-        let error: String = match value.0.into_service_error() {
-            ConverseError::ModelTimeoutException(e) => e.message.unwrap_or("The request took too long to process. Processing time exceeded the model timeout length.".into()),
-            ConverseError::AccessDeniedException(e) => e.message.unwrap_or("The request is denied because you do not have sufficient permissions to perform the requested action.".into()),
-            ConverseError::ResourceNotFoundException(e) => e.message.unwrap_or("The specified resource ARN was not found.".into()),
-            ConverseError::ThrottlingException(e) => e.message.unwrap_or("Your request was denied due to exceeding the account quotas for AWS Bedrock.".into()),
-            ConverseError::ServiceUnavailableException(e) => e.message.unwrap_or("The service isn't currently available.".into()),
-            ConverseError::InternalServerException(e) => e.message.unwrap_or("An internal server error occurred.".into()),
-            ConverseError::ValidationException(e) => e.message.unwrap_or("The input fails to satisfy the constraints specified by AWS Bedrock.".into()),
-            ConverseError::ModelNotReadyException(e) => e.message.unwrap_or("The model specified in the request is not ready to serve inference requests. The AWS SDK will automatically retry the operation up to 5 times.".into()),
-            ConverseError::ModelErrorException(e) => e.message.unwrap_or("The request failed due to an error while processing the model.".into()),
-            _ => String::from("An unexpected error occurred. Verify Internet connection or AWS keys")
+        return if transient == Some(true) {
+            ProviderError::Http(
+                rig_core::http_client::Error::instance(std::io::Error::other(fallback)).into(),
+            )
+        } else {
+            ProviderError::Provider(fallback)
         };
-        CompletionError::ProviderError(error)
     }
+    let transient = code.as_deref().map(transient_exception).or(transient);
+    ProviderError::from_provider_body(message.unwrap_or_default())
+        .with_provider_status(status)
+        .with_provider_code(code)
+        .with_transient(transient)
 }
 
-pub struct AwsSdkConverseStreamError(pub SdkError<ConverseStreamError, HttpResponse>);
-impl From<AwsSdkConverseStreamError> for CompletionError {
-    fn from(value: AwsSdkConverseStreamError) -> Self {
-        let error: String = match value.0.into_service_error() {
-            ConverseStreamError::ModelTimeoutException(e) => e
-                .message
-                .unwrap_or_else(|| "Bedrock model timed out".to_string()),
-            ConverseStreamError::AccessDeniedException(e) => e
-                .message
-                .unwrap_or_else(|| "Bedrock access denied".to_string()),
-            ConverseStreamError::ResourceNotFoundException(e) => e
-                .message
-                .unwrap_or_else(|| "Bedrock resource not found".to_string()),
-            ConverseStreamError::ThrottlingException(e) => e
-                .message
-                .unwrap_or_else(|| "Bedrock request throttled".to_string()),
-            ConverseStreamError::ServiceUnavailableException(e) => e
-                .message
-                .unwrap_or_else(|| "Bedrock service unavailable".to_string()),
-            ConverseStreamError::InternalServerException(e) => e
-                .message
-                .unwrap_or_else(|| "Bedrock internal server error".to_string()),
-            ConverseStreamError::ModelStreamErrorException(e) => e
-                .message
-                .unwrap_or_else(|| "Bedrock streaming model error".to_string()),
-            ConverseStreamError::ValidationException(e) => e
-                .message
-                .unwrap_or_else(|| "Bedrock validation error".to_string()),
-            ConverseStreamError::ModelNotReadyException(e) => e
-                .message
-                .unwrap_or_else(|| "Bedrock model not ready".to_string()),
-            ConverseStreamError::ModelErrorException(e) => e
-                .message
-                .unwrap_or_else(|| "Bedrock model error".to_string()),
-            _ => "An unexpected error occurred. Verify Internet connection or AWS keys".into(),
-        };
-        CompletionError::ProviderError(error)
-    }
-}
+#[cfg(test)]
+mod tests;
 
-#[derive(Debug)]
-pub struct TypeConversionError(String);
-
-impl TypeConversionError {
-    pub fn new(input: &str) -> Self {
-        Self(input.to_string())
-    }
-}
-
-impl fmt::Display for TypeConversionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = self.0.clone();
-        write!(f, "{message}")
-    }
-}
-
-impl std::error::Error for TypeConversionError {}
+#[cfg(test)]
+mod request_id_tests;

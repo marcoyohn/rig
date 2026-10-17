@@ -20,8 +20,7 @@ use rig_neo4j::Neo4jClient;
 
 use std::env;
 
-use rig_core::client::EmbeddingsClient;
-use rig_core::{providers::openai::Client, vector_store::VectorStoreIndex};
+use rig_core::{providers::openai::OpenAI, vector_store::VectorStoreIndex};
 use serde::{Deserialize, Serialize};
 
 #[path = "./display/lib.rs"]
@@ -36,9 +35,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
     const INDEX_NAME: &str = "moviePlotsEmbedding";
 
-    // Initialize OpenAI client
+    // The OpenAI client, from `OPENAI_API_KEY`.
     let openai_api_key = env::var("OPENAI_API_KEY")?;
-    let openai_client: Client = Client::new(&openai_api_key)?;
+    let openai_client = OpenAI::new(&openai_api_key);
 
     let neo4j_uri = "neo4j+s://demo.neo4jlabs.com:7687";
     let neo4j_username = "recommendations";
@@ -55,7 +54,7 @@ async fn main() -> Result<(), anyhow::Error> {
     .await?;
 
     // // Select the embedding model and generate our embeddings
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let model = openai_client.embedding(openai::TEXT_EMBEDDING_ADA_002, None);
 
     // Define the properties that will be retrieved from querying the graph nodes
     #[derive(Debug, Deserialize, Serialize)]
@@ -80,11 +79,11 @@ async fn main() -> Result<(), anyhow::Error> {
         .top_n::<Movie>(req)
         .await?
         .into_iter()
-        .map(|(score, id, doc)| display::SearchResult {
-            title: doc.title,
-            id,
-            description: doc.plot,
-            score,
+        .map(|result| display::SearchResult {
+            title: result.document.title,
+            id: result.id,
+            description: result.document.plot,
+            score: result.score,
         })
         .collect::<Vec<_>>();
 

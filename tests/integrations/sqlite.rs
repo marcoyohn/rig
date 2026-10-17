@@ -1,21 +1,13 @@
-#![allow(
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::unwrap_used,
-    clippy::unreachable
-)]
-
+use crate::common::{WORD_DEFINITIONS, mock_embeddings, openai_client};
 use rig::vector_store::request::{SearchFilter, VectorSearchRequest};
 use serde_json::json;
 
-use rig::client::EmbeddingsClient;
 use rig::sqlite::{
     Column, ColumnValue, SqliteSearchFilter, SqliteVectorStore, SqliteVectorStoreTable,
 };
 use rig::vector_store::{InsertDocuments, VectorStoreIndex};
 use rig::{
-    Embed, OneOrMany,
+    DynModel, Embed,
     embeddings::{Embedding, EmbeddingsBuilder},
     providers::openai,
 };
@@ -82,89 +74,22 @@ async fn vector_search_test() {
     let conn = open_test_connection("vector_search_test").await;
     let server = httpmock::MockServer::start();
 
-    server.mock(|when, then| {
-        when.method(httpmock::Method::POST)
-            .path("/embeddings")
-            .header("Authorization", "Bearer TEST")
-            .json_body(json!({
-                "input": [
-                    "Definition of a *flurbo*: A flurbo is a green alien that lives on cold planets",
-                    "Definition of a *glarb-glarb*: A glarb-glarb is an ancient tool used by the ancestors of the inhabitants of planet Jiro to farm the land.",
-                    "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans."
-                ],
-                "model": "text-embedding-ada-002",
-            }));
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!({
-                "object": "list",
-                "data": [
-                  {
-                    "object": "embedding",
-                    "embedding": vec![-0.001; 1536],
-                    "index": 0
-                  },
-                  {
-                    "object": "embedding",
-                    "embedding": vec![0.0023064255; 1536],
-                    "index": 1
-                  },
-                  {
-                    "object": "embedding",
-                    "embedding": vec![-0.001; 1536],
-                    "index": 2
-                  },
-                ],
-                "model": "text-embedding-ada-002",
-                "usage": {
-                  "prompt_tokens": 8,
-                  "total_tokens": 8
-                }
-            }
-        ));
-    });
+    mock_definition_embeddings(&server);
+    mock_embeddings(
+        &server,
+        json!({ "input": ["What is a glarb?"], "model": "text-embedding-ada-002" }),
+        [vec![0.0024064254; 1536]],
+    );
 
-    server.mock(|when, then| {
-        when.method(httpmock::Method::POST)
-            .path("/embeddings")
-            .header("Authorization", "Bearer TEST")
-            .json_body(json!({
-                "input": [
-                    "What is a glarb?",
-                ],
-                "model": "text-embedding-ada-002",
-            }));
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!({
-                    "object": "list",
-                    "data": [
-                      {
-                        "object": "embedding",
-                        "embedding": vec![0.0024064254; 1536],
-                        "index": 0
-                      }
-                    ],
-                    "model": "text-embedding-ada-002",
-                    "usage": {
-                      "prompt_tokens": 8,
-                      "total_tokens": 8
-                    }
-                }
-            ));
-    });
-
-    let openai_client = openai::Client::builder()
-        .api_key("TEST")
-        .base_url(server.base_url())
-        .build()
-        .unwrap();
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let openai_client = openai_client(&server);
+    let model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_ADA_002, None)
+        .erase();
 
     let embeddings = create_embeddings(model.clone()).await;
 
     // Initialize SQLite vector store
-    let vector_store = SqliteVectorStore::new(conn, &model)
+    let vector_store = SqliteVectorStore::new(conn, model.capabilities().ndims)
         .await
         .expect("Could not initialize SQLite vector store");
 
@@ -187,7 +112,7 @@ async fn vector_search_test() {
     // Query the index
     let results = index.top_n::<serde_json::Value>(req).await.expect("");
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].1, "doc1");
+    assert_eq!(results[0].id, "doc1");
 }
 
 #[tokio::test]
@@ -197,59 +122,18 @@ async fn insert_documents_test() {
     let conn = open_test_connection("insert_documents_test").await;
     let server = httpmock::MockServer::start();
 
-    server.mock(|when, then| {
-        when.method(httpmock::Method::POST)
-            .path("/embeddings")
-            .header("Authorization", "Bearer TEST")
-            .json_body(json!({
-                "input": [
-                    "Definition of a *flurbo*: A flurbo is a green alien that lives on cold planets",
-                    "Definition of a *glarb-glarb*: A glarb-glarb is an ancient tool used by the ancestors of the inhabitants of planet Jiro to farm the land.",
-                    "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans."
-                ],
-                "model": "text-embedding-ada-002",
-            }));
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!({
-                "object": "list",
-                "data": [
-                  {
-                    "object": "embedding",
-                    "embedding": vec![-0.001; 1536],
-                    "index": 0
-                  },
-                  {
-                    "object": "embedding",
-                    "embedding": vec![0.0023064255; 1536],
-                    "index": 1
-                  },
-                  {
-                    "object": "embedding",
-                    "embedding": vec![-0.001; 1536],
-                    "index": 2
-                  },
-                ],
-                "model": "text-embedding-ada-002",
-                "usage": {
-                  "prompt_tokens": 8,
-                  "total_tokens": 8
-                }
-            }
-        ));
-    });
+    mock_definition_embeddings(&server);
 
-    let openai_client = openai::Client::builder()
-        .api_key("TEST")
-        .base_url(server.base_url())
-        .build()
-        .unwrap();
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let openai_client = openai_client(&server);
+    let model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_ADA_002, None)
+        .erase();
     let embeddings = create_embeddings(model.clone()).await;
 
-    let vector_store: SqliteVectorStore<_, Word> = SqliteVectorStore::new(conn.clone(), &model)
-        .await
-        .expect("Could not initialize SQLite vector store");
+    let vector_store: SqliteVectorStore<Word> =
+        SqliteVectorStore::new(conn.clone(), model.capabilities().ndims)
+            .await
+            .expect("Could not initialize SQLite vector store");
 
     vector_store
         .insert_documents(embeddings)
@@ -274,21 +158,30 @@ async fn insert_documents_test() {
     assert_eq!(embedding_count, 3);
 }
 
-async fn create_embeddings(model: openai::EmbeddingModel) -> Vec<(Word, OneOrMany<Embedding>)> {
-    let words = vec![
-        Word {
-            id: "doc0".to_string(),
-            definition: "Definition of a *flurbo*: A flurbo is a green alien that lives on cold planets".to_string(),
-        },
-        Word {
-            id: "doc1".to_string(),
-            definition: "Definition of a *glarb-glarb*: A glarb-glarb is an ancient tool used by the ancestors of the inhabitants of planet Jiro to farm the land.".to_string(),
-        },
-        Word {
-            id: "doc2".to_string(),
-            definition: "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans.".to_string(),
-        }
-    ];
+/// Mocks the embeddings of [`WORD_DEFINITIONS`]; `doc1` is the one nearest
+/// the `What is a glarb?` query.
+fn mock_definition_embeddings(server: &httpmock::MockServer) {
+    mock_embeddings(
+        server,
+        json!({ "input": WORD_DEFINITIONS, "model": "text-embedding-ada-002" }),
+        [
+            vec![-0.001; 1536],
+            vec![0.0023064255; 1536],
+            vec![-0.001; 1536],
+        ],
+    );
+}
+
+async fn create_embeddings(
+    model: impl Into<DynModel<rig::operation::Embedding>>,
+) -> Vec<(Word, Vec<Embedding>)> {
+    let words = WORD_DEFINITIONS
+        .iter()
+        .enumerate()
+        .map(|(i, definition)| Word {
+            id: format!("doc{i}"),
+            definition: definition.to_string(),
+        });
 
     EmbeddingsBuilder::new(model)
         .documents(words)

@@ -1,42 +1,45 @@
-//! A vector index for a Neo4j graph DB.
-//!
-//! This module provides a way to perform vector searches on a Neo4j graph DB.
-//! It uses the [Neo4j vector index](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/)
-//! to search for similar nodes based on a query.
+//! Vector search over a Neo4j
+//! [vector index](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/).
 
 use neo4rs::{Graph, Query};
 use rig_core::{
-    embeddings::{Embedding, EmbeddingModel},
+    Embed,
+    embeddings::Embedding,
     vector_store::{
-        VectorStoreError, VectorStoreIndex,
+        InsertDocuments, VectorSearchIdResult, VectorSearchResult, VectorStoreError,
+        VectorStoreIndex,
         request::{SearchFilter, VectorSearchRequest},
     },
+    wasm_compat::WasmCompatSend,
 };
-use serde::{Deserialize, Serialize, de::Error};
+use serde::{Deserialize, Serialize, de::DeserializeOwned, de::Error};
 
-use crate::{Neo4jClient, Neo4jSearchFilter};
+use crate::{Neo4jClient, Neo4jSearchFilter, ToBoltType};
 
-pub struct Neo4jVectorIndex<M>
-where
-    M: EmbeddingModel,
-{
+/// Vector index over Neo4j nodes.
+///
+/// Queries are embedded with the same model that populated the index, so
+/// results are meaningless under another model.
+pub struct Neo4jVectorIndex {
     graph: Graph,
-    embedding_model: M,
+    embedding_model: rig_core::DynModel<rig_core::operation::Embedding>,
     index_config: IndexConfig,
 }
 
-/// The index name must be unique among both indexes and constraints.
-/// A newly created index is not immediately available but is created in the background.
+/// Identifies the index to query and the shape of the nodes it covers.
 ///
-/// #### Default Values
-/// - `index_name`: "vector_index"
-/// - `embedding_property`: "embedding"
-/// - `similarity_function`: VectorSimilarityFunction::Cosine
+/// Index names must be unique among indexes and constraints. Defaults are the
+/// `vector_index` index, the `embedding` property, cosine similarity, and no
+/// explicit node label.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IndexConfig {
     pub index_name: String,
     pub embedding_property: String,
     pub similarity_function: VectorSimilarityFunction,
+    /// Node label that [`InsertDocuments`] writes to, adopted from the index when
+    /// loaded through [`Neo4jClient::get_index`](crate::Neo4jClient::get_index).
+    /// Inserts fall back to the `Document` label when unset.
+    pub node_label: Option<String>,
 }
 
 impl Default for IndexConfig {
@@ -45,6 +48,7 @@ impl Default for IndexConfig {
             index_name: "vector_index".to_string(),
             embedding_property: "embedding".to_string(),
             similarity_function: VectorSimilarityFunction::Cosine,
+            node_label: None,
         }
     }
 }
@@ -55,11 +59,12 @@ impl IndexConfig {
             index_name: index_name.into(),
             embedding_property: "embedding".to_string(),
             similarity_function: VectorSimilarityFunction::Cosine,
+            node_label: None,
         }
     }
 
-    pub fn index_name(mut self, index_name: &str) -> Self {
-        self.index_name = index_name.to_string();
+    pub fn index_name(mut self, index_name: impl Into<String>) -> Self {
+        self.index_name = index_name.into();
         self
     }
 
@@ -68,15 +73,20 @@ impl IndexConfig {
         self
     }
 
-    pub fn embedding_property(mut self, embedding_property: &str) -> Self {
-        self.embedding_property = embedding_property.to_string();
+    pub fn embedding_property(mut self, embedding_property: impl Into<String>) -> Self {
+        self.embedding_property = embedding_property.into();
+        self
+    }
+
+    /// Sets the node label that [`InsertDocuments`] writes to.
+    pub fn node_label(mut self, node_label: impl Into<String>) -> Self {
+        self.node_label = Some(node_label.into());
         self
     }
 }
 
-/// Cosine is most commonly used, but Euclidean is also supported.
-/// See [Neo4j vector similarity functions](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/#similarity-functions)
-/// for more information.
+/// Similarity function an index is built with. See
+/// [Neo4j vector similarity functions](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/#similarity-functions).
 #[derive(Default, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum VectorSimilarityFunction {
@@ -106,28 +116,25 @@ const BASE_VECTOR_SEARCH_QUERY: &str = "
     YIELD node, score
 ";
 
-impl<M> Neo4jVectorIndex<M>
-where
-    M: EmbeddingModel,
-{
-    pub fn new(graph: Graph, embedding_model: M, index_config: IndexConfig) -> Self {
+impl Neo4jVectorIndex {
+    pub fn new(
+        graph: Graph,
+        embedding_model: impl Into<rig_core::DynModel<rig_core::operation::Embedding>>,
+        index_config: IndexConfig,
+    ) -> Self {
         Self {
             graph,
-            embedding_model,
+            embedding_model: embedding_model.into(),
             index_config,
         }
     }
 
-    /// Build a Neo4j query that performs a vector search against an index.
-    /// See [Query vector index](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/#query-vector-index) for more information.
+    /// Builds the vector search query, returning node ids and scores plus, when
+    /// `return_node` is set, the node with its embedding property nulled out.
     ///
-    /// Query template:
-    /// ```text
-    /// CALL db.index.vector.queryNodes($index_name, $num_candidates, $queryVector)
-    /// YIELD node, score
-    /// WHERE {where_clause}
-    /// RETURN score, ID(node) as element_id, node {.*, embedding:null } as node
-    /// ```
+    /// A request threshold is rendered as a predicate on the node's `distance`
+    /// property rather than the yielded `score`. The filter text and embedding
+    /// property are spliced into the Cypher verbatim.
     pub fn build_vector_search_query(
         &self,
         prompt_embedding: Embedding,
@@ -143,7 +150,6 @@ where
             _ => String::new(),
         };
 
-        // Propertiy containing the embedding vectors are excluded from the returned node
         let query = format!(
             "\
             {}\
@@ -169,32 +175,17 @@ where
             .param("num_candidates", req.samples() as i64)
             .param("index_name", self.index_config.index_name.clone())
     }
-}
 
-/// Search parameters for a vector search. Neo4j currently only supports post-vector-search filtering.
-pub struct SearchParams {
-    /// Sets the **post-filter** field of the search params. Uses a WHERE clause.
-    /// See [Neo4j WHERE clause](https://neo4j.com/docs/cypher-manual/current/clauses/where/) for more information.
-    post_vector_search_filter: Option<String>,
-}
+    /// Embeds the query and runs the search, deserializing each row as `R`.
+    /// Node data is always requested, even when `R` discards it.
+    async fn run_search<R: for<'a> Deserialize<'a>>(
+        &self,
+        req: &VectorSearchRequest<Neo4jSearchFilter>,
+    ) -> Result<Vec<R>, VectorStoreError> {
+        let prompt_embedding = self.embedding_model.embed_text(req.query()).await?;
+        let query = self.build_vector_search_query(prompt_embedding, true, req);
 
-impl SearchParams {
-    /// Initializes a new `SearchParams` with default values.
-    pub fn new(filter: Option<String>) -> Self {
-        Self {
-            post_vector_search_filter: filter,
-        }
-    }
-
-    pub fn filter(mut self, filter: String) -> Self {
-        self.post_vector_search_filter = Some(filter);
-        self
-    }
-}
-
-impl Default for SearchParams {
-    fn default() -> Self {
-        Self::new(None)
+        Neo4jClient::execute_and_collect::<R>(&self.graph, query).await
     }
 }
 
@@ -211,60 +202,102 @@ struct RowResult {
     element_id: i64,
 }
 
-impl<M> VectorStoreIndex for Neo4jVectorIndex<M>
-where
-    M: EmbeddingModel + std::marker::Sync + Send,
-{
+impl VectorStoreIndex for Neo4jVectorIndex {
     type Filter = Neo4jSearchFilter;
 
-    /// Get the top n nodes and scores matching the query.
-    ///
-    /// #### Generic Type Parameters
-    ///
-    /// - `T`: The type used to deserialize the result from the Neo4j query.
-    ///   It must implement the `serde::Deserialize` trait.
-    ///
-    /// #### Returns
-    ///
-    /// Returns a `Result` containing a vector of tuples. Each tuple contains:
-    /// - A `f64` representing the similarity score
-    /// - A `String` representing the node ID
-    /// - A value of type `T` representing the deserialized node data
-    ///
-    async fn top_n<T: for<'a> Deserialize<'a> + std::marker::Send>(
+    /// Returns matches keyed by node element id. The node is deserialized as
+    /// `T` without its embedding property.
+    async fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         req: VectorSearchRequest<Neo4jSearchFilter>,
-    ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
-        let prompt_embedding = self.embedding_model.embed_text(req.query()).await?;
-        let query = self.build_vector_search_query(prompt_embedding, true, &req);
+    ) -> Result<Vec<VectorSearchResult<T>>, VectorStoreError> {
+        let rows = self.run_search::<RowResultNode<T>>(&req).await?;
 
-        let rows = Neo4jClient::execute_and_collect::<RowResultNode<T>>(&self.graph, query).await?;
-
-        let results = rows
+        Ok(rows
             .into_iter()
-            .map(|row| (row.score, row.element_id.to_string(), row.node))
-            .collect::<Vec<_>>();
-
-        Ok(results)
+            .map(|row| VectorSearchResult {
+                score: row.score,
+                id: row.element_id.to_string(),
+                document: row.node,
+            })
+            .collect())
     }
 
-    /// Get the top n ids and scores matching the query. Runs faster than top_n since it doesn't need to transfer and parse
-    /// the full nodes and embeddings to the client.
+    /// Like `top_n` but returns only scores and node ids, without deserializing nodes.
     async fn top_n_ids(
         &self,
         req: VectorSearchRequest<Neo4jSearchFilter>,
-    ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-        let prompt_embedding = self.embedding_model.embed_text(req.query()).await?;
+    ) -> Result<Vec<VectorSearchIdResult>, VectorStoreError> {
+        let rows = self.run_search::<RowResult>(&req).await?;
 
-        let query = self.build_vector_search_query(prompt_embedding, true, &req);
-
-        let rows = Neo4jClient::execute_and_collect::<RowResult>(&self.graph, query).await?;
-
-        let results = rows
+        Ok(rows
             .into_iter()
-            .map(|row| (row.score, row.element_id.to_string()))
-            .collect::<Vec<_>>();
-
-        Ok(results)
+            .map(|row| VectorSearchIdResult {
+                score: row.score,
+                id: row.element_id.to_string(),
+            })
+            .collect())
     }
 }
+
+/// Node label used by [`InsertDocuments`] when the config specifies none.
+const DEFAULT_NODE_LABEL: &str = "Document";
+
+/// Bulk insert statement over an `$items` parameter list. `node_label` is
+/// spliced in verbatim.
+fn insert_documents_query(node_label: &str) -> String {
+    format!("UNWIND $items AS item CREATE (n:{node_label}) SET n = item")
+}
+
+impl InsertDocuments for Neo4jVectorIndex {
+    /// Inserts one node per embedding, flattening the document's JSON fields
+    /// onto the node alongside the embedding (`embedding_property`) and its
+    /// source text (`embedded_text`). Nodes are written under the index's
+    /// `node_label`, defaulting to the `Document` label.
+    async fn insert_documents<Doc: Serialize + Embed + WasmCompatSend>(
+        &self,
+        documents: Vec<(Doc, Vec<Embedding>)>,
+    ) -> Result<(), VectorStoreError> {
+        let node_label = self
+            .index_config
+            .node_label
+            .as_deref()
+            .unwrap_or(DEFAULT_NODE_LABEL);
+        let embedding_property = &self.index_config.embedding_property;
+
+        let mut items: Vec<neo4rs::BoltType> = Vec::new();
+        for (document, embeddings) in documents {
+            let json_doc = serde_json::to_value(&document)?;
+
+            for embedding in embeddings {
+                let mut props = neo4rs::BoltMap::new();
+                if let serde_json::Value::Object(map) = &json_doc {
+                    for (key, value) in map {
+                        props.put(neo4rs::BoltString::new(key), value.to_bolt_type());
+                    }
+                } else {
+                    props.put(neo4rs::BoltString::new("document"), json_doc.to_bolt_type());
+                }
+                props.put(
+                    neo4rs::BoltString::new("embedded_text"),
+                    neo4rs::BoltType::String(neo4rs::BoltString::new(&embedding.document)),
+                );
+                props.put(
+                    neo4rs::BoltString::new(embedding_property),
+                    embedding.vec.to_bolt_type(),
+                );
+                items.push(neo4rs::BoltType::Map(props));
+            }
+        }
+
+        self.graph
+            .run(neo4rs::query(&insert_documents_query(node_label)).param("items", items))
+            .await
+            .map_err(VectorStoreError::datastore)?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;

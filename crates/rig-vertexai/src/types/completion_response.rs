@@ -1,189 +1,162 @@
 use google_cloud_aiplatform_v1 as vertexai;
-use rig_core::OneOrMany;
-use rig_core::completion::{CompletionError, CompletionResponse, Usage};
-use rig_core::message::{AssistantContent, Text, ToolCall, ToolFunction};
-use serde::{Deserialize, Serialize};
+use rig_core::error::ProviderError;
+use rig_core::operation::Completion;
+use rig_core::providers::gemini::streaming::document::GenerateContentResponse;
+use rig_core::providers::gemini::streaming::{GenerateContentChunk, GenerateContentDecoder};
+use rig_core::wire::{Decoder, Flow, Out, WireEvent};
+use serde_json::{Map, Value};
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct VertexGenerateContentOutput(pub vertexai::model::GenerateContentResponse);
+/// Stable descriptor name reported on normalized Vertex AI responses.
+pub const PROVIDER_NAME: &str = "vertexai";
 
-impl TryFrom<VertexGenerateContentOutput> for CompletionResponse<VertexGenerateContentOutput> {
-    type Error = CompletionError;
+/// A Vertex AI reply's document: its responses' REST JSON, rebuilt by the
+/// Gemini API's [`GenerateContentResponse`] fold. The transport reports the
+/// one response a call returns, so this is fed only by a reply that
+/// arrives without it.
+#[derive(Debug, Default)]
+pub struct VertexDocument(GenerateContentResponse);
 
-    fn try_from(value: VertexGenerateContentOutput) -> Result<Self, Self::Error> {
-        let response = &value.0;
+impl rig_core::wire::document::Serves<rig_core::operation::Completion> for VertexDocument {}
 
-        let candidate = response.candidates.first().ok_or_else(|| {
-            CompletionError::ProviderError("No candidates in response".to_string())
-        })?;
+impl rig_core::wire::document::Reassemble<vertexai::model::GenerateContentResponse>
+    for VertexDocument
+{
+    fn absorb(&mut self, frame: &vertexai::model::GenerateContentResponse) {
+        // A response that does not transcode adds nothing; its decoding
+        // fails the reply.
+        rest_chunk(frame)
+            .into_iter()
+            .for_each(|chunk| self.0.chunk(chunk));
+    }
 
-        let content = candidate
-            .content
-            .as_ref()
-            .ok_or_else(|| CompletionError::ProviderError("No content in candidate".to_string()))?;
+    fn finish(self) -> Value {
+        self.0.document()
+    }
+}
 
-        let mut assistant_contents = Vec::new();
+/// Decodes Vertex AI's whole `GenerateContent` reply. The reply is restated
+/// as the REST chunk its JSON is and read by the Gemini API's decoder, so a
+/// block's provider item is the SDK part's JSON. A streamed call re-emits
+/// the same reply.
+#[derive(Debug, Default)]
+pub struct VertexDecoder(GenerateContentDecoder);
 
-        // vertexai internally uses a wkt::Struct (serde_json::Map<String, serde_json::Value>) in
-        // function calling args. We need to convert that to serde_json::Value for rig_core::completion type matching
-        for part in content.parts.iter() {
-            if let Some(function_call) = part.function_call() {
-                let args_json = function_call
-                    .args
-                    .as_ref()
-                    .map(|s| serde_json::Value::Object(s.clone()))
-                    .unwrap_or_else(|| serde_json::json!({}));
+impl<'id> Decoder<'id, Completion, vertexai::model::GenerateContentResponse> for VertexDecoder {
+    type Event = vertexai::model::GenerateContentResponse;
 
-                assistant_contents.push(AssistantContent::ToolCall(ToolCall::new(
-                    function_call.name.clone(),
-                    ToolFunction::new(function_call.name.clone(), args_json),
-                )));
-            } else if let Some(text) = part.text() {
-                assistant_contents.push(AssistantContent::Text(Text::new(text.clone())));
+    fn classify(
+        &self,
+        frame: vertexai::model::GenerateContentResponse,
+    ) -> WireEvent<vertexai::model::GenerateContentResponse> {
+        WireEvent::Known(frame)
+    }
+
+    fn decode(
+        &mut self,
+        response: vertexai::model::GenerateContentResponse,
+        out: Out<'id, Completion>,
+    ) -> Result<Flow, ProviderError> {
+        let chunk = rest_chunk(&response)?;
+        Decoder::<'id, Completion>::decode(&mut self.0, GenerateContentChunk(chunk), out)
+    }
+
+    fn eof(&mut self, out: Out<'id, Completion>) -> Result<Flow, ProviderError> {
+        Decoder::<'id, Completion>::eof(&mut self.0, out)
+    }
+}
+
+/// `response` as the REST JSON Vertex AI sent: the SDK's own JSON, with
+/// each enum value respelled by name, since the SDK serializes enums by
+/// number. The SDK keeps the tool-use prompt count only per modality, so
+/// its total is the breakdown's sum.
+pub(crate) fn rest_chunk(
+    response: &vertexai::model::GenerateContentResponse,
+) -> Result<Map<String, Value>, ProviderError> {
+    let Value::Object(mut chunk) = serde_json::to_value(response)? else {
+        return Ok(Map::new());
+    };
+    let candidates = chunk.get_mut("candidates").and_then(Value::as_array_mut);
+    for (candidate, json) in response
+        .candidates
+        .iter()
+        .zip(candidates.into_iter().flatten())
+    {
+        spell(json, "finishReason", candidate.finish_reason.name());
+        ratings(json, &candidate.safety_ratings);
+        // A part's enums too, so a stored part reads back whatever a store
+        // does to its numbers.
+        let parts = candidate.content.iter().flat_map(|content| &content.parts);
+        let json_parts = json
+            .pointer_mut("/content/parts")
+            .and_then(Value::as_array_mut);
+        for (part, json) in parts.zip(json_parts.into_iter().flatten()) {
+            if let (Some(code), Some(json)) =
+                (part.executable_code(), json.get_mut("executableCode"))
+            {
+                spell(json, "language", code.language.name());
+            }
+            if let (Some(result), Some(json)) = (
+                part.code_execution_result(),
+                json.get_mut("codeExecutionResult"),
+            ) {
+                spell(json, "outcome", result.outcome.name());
             }
         }
-
-        if assistant_contents.is_empty() {
-            return Err(CompletionError::ProviderError(
-                "No text or tool call content found in response".to_string(),
-            ));
+    }
+    if let (Some(feedback), Some(json)) =
+        (&response.prompt_feedback, chunk.get_mut("promptFeedback"))
+    {
+        spell(json, "blockReason", feedback.block_reason.name());
+        ratings(json, &feedback.safety_ratings);
+    }
+    if let (Some(usage), Some(json)) = (&response.usage_metadata, chunk.get_mut("usageMetadata")) {
+        spell(json, "trafficType", usage.traffic_type.name());
+        for (key, details) in [
+            ("promptTokensDetails", &usage.prompt_tokens_details),
+            ("cacheTokensDetails", &usage.cache_tokens_details),
+            ("candidatesTokensDetails", &usage.candidates_tokens_details),
+            (
+                "toolUsePromptTokensDetails",
+                &usage.tool_use_prompt_tokens_details,
+            ),
+        ] {
+            let json = json.get_mut(key).and_then(Value::as_array_mut);
+            for (detail, json) in details.iter().zip(json.into_iter().flatten()) {
+                spell(json, "modality", detail.modality.name());
+            }
         }
+        let tool_use: i64 = usage
+            .tool_use_prompt_tokens_details
+            .iter()
+            .map(|detail| i64::from(detail.token_count))
+            .sum();
+        if let (Some(json), true) = (json.as_object_mut(), tool_use > 0) {
+            json.entry("toolUsePromptTokenCount")
+                .or_insert_with(|| tool_use.into());
+        }
+    }
+    Ok(chunk)
+}
 
-        let choice = OneOrMany::many(assistant_contents).map_err(|e| {
-            CompletionError::ProviderError(format!("Failed to create OneOrMany: {e}"))
-        })?;
+/// Respell the safety ratings under `json` by name.
+fn ratings(json: &mut Value, ratings: &[vertexai::model::SafetyRating]) {
+    let json = json.get_mut("safetyRatings").and_then(Value::as_array_mut);
+    for (rating, json) in ratings.iter().zip(json.into_iter().flatten()) {
+        spell(json, "category", rating.category.name());
+        spell(json, "probability", rating.probability.name());
+        spell(json, "severity", rating.severity.name());
+    }
+}
 
-        let usage = response
-            .usage_metadata
-            .as_ref()
-            .map(|usage| Usage {
-                input_tokens: usage.prompt_token_count as u64,
-                output_tokens: usage.candidates_token_count as u64,
-                total_tokens: usage.total_token_count as u64,
-                cached_input_tokens: 0, // unreported at time of writing
-                cache_creation_input_tokens: 0,
-                tool_use_prompt_tokens: 0,
-                reasoning_tokens: 0,
-            })
-            .unwrap_or_default();
-
-        Ok(CompletionResponse {
-            choice,
-            usage,
-            raw_response: value,
-            message_id: None,
-        })
+/// Replace the number at `json[key]` with `name`, when both exist.
+fn spell(json: &mut Value, key: &str, name: Option<&str>) {
+    if let (Some(slot), Some(name)) = (json.get_mut(key), name) {
+        *slot = Value::String(name.to_owned());
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use google_cloud_aiplatform_v1 as vertexai;
-    use rig_core::OneOrMany;
-    use rig_core::message::{AssistantContent, Text, ToolCall};
+pub(crate) mod tests;
 
-    fn create_text_response(text: &str) -> VertexGenerateContentOutput {
-        let part = vertexai::model::Part::new().set_text(text.to_string());
-        let content = vertexai::model::Content::new()
-            .set_role("model")
-            .set_parts([part]);
-        let candidate = vertexai::model::Candidate::new()
-            .set_content(content)
-            .set_finish_reason(vertexai::model::candidate::FinishReason::Stop);
-        let response = vertexai::model::GenerateContentResponse::new().set_candidates([candidate]);
-        VertexGenerateContentOutput(response)
-    }
-
-    fn create_tool_call_response(
-        function_name: &str,
-        args: serde_json::Value,
-    ) -> VertexGenerateContentOutput {
-        let struct_args = match args {
-            serde_json::Value::Object(map) => map,
-            _ => panic!("Expected JSON object for Struct conversion"),
-        };
-        let function_call = vertexai::model::FunctionCall::new()
-            .set_name(function_name.to_string())
-            .set_args(struct_args);
-        let part = vertexai::model::Part::new().set_function_call(function_call);
-        let content = vertexai::model::Content::new()
-            .set_role("model")
-            .set_parts([part]);
-        let candidate = vertexai::model::Candidate::new()
-            .set_content(content)
-            .set_finish_reason(vertexai::model::candidate::FinishReason::Stop);
-        let response = vertexai::model::GenerateContentResponse::new().set_candidates([candidate]);
-        VertexGenerateContentOutput(response)
-    }
-
-    #[test]
-    fn test_text_response_conversion() {
-        let vertex_output = create_text_response("Hello, world!");
-        let completion_response: Result<CompletionResponse<VertexGenerateContentOutput>, _> =
-            vertex_output.try_into();
-
-        assert!(completion_response.is_ok());
-        let response = completion_response.unwrap();
-        assert_eq!(
-            response.choice,
-            OneOrMany::one(AssistantContent::Text(Text::new(
-                "Hello, world!".to_string()
-            )))
-        );
-    }
-
-    #[test]
-    fn test_tool_call_response_conversion() {
-        let args = serde_json::json!({
-            "x": 5,
-            "y": 3
-        });
-        let vertex_output = create_tool_call_response("add", args.clone());
-        let completion_response: Result<CompletionResponse<VertexGenerateContentOutput>, _> =
-            vertex_output.try_into();
-
-        assert!(completion_response.is_ok());
-        let response = completion_response.unwrap();
-
-        match response.choice.first() {
-            AssistantContent::ToolCall(ToolCall { id, function, .. }) => {
-                assert_eq!(id, "add");
-                assert_eq!(function.name, "add");
-                assert_eq!(function.arguments, args);
-            }
-            _ => panic!("Expected ToolCall"),
-        }
-    }
-
-    #[test]
-    fn test_usage_metadata_conversion() {
-        let mut response = create_text_response("test").0;
-        let usage_metadata = vertexai::model::generate_content_response::UsageMetadata::new()
-            .set_prompt_token_count(10)
-            .set_candidates_token_count(20)
-            .set_total_token_count(30);
-        response = response.set_usage_metadata(usage_metadata);
-
-        let vertex_output = VertexGenerateContentOutput(response);
-        let completion_response: Result<CompletionResponse<VertexGenerateContentOutput>, _> =
-            vertex_output.try_into();
-
-        assert!(completion_response.is_ok());
-        let response = completion_response.unwrap();
-        assert_eq!(response.usage.input_tokens, 10);
-        assert_eq!(response.usage.output_tokens, 20);
-        assert_eq!(response.usage.total_tokens, 30);
-    }
-
-    #[test]
-    fn test_empty_response_error() {
-        // Create a response with no candidates
-        let response = vertexai::model::GenerateContentResponse::new();
-        let vertex_output = VertexGenerateContentOutput(response);
-        let completion_response: Result<CompletionResponse<VertexGenerateContentOutput>, _> =
-            vertex_output.try_into();
-
-        assert!(completion_response.is_err());
-    }
-}
+#[cfg(test)]
+mod vertex_usage_mapping_tests;

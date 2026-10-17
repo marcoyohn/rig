@@ -1,7 +1,5 @@
 //! Together tools smoke test.
 
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::Prompt;
 use rig::providers::together;
 
 use crate::support::{
@@ -11,9 +9,8 @@ use crate::support::{
 #[tokio::test]
 #[ignore = "requires TOGETHER_API_KEY"]
 async fn tools_smoke() {
-    let client = together::Client::from_env().expect("client should build");
-    let agent = client
-        .agent(together::MIXTRAL_8X7B_INSTRUCT_V0_1)
+    let provider = together::from_env().expect("config should build from env");
+    let agent = rig::AgentBuilder::new(provider.completion(together::MIXTRAL_8X7B_INSTRUCT_V0_1))
         .preamble(TOOLS_PREAMBLE)
         .tool(Adder)
         .tool(Subtract)
@@ -24,5 +21,5 @@ async fn tools_smoke() {
         .await
         .expect("tool prompt should succeed");
 
-    assert_mentions_expected_number(&response, -3);
+    assert_mentions_expected_number(&response.output(), -3);
 }

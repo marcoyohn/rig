@@ -1,13 +1,24 @@
-//! OpenRouter Inference API client and Rig integration
+//! OpenRouter model identifiers.
 //!
-//! # Example
+//! [`from_env`] and [`new`] build a client on the [`OPENROUTER`](crate::providers::openai::wire::OPENROUTER) dialect.
+//! Routing preferences, model fallbacks and the reply's cost are typed in
+//! [`extension`].
+//!
 //! ```no_run
-//! use rig_core::{client::CompletionClient, providers::openrouter};
+//! use rig_core::completion::CompletionRequest;
+//! use rig_core::providers::openrouter;
+//! use rig_core::providers::openrouter::extension::{
+//!     OpenRouterOptions, ProviderPreferences, ProviderSortStrategy,
+//! };
 //!
 //! # fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let client = openrouter::Client::new("YOUR_API_KEY")?;
+//! let sonar = openrouter::from_env()?.chat(openrouter::PERPLEXITY_SONAR_PRO);
 //!
-//! let sonar = client.completion_model(openrouter::PERPLEXITY_SONAR_PRO);
+//! let routing = OpenRouterOptions::new()
+//!     .provider(ProviderPreferences::new().sort(ProviderSortStrategy::Price));
+//! let request = CompletionRequest::new("What is Rig?")
+//!     .provider_option(routing);
+//! # let _ = (sonar, request);
 //! # Ok(())
 //! # }
 //! ```
@@ -15,20 +26,20 @@
 #[cfg(feature = "audio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "audio")))]
 pub mod audio_generation;
-pub mod client;
 pub mod completion;
-pub mod embedding;
-pub mod model_listing;
-pub mod streaming;
+pub mod extension;
 pub mod transcription;
 
 #[cfg(feature = "audio")]
-pub use audio_generation::{AudioGenerationModel, GPT_4O_MINI_TTS, KOKORO_82M, VOXTRAL_MINI_TTS};
-pub use client::*;
+pub use audio_generation::{GPT_4O_MINI_TTS, KOKORO_82M, VOXTRAL_MINI_TTS};
 pub use completion::*;
-pub use embedding::*;
-pub use model_listing::OpenRouterModelLister;
 pub use transcription::{
-    CHIRP_3, GPT_4O_MINI_TRANSCRIBE, GPT_4O_TRANSCRIBE, TranscriptionModel, TranscriptionResponse,
-    WHISPER_1, WHISPER_LARGE_V3, WHISPER_LARGE_V3_TURBO,
+    CHIRP_3, GPT_4O_MINI_TRANSCRIBE, GPT_4O_TRANSCRIBE, WHISPER_1, WHISPER_LARGE_V3,
+    WHISPER_LARGE_V3_TURBO,
 };
+
+/// The provider key: the dialect name, a reply's `Origin::provider` and
+/// the typed provider-options key.
+pub const PROVIDER_NAME: &str = "openrouter";
+
+crate::client::macros::openai_vendor!(crate::providers::openai::wire::OPENROUTER, "OpenRouter");

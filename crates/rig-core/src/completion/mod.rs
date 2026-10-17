@@ -1,43 +1,36 @@
-//! Provider-agnostic completion and chat abstractions.
-//!
-//! This module contains the low-level request and response types used by provider
-//! implementations, plus the high-level traits most callers use through
-//! [`Agent`](crate::agent::Agent):
-//!
-//! - [`Prompt`] sends one user prompt and returns assistant text.
-//! - [`Chat`] sends a prompt with existing history and returns assistant text.
-//! - [`TypedPrompt`] requests structured output and deserializes it into a Rust type.
-//! - [`Completion`] exposes a request builder for call-site overrides.
-//! - [`CompletionModel`] is the provider-facing trait implemented by completion models.
-//!
-//! `CompletionRequest` is Rig's canonical request representation. Provider modules
-//! translate it into provider-specific request bodies and convert responses back into
-//! [`CompletionResponse`].
-//!
-//! # Example
+//! Provider-agnostic completion requests and responses. A provider's wire
+//! translates [`CompletionRequest`] into its own request and normalizes the
+//! reply as [`CompletionResponse`]; a [`Model`](crate::Model) sends it.
 //!
 //! ```no_run
-//! use rig_core::{
-//!     client::{CompletionClient, ProviderClient},
-//!     completion::Prompt,
-//!     providers::openai,
-//! };
+//! use rig_core::{Model, completion::CompletionRequest, providers::openai::OpenAI};
 //!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let client = openai::Client::from_env()?;
-//! let agent = client
-//!     .agent(openai::GPT_5_2)
-//!     .preamble("Answer concisely.")
-//!     .build();
-//!
-//! let answer = agent.prompt("What is Rig?").await?;
-//! println!("{answer}");
+//! # async fn run(http: rig_core::http_client::DynHttpClient) -> Result<(), Box<dyn std::error::Error>> {
+//! let model = OpenAI::from_env()?.with_http(http).completion("gpt-4o");
+//! let request = CompletionRequest::new("What is Rig?");
+//! let response = model.call(request).await?;
+//! println!("{:?}", response.choice);
 //! # Ok(())
 //! # }
 //! ```
 
+pub mod cache_cost;
+pub mod handle;
+pub mod history;
 pub mod message;
+pub mod options;
+pub mod provider_options;
 pub mod request;
 
-pub use message::{AssistantContent, Message, MessageError};
+pub use cache_cost::{CacheCost, CacheRates};
+pub use handle::ModelRef;
+pub use history::{Accepts, LaterSystem, Media, Pairing, Place, Replay, ReplayTarget, adapt};
+pub use message::{AssistantContent, AssistantMessage, Message, MessageError};
+pub use options::{
+    CacheRetention, Effort, GenerationOptions, OnUnsupported, Reasoning, ServiceTier,
+    UnsupportedOption, Verbosity,
+};
+pub use provider_options::{
+    ExtensionOptions, OptionsError, ProviderExtension, ProviderOptions, ReplyExtras, SHARED,
+};
 pub use request::*;

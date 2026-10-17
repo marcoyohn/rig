@@ -1,72 +1,139 @@
-use crate::client::Client;
-use crate::types::errors::AwsSdkInvokeModelError;
+//! The Bedrock text-to-image wire over `InvokeModel`.
+//!
+//! ```no_run
+//! use rig_bedrock::{client::BedrockRuntime, image::{AMAZON_NOVA_CANVAS, Images}};
+//! use rig_core::Model;
+//!
+//! let model = BedrockRuntime::from_env().image_generation(AMAZON_NOVA_CANVAS);
+//! # let _ = model;
+//! ```
+
+use crate::client::BedrockRuntime;
+use crate::completion::PROVIDER_NAME;
+use crate::types::errors::sdk_error;
 use crate::types::text_to_image::{TextToImageGeneration, TextToImageResponse};
 use aws_smithy_types::Blob;
-use rig_core::image_generation::{
-    self, ImageGenerationError, ImageGenerationRequest, ImageGenerationResponse,
-};
+use rig_core::Model;
+use rig_core::driver::{Exchange, Opened, Opening, Transport};
+use rig_core::error::{EncodeError, ProviderError};
+use rig_core::image_generation::{ImageGenerationRequest, NormalizeImageGenerationResponse};
+use rig_core::operation::ImageGeneration;
+use rig_core::wire::{Decoder, Descriptor, Flow, Mode, Out, Wire, WireEvent};
 
-/// `amazon.titan-image-generator-v1`
-pub const AMAZON_TITAN_IMAGE_GENERATOR_V1: &str = "amazon.titan-image-generator-v1";
-/// `amazon.titan-image-generator-v2:0`
-pub const AMAZON_TITAN_IMAGE_GENERATOR_V2_0: &str = "amazon.titan-image-generator-v2:0";
 /// `amazon.nova-canvas-v1:0`
 pub const AMAZON_NOVA_CANVAS: &str = "amazon.nova-canvas-v1:0";
+/// `stability.sd3-5-large-v1:0`
+pub const STABILITY_SD3_5_LARGE: &str = "stability.sd3-5-large-v1:0";
+/// `stability.stable-image-core-v1:1`
+pub const STABILITY_STABLE_IMAGE_CORE_1_0: &str = "stability.stable-image-core-v1:1";
+/// `stability.stable-image-ultra-v1:1`
+pub const STABILITY_STABLE_IMAGE_ULTRA_1_0: &str = "stability.stable-image-ultra-v1:1";
 
-#[derive(Clone)]
-pub struct ImageGenerationModel {
-    pub(crate) client: Client,
+/// The image-generation endpoint for one model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Images {
     pub model: String,
 }
 
-impl ImageGenerationModel {
-    pub fn new(client: Client, model: impl Into<String>) -> Self {
+impl BedrockRuntime {
+    /// The image-generation model for `model`.
+    pub fn image_generation(&self, model: impl Into<String>) -> Model<Images, Self> {
+        Model::new(Images::new(model), self.clone())
+    }
+}
+
+impl Images {
+    pub fn new(model: impl Into<String>) -> Self {
         Self {
-            client,
             model: model.into(),
         }
     }
 }
 
-impl image_generation::ImageGenerationModel for ImageGenerationModel {
-    type Response = TextToImageResponse;
+/// One `InvokeModel` request: the model and its JSON body.
+pub struct InvokeModel {
+    model: String,
+    body: String,
+}
 
-    type Client = Client;
+impl Wire for Images {
+    type Op = ImageGeneration;
+    type Payload = InvokeModel;
+    type Frame = Vec<u8>;
+    type Decoder<'id> = ImagesDecoder;
+    type Reassembler = rig_core::wire::document::Unreassembled;
 
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
+    fn describe(&self) -> Descriptor<'_> {
+        Descriptor::new(PROVIDER_NAME).model(self.model.as_str())
     }
 
-    async fn image_generation(
+    fn encode(
         &self,
-        generation_request: ImageGenerationRequest,
-    ) -> Result<ImageGenerationResponse<Self::Response>, ImageGenerationError> {
-        let mut request = TextToImageGeneration::new(generation_request.prompt);
-        request.width(generation_request.width);
-        request.height(generation_request.height);
+        request: ImageGenerationRequest,
+        _mode: Mode,
+    ) -> Result<InvokeModel, EncodeError> {
+        let request = TextToImageGeneration::new(request.prompt)
+            .width(request.width)
+            .height(request.height);
+        Ok(InvokeModel {
+            model: self.model.clone(),
+            body: serde_json::to_string(&request)?,
+        })
+    }
 
-        let body = serde_json::to_string(&request)?;
-        let model_response = self
-            .client
-            .get_inner()
-            .await
-            .invoke_model()
-            .model_id(self.model.as_str())
-            .content_type("application/json")
-            .accept("application/json")
-            .body(Blob::new(body))
-            .send()
-            .await
-            .map_err(|sdk_error| {
-                Into::<ImageGenerationError>::into(AwsSdkInvokeModelError(sdk_error))
-            })?;
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
+        ImagesDecoder
+    }
+}
 
-        let response_str = String::from_utf8(model_response.body.into_inner())
-            .map_err(|e| ImageGenerationError::ResponseError(e.to_string()))?;
+impl Transport<Images> for BedrockRuntime {
+    fn send(&self, payload: InvokeModel, _exchange: Exchange) -> Opening<Vec<u8>> {
+        let runtime = self.clone();
+        Opening::new(async move {
+            let sent = runtime
+                .inner()
+                .await
+                .invoke_model()
+                .model_id(payload.model.as_str())
+                .content_type("application/json")
+                .accept("application/json")
+                .body(Blob::new(payload.body))
+                .send()
+                .await;
+            Ok(match sent {
+                Ok(response) => {
+                    let request_id =
+                        aws_sdk_bedrockruntime::operation::RequestId::request_id(&response)
+                            .map(str::to_owned);
+                    Opened::new(futures::stream::iter([Ok(response.body.into_inner())]))
+                        .with_request_id(request_id)
+                }
+                Err(error) => Opened::failed(sdk_error(error)),
+            })
+        })
+    }
+}
 
-        let result: TextToImageResponse = serde_json::from_str(&response_str)
-            .map_err(|e| ImageGenerationError::ResponseError(e.to_string()))?;
+/// Decodes the one `TextToImageResponse` an image request returns.
+pub struct ImagesDecoder;
 
-        result.try_into()
+impl<'id> Decoder<'id, ImageGeneration, Vec<u8>> for ImagesDecoder {
+    type Event = Vec<u8>;
+
+    fn classify(&self, body: Vec<u8>) -> WireEvent<Vec<u8>> {
+        WireEvent::Known(body)
+    }
+
+    fn decode(
+        &mut self,
+        body: Vec<u8>,
+        mut out: Out<'id, ImageGeneration>,
+    ) -> Result<Flow, ProviderError> {
+        let body =
+            String::from_utf8(body).map_err(|error| ProviderError::Response(error.to_string()))?;
+        let response = serde_json::from_str::<TextToImageResponse>(&body)
+            .map_err(|error| ProviderError::Response(error.to_string()))?;
+        out.raw(serde_json::to_value(&response)?);
+        Ok(out.end(response.normalize()?))
     }
 }

@@ -1,11 +1,9 @@
 use anyhow::Result;
 use rig::integrations::cli_chatbot::ChatBotBuilder;
 use rig::prelude::*;
-use rig::providers::openai;
+use rig::providers::openai::{self, OpenAI};
 use rig::{
-    completion::ToolDefinition,
     embeddings::EmbeddingsBuilder,
-    providers::openai::Client,
     tool::{Tool, ToolEmbedding, ToolSet},
     vector_store::in_memory_store::InMemoryVectorStore,
 };
@@ -36,28 +34,32 @@ impl Tool for Add {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "add".to_string(),
-            description: "Add x and y together".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The first number to add"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The second number to add"
-                    }
-                },
-                "required": [ "x", "y" ]
-            }),
-        }
+    fn description(&self) -> String {
+        "Add x and y together".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The first number to add"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The second number to add"
+                }
+            },
+            "required": [ "x", "y" ]
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let result = args.x + args.y;
         Ok(result)
     }
@@ -88,28 +90,32 @@ impl Tool for Subtract {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "subtract".to_string(),
-            description: "Subtract y from x (i.e.: x - y)".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The number to subtract from"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The number to subtract"
-                    }
-                },
-                "required": [ "x", "y" ]
-            }),
-        }
+    fn description(&self) -> String {
+        "Subtract y from x (i.e.: x - y)".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The number to subtract from"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The number to subtract"
+                }
+            },
+            "required": [ "x", "y" ]
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let result = args.x - args.y;
         Ok(result)
     }
@@ -139,28 +145,32 @@ impl Tool for Multiply {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "multiply".to_string(),
-            description: "Compute the product of x and y (i.e.: x * y)".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The first factor in the product"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The second factor in the product"
-                    }
-                },
-                "required": [ "x", "y" ]
-            }),
-        }
+    fn description(&self) -> String {
+        "Compute the product of x and y (i.e.: x * y)".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The first factor in the product"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The second factor in the product"
+                }
+            },
+            "required": [ "x", "y" ]
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let result = args.x * args.y;
         Ok(result)
     }
@@ -186,28 +196,31 @@ impl Tool for Divide {
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "divide".to_string(),
-            description: "Compute the Quotient of x and y (i.e.: x / y). Useful for ratios."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The Dividend of the division. The number being divided"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The Divisor of the division. The number by which the dividend is being divided"
-                    }
-                },
-                "required": [ "x", "y" ]
-            }),
-        }
+    fn description(&self) -> String {
+        "Compute the Quotient of x and y (i.e.: x / y). Useful for ratios.".to_string()
     }
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The Dividend of the division. The number being divided"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The Divisor of the division. The number by which the dividend is being divided"
+                }
+            },
+            "required": [ "x", "y" ]
+        })
+    }
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let result = args.x / args.y;
         Ok(result)
     }
@@ -231,17 +244,18 @@ impl ToolEmbedding for Divide {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Create OpenAI client
-    let openai_client = Client::from_env()?;
+    // The OpenAI client, from `OPENAI_API_KEY`.
+    let openai_client = OpenAI::from_env()?;
 
     // Create dynamic tools embeddings
-    let toolset = ToolSet::builder()
-        .dynamic_tool(Add)
-        .dynamic_tool(Subtract)
-        .dynamic_tool(Multiply)
-        .dynamic_tool(Divide)
-        .build();
-    let embedding_model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let mut toolset = ToolSet::default();
+    toolset.add_retrieved_tool(Add)?;
+    toolset.add_retrieved_tool(Subtract)?;
+    toolset.add_retrieved_tool(Multiply)?;
+    toolset.add_retrieved_tool(Divide)?;
+    let embedding_model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_ADA_002, None)
+        .erase();
     let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
         .documents(toolset.schemas()?)?
         .build()
@@ -252,8 +266,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let index = vector_store.index(embedding_model);
 
     // Create RAG agent with a single context prompt and a dynamic tool source
-    let calculator_rag = openai_client
-        .agent(openai::GPT_4)
+    let calculator_rag = AgentBuilder::new(openai_client.completion(openai::GPT_4))
         .preamble(
             "You are an assistant here to help the user select which tool is most appropriate to perform arithmetic operations.
             Follow these instructions closely.
@@ -268,11 +281,14 @@ async fn main() -> Result<(), anyhow::Error> {
         )
         // Add a dynamic tool source with a sample rate of 1 (i.e.: only
         // 1 additional tool will be added to prompts)
-        .dynamic_tools(4, index, toolset)
+        .retrieved_tools(4, index, toolset)
         .build();
 
     // Create a CLI chatbot from the agent
-    let chatbot = ChatBotBuilder::new().agent(calculator_rag).build();
+    let chatbot = ChatBotBuilder::new()
+        .agent(calculator_rag)
+        .max_turns(2)
+        .build();
 
     chatbot.run().await?;
 

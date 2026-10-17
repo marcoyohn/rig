@@ -1,12 +1,6 @@
-#![allow(
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::unwrap_used,
-    clippy::unreachable
-)]
+#![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
-use rig_core::tool::Tool;
+use rig_agent::tool::Tool;
 use rig_derive::rig_tool;
 
 #[rig_tool(
@@ -17,23 +11,27 @@ use rig_derive::rig_tool;
         operation = "The operation to perform (add, subtract, multiply, divide)"
     )
 )]
-async fn calculator(x: i32, y: i32, operation: String) -> Result<i32, rig_core::tool::ToolError> {
+async fn calculator(
+    x: i32,
+    y: i32,
+    operation: String,
+) -> Result<i32, rig_core::tool::ToolExecutionError> {
     match operation.as_str() {
         "add" => Ok(x + y),
         "subtract" => Ok(x - y),
         "multiply" => Ok(x * y),
         "divide" => {
             if y == 0 {
-                Err(rig_core::tool::ToolError::ToolCallError(
-                    "Division by zero".into(),
+                Err(rig_core::tool::ToolExecutionError::other(
+                    "Division by zero",
                 ))
             } else {
                 Ok(x / y)
             }
         }
-        _ => Err(rig_core::tool::ToolError::ToolCallError(
-            format!("Unknown operation: {operation}").into(),
-        )),
+        _ => Err(rig_core::tool::ToolExecutionError::other(format!(
+            "Unknown operation: {operation}"
+        ))),
     }
 }
 
@@ -45,23 +43,27 @@ async fn calculator(x: i32, y: i32, operation: String) -> Result<i32, rig_core::
         operation = "The operation to perform (add, subtract, multiply, divide)"
     )
 )]
-fn sync_calculator(x: i32, y: i32, operation: String) -> Result<i32, rig_core::tool::ToolError> {
+fn sync_calculator(
+    x: i32,
+    y: i32,
+    operation: String,
+) -> Result<i32, rig_core::tool::ToolExecutionError> {
     match operation.as_str() {
         "add" => Ok(x + y),
         "subtract" => Ok(x - y),
         "multiply" => Ok(x * y),
         "divide" => {
             if y == 0 {
-                Err(rig_core::tool::ToolError::ToolCallError(
-                    "Division by zero".into(),
+                Err(rig_core::tool::ToolExecutionError::other(
+                    "Division by zero",
                 ))
             } else {
                 Ok(x / y)
             }
         }
-        _ => Err(rig_core::tool::ToolError::ToolCallError(
-            format!("Unknown operation: {operation}").into(),
-        )),
+        _ => Err(rig_core::tool::ToolExecutionError::other(format!(
+            "Unknown operation: {operation}"
+        ))),
     }
 }
 
@@ -69,8 +71,8 @@ fn sync_calculator(x: i32, y: i32, operation: String) -> Result<i32, rig_core::t
 async fn test_calculator_tool() {
     let calculator = Calculator;
 
-    let definition = calculator.definition(String::default()).await;
-    assert_eq!(calculator.name(), "calculator");
+    let definition = rig_agent::tool::tool_definition(&calculator);
+    assert_eq!(Calculator::NAME, "calculator");
     assert_eq!(
         definition.description,
         "Perform basic arithmetic operations"
@@ -131,7 +133,10 @@ async fn test_calculator_tool() {
     ];
 
     for (input, expected) in test_cases {
-        let result = calculator.call(input).await.unwrap();
+        let result = calculator
+            .call(&mut rig_agent::tool::ToolContext::new(), input)
+            .await
+            .unwrap();
         assert_eq!(result, serde_json::json!(expected));
     }
 
@@ -141,8 +146,11 @@ async fn test_calculator_tool() {
         y: 0,
         operation: "divide".to_string(),
     };
-    let err = calculator.call(div_zero).await.unwrap_err();
-    assert!(matches!(err, rig_core::tool::ToolError::ToolCallError(_)));
+    let err = calculator
+        .call(&mut rig_agent::tool::ToolContext::new(), div_zero)
+        .await
+        .unwrap_err();
+    assert!(err.kind() == rig_core::tool::ToolErrorKind::Other);
 
     // Test invalid operation
     let invalid_op = CalculatorParameters {
@@ -150,17 +158,23 @@ async fn test_calculator_tool() {
         y: 3,
         operation: "power".to_string(),
     };
-    let err = calculator.call(invalid_op).await.unwrap_err();
-    assert!(matches!(err, rig_core::tool::ToolError::ToolCallError(_)));
+    let err = calculator
+        .call(&mut rig_agent::tool::ToolContext::new(), invalid_op)
+        .await
+        .unwrap_err();
+    assert!(err.kind() == rig_core::tool::ToolErrorKind::Other);
 
     // Test sync calculator
     let sync_calculator = SyncCalculator;
     let result = sync_calculator
-        .call(SyncCalculatorParameters {
-            x: 5,
-            y: 3,
-            operation: "add".to_string(),
-        })
+        .call(
+            &mut rig_agent::tool::ToolContext::new(),
+            SyncCalculatorParameters {
+                x: 5,
+                y: 3,
+                operation: "add".to_string(),
+            },
+        )
         .await
         .unwrap();
 

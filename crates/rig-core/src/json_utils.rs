@@ -1,9 +1,77 @@
-use serde::Deserialize;
-use serde::de::{self, Deserializer, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Serialize, Serializer};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
 use std::str::FromStr;
+
+/// `skip_serializing_if` helper: serde requires a `fn(&bool) -> bool`, so the
+/// trivially-copy lint does not apply here.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// Serializes a `HashMap` in lexicographic key order, propagating serializer errors.
+/// Stable ordering avoids randomized map iteration changing request bytes.
+pub fn serialize_map_sorted<S, V>(
+    map: &HashMap<String, V>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    V: Serialize,
+{
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    serializer.collect_map(entries)
+}
+
+/// [`serialize_map_sorted`] for an optional map.
+///
+/// Pairs with `#[serde(skip_serializing_if = "Option::is_none")]`: serde still
+/// routes `Some` through this function, and the `None` arm only runs for a field
+/// that is serialized unconditionally.
+pub fn serialize_optional_map_sorted<S, V>(
+    map: &Option<HashMap<String, V>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    V: Serialize,
+{
+    match map {
+        Some(map) => serialize_map_sorted(map, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Renders compact JSON with lexicographically sorted object keys at every depth,
+/// independent of serde_json's `preserve_order` feature. Array order is retained.
+pub fn to_canonical_string(value: &serde_json::Value) -> String {
+    fn sorted(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by_key(|(key, _)| *key);
+                let mut out = serde_json::Map::new();
+                for (key, value) in entries {
+                    out.insert(key.clone(), sorted(value));
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(sorted).collect())
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => value.clone(),
+        }
+    }
+    sorted(value).to_string()
+}
 
 pub fn merge(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
     match (a, b) {
@@ -17,6 +85,21 @@ pub fn merge(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Applies a request builder's `additional_params` call: `None` clears, and a
+/// value merges over the parameters earlier calls set. Merging combines JSON
+/// objects key by key; earlier parameters that are not an object are kept.
+pub(crate) fn merge_params(
+    existing: Option<serde_json::Value>,
+    params: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    Some(match (existing, params?) {
+        (Some(existing), params) => merge(existing, params),
+        (None, params) => params,
+    })
+}
+
+// Callers require the image or audio feature.
+#[cfg_attr(not(any(feature = "image", feature = "audio")), allow(dead_code))]
 pub fn merge_inplace(a: &mut serde_json::Value, b: serde_json::Value) {
     if let (serde_json::Value::Object(a_map), serde_json::Value::Object(b_map)) = (a, b) {
         b_map.into_iter().for_each(|(key, value)| {
@@ -25,9 +108,10 @@ pub fn merge_inplace(a: &mut serde_json::Value, b: serde_json::Value) {
     }
 }
 
-/// Convert a serde_json::Value to a JSON string for tool arguments.
-/// Handles the case where vLLM returns arguments as a JSON string (Value::String)
-/// instead of a JSON object (Value::Object) like OpenAI does.
+/// Normalize a provider-wire field that may contain encoded JSON in a string.
+///
+/// This deliberately unwraps [`serde_json::Value::String`] and is only for
+/// provider decoding, before a value enters Rig's canonical message model.
 pub fn value_to_json_string(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
@@ -35,17 +119,14 @@ pub fn value_to_json_string(value: &serde_json::Value) -> String {
     }
 }
 
-/// Deserialize a field that may arrive as either a JSON-encoded string or any other
-/// JSON value, into `Option<String>`.
-///
-/// - A string is taken verbatim.
-/// - Any other JSON value is re-serialized to its compact JSON-string form (via
-///   [`value_to_json_string`]). Object key order is not preserved, which is fine
-///   because callers re-parse the string.
-/// - `null` or a missing field becomes `None`.
-///
-/// Tolerates OpenAI-compatible gateways that stream `tool_calls[].function.arguments`
-/// as an object (e.g. `{}`) instead of the spec-mandated JSON string (`"{}"`).
+/// Serializes compact JSON, retaining quotes and escaping for string values.
+pub fn serialize_json_value(value: &serde_json::Value) -> String {
+    value.to_string()
+}
+
+/// Deserializes strings verbatim and other non-null values as compact JSON text.
+/// Null becomes `None`; fields that may be absent need a serde default.
+/// Object key order depends on serde_json's enabled features.
 pub fn deserialize_json_string_or_value<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -67,9 +148,184 @@ pub fn parse_tool_arguments(arguments: &str) -> serde_json::Result<serde_json::V
     serde_json::from_str(arguments)
 }
 
-/// This module is helpful in cases where raw json objects are serialized and deserialized as
-///  strings such as `"{\"key\": \"value\"}"`. This might seem odd but it's actually how some
-///  some providers such as OpenAI return function arguments (for some reason).
+/// The longest object a cut-off JSON text `text` still states: open strings,
+/// arrays and objects are closed and a dangling key or separator dropped, as
+/// pi's streaming JSON parse does. `None` when no prefix states an object.
+pub fn parse_partial_object(text: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    // Bounds the work on a large cut-off input: the last valid cut is
+    // almost always near its end.
+    const MAX_ATTEMPTS: usize = 256;
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    // Prefix lengths a value just ended at, with the containers open there.
+    let mut cuts: Vec<(usize, Vec<u8>, bool)> = Vec::new();
+    let bytes = text.as_bytes();
+    for (at, byte) in bytes.iter().enumerate() {
+        if in_string {
+            match (escaped, *byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => {
+                    in_string = false;
+                    cuts.push((at + 1, stack.clone(), false));
+                }
+                (false, _) => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                stack.push(*byte);
+                cuts.push((at + 1, stack.clone(), false));
+            }
+            b'}' | b']' => {
+                stack.pop();
+                cuts.push((at + 1, stack.clone(), false));
+            }
+            b if b.is_ascii_alphanumeric() || *b == b'.' || *b == b'-' || *b == b'+' => {
+                let next = bytes.get(at + 1).copied();
+                if !next.is_some_and(|n| {
+                    n.is_ascii_alphanumeric() || n == b'.' || n == b'-' || n == b'+'
+                }) {
+                    cuts.push((at + 1, stack.clone(), false));
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_string {
+        let at = text.len() - usize::from(escaped);
+        cuts.push((at, stack.clone(), true));
+    }
+    cuts.iter()
+        .rev()
+        .take(MAX_ATTEMPTS)
+        .find_map(|(at, open, quote)| {
+            let mut candidate = text.get(..*at)?.to_owned();
+            if *quote {
+                candidate.push('"');
+            }
+            for container in open.iter().rev() {
+                candidate.push(if *container == b'{' { '}' } else { ']' });
+            }
+            match serde_json::from_str(&candidate) {
+                Ok(serde_json::Value::Object(object)) => Some(object),
+                _ => None,
+            }
+        })
+}
+
+/// The best object a tool call's argument text states so far, for showing a
+/// call while it streams. It never fails: complete JSON parses as is, text
+/// with raw control characters or invalid escapes is repaired first, a
+/// cut-off prefix keeps the longest object it states
+/// ([`parse_partial_object`]), and anything else is an empty object, as is
+/// a top level that is not an object.
+///
+/// It is for display only. A call's arguments are what its end states, and
+/// only those are validated and executed.
+///
+/// ```
+/// use rig_core::streaming::parse_partial_arguments;
+///
+/// let partial = parse_partial_arguments(r#"{"path": "notes.md", "content": "Hel"#);
+/// assert_eq!(partial["path"], "notes.md");
+/// assert_eq!(partial["content"], "Hel");
+/// ```
+pub fn parse_partial_arguments(text: &str) -> serde_json::Map<String, serde_json::Value> {
+    if text.trim().is_empty() {
+        return serde_json::Map::new();
+    }
+    let repaired = repair_json(text);
+    let complete = serde_json::from_str(text)
+        .ok()
+        .or_else(|| serde_json::from_str(&repaired).ok());
+    if let Some(value) = complete {
+        return match value {
+            serde_json::Value::Object(object) => object,
+            _ => serde_json::Map::new(),
+        };
+    }
+    let cut = without_partial_escape(&repaired);
+    parse_partial_object(cut)
+        .or_else(|| parse_partial_object(text))
+        .unwrap_or_default()
+}
+
+/// `text` with raw control characters inside strings escaped and each
+/// backslash that starts no valid escape doubled, as models sometimes write
+/// them.
+fn repair_json(text: &str) -> String {
+    let mut repaired = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !in_string {
+            in_string = c == '"';
+            repaired.push(c);
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = false;
+                repaired.push(c);
+            }
+            '\\' => match chars.peek() {
+                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') => {
+                    repaired.push(c);
+                    if let Some(next) = chars.next() {
+                        repaired.push(next);
+                    }
+                }
+                // A trailing backslash may begin an escape the next fragment ends.
+                None => repaired.push(c),
+                Some(_) => repaired.push_str("\\\\"),
+            },
+            '\n' => repaired.push_str("\\n"),
+            '\r' => repaired.push_str("\\r"),
+            '\t' => repaired.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write as _;
+                // Writing to a `String` cannot fail.
+                let _ = write!(repaired, "\\u{:04x}", u32::from(c));
+            }
+            c => repaired.push(c),
+        }
+    }
+    repaired
+}
+
+/// `text` without a `\u` escape its end cuts short, which would otherwise
+/// cost the whole string it ends.
+fn without_partial_escape(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let tail = bytes.len().saturating_sub(5);
+    let Some(at) = (tail..bytes.len())
+        .rev()
+        .find(|at| bytes.get(*at..*at + 2) == Some(b"\\u"))
+    else {
+        return text;
+    };
+    let digits = bytes.get(at + 2..).unwrap_or_default();
+    // A preceding backslash run of odd length escapes this backslash itself.
+    let escaping = bytes
+        .get(..at)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    if digits.len() < 4 && digits.iter().all(u8::is_ascii_hexdigit) && escaping % 2 == 0 {
+        text.get(..at).unwrap_or(text)
+    } else {
+        text
+    }
+}
+
+/// Serde adapters for JSON encoded inside strings. Empty or whitespace-only
+/// strings deserialize to empty objects.
 pub mod stringified_json {
     use super::parse_tool_arguments;
     use serde::{self, Deserialize, Deserializer, Serializer};
@@ -93,10 +349,8 @@ pub mod stringified_json {
         serde_json::from_str(&s).map_err(serde::de::Error::custom)
     }
 
-    /// Deserialize JSON that may be encoded either as a string or as a raw JSON value.
-    /// OpenAI-compatible providers typically return tool arguments as a stringified JSON
-    /// object, while some implementations such as Hugging Face and `llama.cpp` return the
-    /// JSON object directly.
+    /// Parses string contents as JSON and passes other values through unchanged.
+    /// Empty or whitespace-only strings become empty objects.
     pub fn deserialize_maybe_stringified<'de, D>(
         deserializer: D,
     ) -> Result<serde_json::Value, D::Error>
@@ -112,6 +366,8 @@ pub mod stringified_json {
     }
 }
 
+/// Deserializes a string or object as one item, a sequence as multiple items,
+/// and null as an empty list. Strings use [`FromStr`]; objects use [`Deserialize`].
 pub fn string_or_vec<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     T: Deserialize<'de> + FromStr<Err = Infallible>,
@@ -144,6 +400,14 @@ where
             Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))
         }
 
+        fn visit_map<M>(self, map: M) -> Result<Vec<T>, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let item = Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
+            Ok(vec![item])
+        }
+
         fn visit_none<E>(self) -> Result<Vec<T>, E>
         where
             E: de::Error,
@@ -162,48 +426,10 @@ where
     deserializer.deserialize_any(StringOrVec(PhantomData))
 }
 
-pub fn null_or_vec<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    T: Deserialize<'de>,
-    D: Deserializer<'de>,
-{
-    struct NullOrVec<T>(PhantomData<fn() -> T>);
-
-    impl<'de, T> Visitor<'de> for NullOrVec<T>
-    where
-        T: Deserialize<'de>,
-    {
-        type Value = Vec<T>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a sequence or null")
-        }
-
-        fn visit_seq<A>(self, seq: A) -> Result<Vec<T>, A::Error>
-        where
-            A: SeqAccess<'de>,
-        {
-            Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))
-        }
-
-        fn visit_none<E>(self) -> Result<Vec<T>, E>
-        where
-            E: de::Error,
-        {
-            Ok(vec![])
-        }
-
-        fn visit_unit<E>(self) -> Result<Vec<T>, E>
-        where
-            E: de::Error,
-        {
-            Ok(vec![])
-        }
-    }
-
-    deserializer.deserialize_any(NullOrVec(PhantomData))
-}
-
+/// Deserializes `T`, mapping an explicit `null` to `T::default()`.
+///
+/// Driven through `deserialize_option` rather than `deserialize_any`; the two
+/// agree only for self-describing formats, which is all rig decodes (JSON).
 pub fn null_or_default<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
     T: Deserialize<'de> + Default,
@@ -213,162 +439,96 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde::{Deserialize, Serialize};
+mod tests;
 
-    #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct Dummy {
-        #[serde(with = "stringified_json")]
-        data: serde_json::Value,
+/// Lenient reads of a provider reply: each accessor gives `None`, or an
+/// empty slice, for a field that is missing or of another type, and never
+/// fails. Decoders read replies through it, so a field no block or finish
+/// needs can never fail a reply.
+///
+/// ```
+/// use rig_core::json_utils::Lenient;
+/// use serde_json::json;
+///
+/// let reply = json!({"id": "r1", "usage": {"input_tokens": "7"}, "output": null});
+/// assert_eq!(reply.str("id"), Some("r1"));
+/// assert_eq!(reply.at("/usage/input_tokens").and_then(Lenient::as_u64_lenient), Some(7));
+/// assert!(reply.arr("output").is_empty());
+/// ```
+pub trait Lenient {
+    /// The string at `key`.
+    fn str(&self, key: &str) -> Option<&str>;
+    /// The unsigned integer at `key`, from a number or a numeric string.
+    fn u64(&self, key: &str) -> Option<u64>;
+    /// The integer at `key`, from a number or a numeric string.
+    fn i64(&self, key: &str) -> Option<i64>;
+    /// The number at `key`, from a number or a numeric string.
+    fn f64(&self, key: &str) -> Option<f64>;
+    /// The boolean at `key`.
+    fn bool(&self, key: &str) -> Option<bool>;
+    /// The object at `key`.
+    fn obj(&self, key: &str) -> Option<&serde_json::Map<String, serde_json::Value>>;
+    /// The array at `key`, empty when absent or of another type.
+    fn arr(&self, key: &str) -> &[serde_json::Value];
+    /// The value at a JSON pointer, `None` for `null`.
+    fn at(&self, pointer: &str) -> Option<&serde_json::Value>;
+    /// This value as an unsigned integer, from a number or a numeric string.
+    fn as_u64_lenient(&self) -> Option<u64>;
+}
+
+impl Lenient for serde_json::Value {
+    fn str(&self, key: &str) -> Option<&str> {
+        self.get(key)?.as_str()
     }
 
-    #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct DummyMaybeStringified {
-        #[serde(deserialize_with = "stringified_json::deserialize_maybe_stringified")]
-        data: serde_json::Value,
+    fn u64(&self, key: &str) -> Option<u64> {
+        self.get(key)?.as_u64_lenient()
     }
 
-    #[derive(serde::Deserialize)]
-    struct ArgWrapper {
-        #[serde(default, deserialize_with = "deserialize_json_string_or_value")]
-        arguments: Option<String>,
+    fn i64(&self, key: &str) -> Option<i64> {
+        match self.get(key)? {
+            serde_json::Value::Number(number) => number.as_i64(),
+            serde_json::Value::String(text) => text.trim().parse().ok(),
+            _ => None,
+        }
     }
 
-    /// Spec-compliant case: `arguments` is already a JSON-encoded string, taken verbatim.
-    #[test]
-    fn json_string_or_value_string_passthrough() {
-        let w: ArgWrapper = serde_json::from_str(r#"{"arguments":"{\"a\":1}"}"#).unwrap();
-        assert_eq!(w.arguments.as_deref(), Some(r#"{"a":1}"#));
+    fn f64(&self, key: &str) -> Option<f64> {
+        match self.get(key)? {
+            serde_json::Value::Number(number) => number.as_f64(),
+            serde_json::Value::String(text) => text.trim().parse().ok(),
+            _ => None,
+        }
     }
 
-    /// Non-compliant gateway: an empty object `{}` must serialize to the string `"{}"`,
-    /// not be treated as absent (None).
-    #[test]
-    fn json_string_or_value_empty_object() {
-        let w: ArgWrapper = serde_json::from_str(r#"{"arguments":{}}"#).unwrap();
-        assert_eq!(w.arguments.as_deref(), Some("{}"));
+    fn bool(&self, key: &str) -> Option<bool> {
+        self.get(key)?.as_bool()
     }
 
-    /// Non-compliant gateway: a nested object is re-serialized to a string.
-    #[test]
-    fn json_string_or_value_nested_object() {
-        let w: ArgWrapper =
-            serde_json::from_str(r#"{"arguments":{"path":"/tmp","depth":2}}"#).unwrap();
-        // `arguments` is re-serialized from a Value; object key order is not guaranteed
-        // (depends on serde_json's `preserve_order` feature), so re-parse and compare
-        // values rather than the raw string.
-        let parsed: serde_json::Value =
-            serde_json::from_str(w.arguments.as_deref().unwrap()).unwrap();
-        assert_eq!(parsed["path"], "/tmp");
-        assert_eq!(parsed["depth"], 2);
+    fn obj(&self, key: &str) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.get(key)?.as_object()
     }
 
-    /// Non-compliant gateway: an array is also "any other JSON value" and serializes to a
-    /// string. Array order is meaningful and preserved by serde_json, so compare the string
-    /// directly.
-    #[test]
-    fn json_string_or_value_array() {
-        let w: ArgWrapper = serde_json::from_str(r#"{"arguments":[1,2,3]}"#).unwrap();
-        assert_eq!(w.arguments.as_deref(), Some("[1,2,3]"));
+    fn arr(&self, key: &str) -> &[serde_json::Value] {
+        self.get(key)
+            .and_then(serde_json::Value::as_array)
+            .map_or(&[], Vec::as_slice)
     }
 
-    /// Regression test: JSON null must collapse to None (not the string "null").
-    /// Removing `.filter(|v| !v.is_null())` from the deserializer would fail this test.
-    #[test]
-    fn json_string_or_value_null_is_none() {
-        let w: ArgWrapper = serde_json::from_str(r#"{"arguments":null}"#).unwrap();
-        assert!(w.arguments.is_none());
+    fn at(&self, pointer: &str) -> Option<&serde_json::Value> {
+        self.pointer(pointer).filter(|value| !value.is_null())
     }
 
-    /// A missing field is likewise None (relies on `#[serde(default)]`).
-    #[test]
-    fn json_string_or_value_missing_is_none() {
-        let w: ArgWrapper = serde_json::from_str(r#"{}"#).unwrap();
-        assert!(w.arguments.is_none());
-    }
-
-    #[test]
-    fn test_merge() {
-        let a = serde_json::json!({"key1": "value1"});
-        let b = serde_json::json!({"key2": "value2"});
-        let result = merge(a, b);
-        let expected = serde_json::json!({"key1": "value1", "key2": "value2"});
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_merge_inplace() {
-        let mut a = serde_json::json!({"key1": "value1"});
-        let b = serde_json::json!({"key2": "value2"});
-        merge_inplace(&mut a, b);
-        let expected = serde_json::json!({"key1": "value1", "key2": "value2"});
-        assert_eq!(a, expected);
-    }
-
-    #[test]
-    fn test_stringified_json_serialize() {
-        let dummy = Dummy {
-            data: serde_json::json!({"key": "value"}),
-        };
-        let serialized = serde_json::to_string(&dummy).unwrap();
-        let expected = r#"{"data":"{\"key\":\"value\"}"}"#;
-        assert_eq!(serialized, expected);
-    }
-
-    #[test]
-    fn test_stringified_json_deserialize() {
-        let json_str = r#"{"data":"{\"key\":\"value\"}"}"#;
-        let dummy: Dummy = serde_json::from_str(json_str).unwrap();
-        let expected = Dummy {
-            data: serde_json::json!({"key": "value"}),
-        };
-        assert_eq!(dummy, expected);
-    }
-
-    #[test]
-    fn test_stringified_json_deserialize_empty_string() {
-        let json_str = r#"{"data":""}"#;
-        let dummy: Dummy = serde_json::from_str(json_str).unwrap();
-        assert_eq!(dummy.data, serde_json::json!({}));
-    }
-
-    #[test]
-    fn test_deserialize_maybe_stringified_value_from_string() {
-        let json_str = r#"{"data":"{\"key\":\"value\"}"}"#;
-        let dummy: DummyMaybeStringified = serde_json::from_str(json_str).unwrap();
-        assert_eq!(dummy.data, serde_json::json!({"key": "value"}));
-    }
-
-    #[test]
-    fn test_deserialize_maybe_stringified_value_from_object() {
-        let json_str = r#"{"data":{"key":"value"}}"#;
-        let dummy: DummyMaybeStringified = serde_json::from_str(json_str).unwrap();
-        assert_eq!(dummy.data, serde_json::json!({"key": "value"}));
-    }
-
-    #[test]
-    fn test_deserialize_maybe_stringified_value_from_empty_string() {
-        let json_str = r#"{"data":""}"#;
-        let dummy: DummyMaybeStringified = serde_json::from_str(json_str).unwrap();
-        assert_eq!(dummy.data, serde_json::json!({}));
-    }
-
-    #[test]
-    fn test_parse_tool_arguments_empty_string() {
-        let parsed = parse_tool_arguments("").unwrap();
-        assert_eq!(parsed, serde_json::json!({}));
-    }
-
-    #[test]
-    fn test_parse_tool_arguments_whitespace_string() {
-        let parsed = parse_tool_arguments("   ").unwrap();
-        assert_eq!(parsed, serde_json::json!({}));
-    }
-
-    #[test]
-    fn test_parse_tool_arguments_valid_json() {
-        let parsed = parse_tool_arguments(r#"{"key":"value"}"#).unwrap();
-        assert_eq!(parsed, serde_json::json!({"key": "value"}));
+    fn as_u64_lenient(&self) -> Option<u64> {
+        match self {
+            serde_json::Value::Number(number) => number.as_u64().or_else(|| {
+                number
+                    .as_f64()
+                    .filter(|float| *float >= 0.0 && float.fract() == 0.0)
+                    .map(|float| float as u64)
+            }),
+            serde_json::Value::String(text) => text.trim().parse().ok(),
+            _ => None,
+        }
     }
 }

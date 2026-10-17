@@ -1,8 +1,7 @@
 use rig_core::{
     Embed,
-    client::{EmbeddingsClient, ProviderClient},
     embeddings::EmbeddingsBuilder,
-    providers::openai,
+    providers::openai::{self, OpenAI},
     vector_store::{InsertDocuments, VectorSearchRequest, VectorStoreIndex},
 };
 use rig_helixdb::{HelixDB, HelixDBVectorStore};
@@ -27,8 +26,9 @@ impl std::fmt::Display for WordDefinition {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let openai_model = rig_core::providers::openai::Client::from_env()?
-        .embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let openai_model = OpenAI::from_env()?
+        .embedding(openai::TEXT_EMBEDDING_ADA_002, None)
+        .erase();
 
     let helixdb_client = HelixDB::new(None, Some(6969), None); // Uses default port 6969
     let vector_store = HelixDBVectorStore::new(helixdb_client, openai_model.clone());
@@ -65,10 +65,10 @@ async fn main() -> Result<(), anyhow::Error> {
     for doc in docs {
         println!(
             "Vector found with id: {id} and score: {score} and word def: {doc}",
-            id = doc.1,
-            score = doc.0,
-            doc = doc.2
-        )
+            id = doc.id,
+            score = doc.score,
+            doc = doc.document
+        );
     }
 
     Ok(())

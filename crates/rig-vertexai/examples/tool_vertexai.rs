@@ -1,10 +1,7 @@
 use anyhow::Result;
-use rig_core::prelude::*;
-use rig_core::{
-    completion::{Prompt, ToolDefinition},
-    tool::Tool,
-};
-use rig_vertexai::{Client, completion::GEMINI_2_5_FLASH_LITE};
+use rig_agent::prelude::*;
+use rig_agent::tool::ToolContext;
+use rig_vertexai::VertexAi;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -28,15 +25,19 @@ impl Tool for Adder {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "add".to_string(),
-            description: "Add x and y together".to_string(),
-            parameters: json!(schema_for!(OperationArgs)),
-        }
+    fn description(&self) -> String {
+        "Add x and y together".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!(schema_for!(OperationArgs))
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         println!("[tool-call] Adding {} and {}", args.x, args.y);
         let result = args.x + args.y;
         Ok(result)
@@ -47,19 +48,18 @@ impl Tool for Adder {
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt().with_target(false).init();
 
-    // Create Vertex AI client using implicit credentials
-    let client = Client::from_env()?;
+    // Create the Vertex AI model using implicit credentials
+    let model = VertexAi::from_env()?.completion("gemini-2.5-flash-lite");
 
     // Create agent with a calculator tool
-    let calculator_agent = client
-        .agent(GEMINI_2_5_FLASH_LITE)
+    let calculator_agent = AgentBuilder::new(model)
         .tool(Adder)
         .max_tokens(1024)
         .build();
 
     // Prompt the agent and print the response
     println!("Calculate 15 + 27");
-    let answer = calculator_agent.prompt("Calculate 15 + 27").await?;
+    let answer = calculator_agent.prompt("Calculate 15 + 27").await?.output();
     println!("Vertex AI Calculator Agent: {answer}");
 
     Ok(())

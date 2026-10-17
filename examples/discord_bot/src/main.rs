@@ -1,16 +1,17 @@
-use rig::integrations::discord_bot::DiscordExt;
+mod discord_bot;
+
+use discord_bot::DiscordExt;
 use rig::prelude::*;
-use rig::providers::openai;
+use rig::providers::openai::{self, OpenAI};
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let discord_bot_token = std::env::var("DISCORD_BOT_TOKEN")?;
-    // Create OpenAI client
-    let client = rig::providers::openai::Client::from_env()?;
+    // Create the OpenAI provider
+    let client = OpenAI::from_env()?;
 
     // Create agent with a single context prompt
-    let mut discord_bot = client
-        .agent(openai::GPT_4O)
+    let mut discord_bot = AgentBuilder::new(client.completion(openai::GPT_4O))
         .preamble("You are a helpful assistant.")
         .build()
         .into_discord_bot(&discord_bot_token)

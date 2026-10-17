@@ -1,25 +1,7 @@
-use std::{convert::Infallible, str::FromStr};
-
-use crate::OneOrMany;
+use crate::error::ProviderError;
 use serde::{Deserialize, Serialize};
+use std::{convert::Infallible, str::FromStr};
 use thiserror::Error;
-
-use super::CompletionError;
-
-// ================================================================
-// Message models
-// ================================================================
-
-/// A useful trait to help convert `rig_core::completion::Message` to your own message type.
-///
-/// Particularly useful if you don't want to create a free-standing function as
-/// when trying to use `TryFrom<T>`, you would normally run into the orphan rule as Vec is
-/// technically considered a foreign type (it's owned by stdlib).
-pub trait ConvertMessage: Sized + Send + Sync {
-    type Error: std::error::Error + Send;
-
-    fn convert_from_message(message: Message) -> Result<Vec<Self>, Self::Error>;
-}
 
 /// A provider-agnostic chat message.
 ///
@@ -35,19 +17,151 @@ pub enum Message {
     System { content: String },
 
     /// User message containing one or more content types defined by `UserContent`.
-    User { content: OneOrMany<UserContent> },
+    User { content: Vec<UserContent> },
 
-    /// Assistant message containing one or more content types defined by `AssistantContent`.
-    Assistant {
-        /// Provider-assigned assistant message ID, when available.
-        id: Option<String>,
-        content: OneOrMany<AssistantContent>,
-    },
+    /// An assistant turn: its blocks in the order the provider produced
+    /// them, and where they came from.
+    Assistant(AssistantMessage),
 }
 
-/// Describes the content of a message, which can be text, a tool result, an image, audio, or
-///  a document. Dependent on provider supporting the content type. Multimedia content is generally
-///  base64 (defined by it's format) encoded but additionally supports urls (for some providers).
+pub mod citation;
+mod identity;
+mod native;
+
+pub use citation::{Citation, DocumentRange, Source, SourceLocation, Span};
+
+pub use identity::{CallId, EmptyCallId, EmptyToolName, LocalCallId, ProviderCallId, ToolName};
+pub use native::{Api, Fingerprint, Native, Opaque, Origin, StopReason};
+
+/// One assistant turn.
+///
+/// `content` holds one block per provider output item, in the order the
+/// provider produced them. `origin` names the wire, provider and model that
+/// produced the turn; a hand-built turn has none and always replays from its
+/// canonical fields.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AssistantMessage {
+    /// The blocks, in provider order.
+    pub content: Vec<AssistantContent>,
+    /// Who produced the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
+    /// How the turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<StopReason>,
+}
+
+impl AssistantMessage {
+    /// A hand-built turn of `content`: no origin or stop.
+    pub fn new(content: Vec<AssistantContent>) -> Self {
+        Self {
+            content,
+            ..Self::default()
+        }
+    }
+
+    /// The turn a runtime rolls back over: what arrived of a reply from
+    /// `origin`, stopped to call tools, since the runtime answers its calls.
+    /// `content` keeps only the provider items its fold kept.
+    pub fn rolled_back(origin: Option<Origin>, content: Vec<AssistantContent>) -> Self {
+        Self {
+            content,
+            origin,
+            stop: Some(StopReason::ToolUse),
+        }
+    }
+
+    /// The turn a run failed on before the reply ended: kept in history,
+    /// never replayed.
+    pub fn aborted(
+        origin: Option<Origin>,
+        content: Vec<AssistantContent>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            content,
+            origin,
+            stop: Some(StopReason::Aborted(reason.into())),
+        }
+    }
+
+    /// This turn holding `content` in place of its blocks.
+    pub fn with_content(mut self, content: Vec<AssistantContent>) -> Self {
+        self.content = content;
+        self
+    }
+
+    /// This turn with `origin` as who produced it.
+    pub fn with_origin(mut self, origin: impl Into<Option<Origin>>) -> Self {
+        self.origin = origin.into();
+        self
+    }
+
+    /// This turn with `stop` as how it ended.
+    pub fn with_stop(mut self, stop: impl Into<Option<StopReason>>) -> Self {
+        self.stop = stop.into();
+        self
+    }
+
+    /// The tool calls, in order.
+    pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
+        self.content.iter().filter_map(|part| match part {
+            AssistantContent::ToolCall(call) => Some(call),
+            _ => None,
+        })
+    }
+}
+
+/// Whether no block of the choice is an answer
+/// ([`AssistantContent::is_answer`]): reasoning, provider-only items and
+/// blank text are not, even when retained in history.
+pub fn turn_delivered_no_answer(choice: &[AssistantContent]) -> bool {
+    !choice.iter().any(AssistantContent::is_answer)
+}
+
+/// Why a run fails on a turn, or `None` when it goes on. A turn that will
+/// not replay ([`StopReason::is_failure`], the rule `adapt` skips it by)
+/// runs none of its tool calls. A turn the provider failed
+/// ([`StopReason::Error`]) fails even when it holds an answer, so the caller
+/// never takes as a success a turn the next request leaves out. A turn that
+/// delivered no answer ([`turn_delivered_no_answer`]) also fails when the
+/// output budget or a filter cut it (`finish` is truncating). A turn that
+/// ended at the token limit with a call is finished, so its call runs.
+/// Every runtime reads this one rule.
+pub fn turn_failure(
+    choice: &[AssistantContent],
+    stop: Option<&StopReason>,
+    finish: Option<&crate::completion::FinishReason>,
+) -> Option<String> {
+    let failed = stop.filter(|stop| stop.is_failure());
+    let calls = choice
+        .iter()
+        .any(|block| matches!(block, AssistantContent::ToolCall(_)));
+    if let Some(StopReason::Error(reason) | StopReason::Aborted(reason)) = failed
+        && calls
+    {
+        return Some(format!(
+            "the turn failed, so none of its tool calls ran: {reason}"
+        ));
+    }
+    let answered = !turn_delivered_no_answer(choice);
+    if !answered && let Some(finish) = finish.filter(|finish| finish.truncated_output()) {
+        return Some(finish.no_answer_message());
+    }
+    match failed {
+        Some(StopReason::Error(reason)) if answered => {
+            Some(format!("the provider failed the turn: {reason}"))
+        }
+        Some(StopReason::Error(reason)) => Some(format!(
+            "the provider failed the turn without an answer: {reason}"
+        )),
+        _ => None,
+    }
+}
+
+/// User text, tool results, or media. Supported source kinds and media types
+/// depend on the target provider.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum UserContent {
@@ -65,269 +179,486 @@ pub enum UserContent {
     Document(Document),
 }
 
-/// Describes responses from a provider which is either text or a tool call.
+/// One block of an assistant turn: one provider output item.
+/// Deserialization requires the lowercase `type` tag.
+#[non_exhaustive]
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(untagged)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum AssistantContent {
-    /// Plain assistant text.
+    /// Answer text.
     Text(Text),
-    /// Tool call requested by the assistant.
+    /// A tool call requested by the assistant.
     ToolCall(ToolCall),
-    /// Structured reasoning emitted by the assistant.
+    /// Reasoning the model showed.
     Reasoning(Reasoning),
-    /// Image content emitted by the assistant.
+    /// An image the assistant produced.
     Image(Image),
+    /// A provider item with no canonical meaning.
+    Opaque(Opaque),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "type", content = "content", rename_all = "snake_case")]
-#[non_exhaustive]
-/// A typed reasoning block used by providers that emit structured thinking data.
-pub enum ReasoningContent {
-    /// Plain reasoning text with an optional provider signature.
-    Text {
-        text: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
-    },
-    /// Provider-encrypted reasoning payload.
-    Encrypted(String),
-    /// Redacted reasoning payload preserved as opaque data.
-    Redacted { data: String },
-    /// Provider-generated reasoning summary text.
-    Summary(String),
+impl AssistantContent {
+    /// This block without its provider item: what a different provider can
+    /// use, and what its fingerprint covers.
+    pub fn canonical(&self) -> Self {
+        let mut block = self.clone();
+        if let Some(native) = block.native_slot() {
+            *native = None;
+        }
+        block
+    }
+
+    /// Whether the block answers the user: text that is not blank, a call
+    /// or an image. Reasoning and provider-only items are not an answer.
+    pub fn is_answer(&self) -> bool {
+        match self {
+            Self::Text(text) => !text.text.trim().is_empty(),
+            Self::ToolCall(_) | Self::Image(_) => true,
+            Self::Reasoning(_) | Self::Opaque(_) => false,
+        }
+    }
+
+    /// Whether the block has nothing to send, so replay drops it: blank text
+    /// or reasoning, and redacted reasoning, without a provider item that is
+    /// still current (with one, its identity pairs it with what follows, and
+    /// pi replays it whatever its text), and an opaque item that does not
+    /// replay.
+    pub fn is_blank(&self) -> bool {
+        match self {
+            Self::Text(Text { text, .. }) => text.trim().is_empty() && self.native_item().is_none(),
+            Self::Reasoning(Reasoning { text, redacted, .. }) => {
+                (*redacted || text.trim().is_empty()) && self.native_item().is_none()
+            }
+            Self::Opaque(opaque) => !opaque.replay,
+            Self::ToolCall(_) | Self::Image(_) => false,
+        }
+    }
+
+    /// The fingerprint of the block's canonical fields, through a fixed,
+    /// versioned projection rather than the block's serde layout, so a field
+    /// added to a canonical type never stales stored items. A rig-issued
+    /// call id counts as one placeholder: rig issues a fresh id each time it
+    /// decodes a call the provider sent without one.
+    pub fn fingerprint(&self) -> Fingerprint {
+        Fingerprint::of(&self.projection())
+    }
+
+    /// Projection v1 of the canonical fields.
+    fn projection(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            Self::Text(text) => json!(["v1", "text", text.text]),
+            Self::Reasoning(reasoning) => {
+                json!(["v1", "reasoning", reasoning.text, reasoning.redacted])
+            }
+            Self::ToolCall(call) => {
+                let id = match &call.id {
+                    CallId::Provider(id) => id.as_str().to_owned(),
+                    CallId::Local(_) => "~local".to_owned(),
+                };
+                json!([
+                    "v1",
+                    "call",
+                    id,
+                    call.function.name.as_str(),
+                    call.function.arguments,
+                    call.function.invalid_arguments,
+                ])
+            }
+            Self::Image(image) => {
+                json!(["v1", "image", image.media_type, image.detail, image.data,])
+            }
+            Self::Opaque(_) => json!(["v1", "opaque"]),
+        }
+    }
+
+    fn native_slot(&mut self) -> Option<&mut Option<Native>> {
+        match self {
+            Self::Text(text) => Some(&mut text.native),
+            Self::ToolCall(call) => Some(&mut call.native),
+            Self::Reasoning(reasoning) => Some(&mut reasoning.native),
+            Self::Image(image) => Some(&mut image.native),
+            Self::Opaque(_) => None,
+        }
+    }
+
+    /// The provider item this block was decoded from, held for its current
+    /// canonical form. An [`Opaque`] block has no separate item.
+    pub fn with_native(mut self, item: serde_json::Value) -> Self {
+        let fingerprint = self.fingerprint();
+        if let Some(native) = self.native_slot() {
+            *native = Some(Native { item, fingerprint });
+        }
+        self
+    }
+
+    /// The provider item of an edited block: no longer current, but its
+    /// identity keys still name the item it was.
+    pub(crate) fn stale_item(&self) -> Option<&serde_json::Value> {
+        let native = match self {
+            Self::Text(text) => text.native.as_ref(),
+            Self::ToolCall(call) => call.native.as_ref(),
+            Self::Reasoning(reasoning) => reasoning.native.as_ref(),
+            Self::Image(image) => image.native.as_ref(),
+            Self::Opaque(_) => None,
+        }?;
+        (native.fingerprint != self.fingerprint()).then_some(&native.item)
+    }
+
+    /// The provider item, while the block is still what it was decoded
+    /// from. An edited block has none: encoders rebuild it.
+    pub fn native_item(&self) -> Option<&serde_json::Value> {
+        let native = match self {
+            Self::Text(text) => text.native.as_ref(),
+            Self::ToolCall(call) => call.native.as_ref(),
+            Self::Reasoning(reasoning) => reasoning.native.as_ref(),
+            Self::Image(image) => image.native.as_ref(),
+            Self::Opaque(_) => None,
+        }?;
+        (native.fingerprint == self.fingerprint()).then_some(&native.item)
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[non_exhaustive]
-/// Assistant reasoning payload with an optional provider-supplied identifier.
+/// Reasoning the model showed: its text, or a redacted block with none.
+/// Signatures, encrypted payloads and ids are provider data and live in
+/// `native`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Reasoning {
-    /// Provider reasoning identifier, when supplied by the upstream API.
-    pub id: Option<String>,
-    /// Ordered reasoning content blocks.
-    pub content: Vec<ReasoningContent>,
+    /// The reasoning text, summaries included.
+    pub text: String,
+    /// Whether the provider withheld the text.
+    #[serde(default, skip_serializing_if = "crate::json_utils::is_false")]
+    pub redacted: bool,
+    /// The provider item this block was decoded from.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "native::lenient"
+    )]
+    pub native: Option<Native>,
 }
 
 impl Reasoning {
-    /// Create a new reasoning item from a single item
-    pub fn new(input: &str) -> Self {
-        Self::new_with_signature(input, None)
-    }
-
-    /// Create a new reasoning item from a single text item and optional signature.
-    pub fn new_with_signature(input: &str, signature: Option<String>) -> Self {
-        Self {
-            id: None,
-            content: vec![ReasoningContent::Text {
-                text: input.to_string(),
-                signature,
-            }],
-        }
-    }
-
-    /// Set or clear the provider reasoning ID.
-    pub fn optional_id(mut self, id: Option<String>) -> Self {
-        self.id = id;
-        self
-    }
-
-    /// Set a provider reasoning ID.
-    pub fn with_id(mut self, id: String) -> Self {
-        self.id = Some(id);
-        self
-    }
-
-    /// Create reasoning content from multiple text blocks.
-    pub fn multi(input: Vec<String>) -> Self {
-        Self {
-            id: None,
-            content: input
-                .into_iter()
-                .map(|text| ReasoningContent::Text {
-                    text,
-                    signature: None,
-                })
-                .collect(),
-        }
-    }
-
-    /// Create a redacted reasoning block.
-    pub fn redacted(data: impl Into<String>) -> Self {
-        Self {
-            id: None,
-            content: vec![ReasoningContent::Redacted { data: data.into() }],
-        }
-    }
-
-    /// Create an encrypted reasoning block.
-    pub fn encrypted(data: impl Into<String>) -> Self {
-        Self {
-            id: None,
-            content: vec![ReasoningContent::Encrypted(data.into())],
-        }
-    }
-
-    /// Create one reasoning block containing summary items.
-    pub fn summaries(input: Vec<String>) -> Self {
-        Self {
-            id: None,
-            content: input.into_iter().map(ReasoningContent::Summary).collect(),
-        }
-    }
-
-    /// Render reasoning as displayable text by joining text-like blocks with newlines.
-    pub fn display_text(&self) -> String {
-        self.content
-            .iter()
-            .filter_map(|content| match content {
-                ReasoningContent::Text { text, .. } => Some(text.as_str()),
-                ReasoningContent::Summary(summary) => Some(summary.as_str()),
-                ReasoningContent::Redacted { data } => Some(data.as_str()),
-                ReasoningContent::Encrypted(_) => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Return the first text reasoning block, if present.
-    pub fn first_text(&self) -> Option<&str> {
-        self.content.iter().find_map(|content| match content {
-            ReasoningContent::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-    }
-
-    /// Return the first signature from text reasoning, if present.
-    pub fn first_signature(&self) -> Option<&str> {
-        self.content.iter().find_map(|content| match content {
-            ReasoningContent::Text {
-                signature: Some(signature),
-                ..
-            } => Some(signature.as_str()),
-            _ => None,
-        })
-    }
-
-    /// Return the first encrypted reasoning payload, if present.
-    pub fn encrypted_content(&self) -> Option<&str> {
-        self.content.iter().find_map(|content| match content {
-            ReasoningContent::Encrypted(data) => Some(data.as_str()),
-            _ => None,
-        })
-    }
-}
-
-/// Tool result content containing information about a tool call and it's resulting content.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ToolResult {
-    /// Tool call ID that this result answers.
-    pub id: String,
-    /// Provider-specific call ID, when distinct from `id`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
-    /// One or more content items produced by the tool.
-    pub content: OneOrMany<ToolResultContent>,
-}
-
-/// Describes the content of a tool result, which can be text or an image.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum ToolResultContent {
-    Text(Text),
-    Image(Image),
-}
-
-/// Describes a tool call with an id and function to call, generally produced by a provider.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ToolCall {
-    /// Provider-supplied tool call ID.
-    pub id: String,
-    /// Provider-specific call ID used by some APIs for tool result correlation.
-    pub call_id: Option<String>,
-    /// Function name and JSON arguments requested by the model.
-    pub function: ToolFunction,
-    /// Optional cryptographic signature for the tool call.
-    ///
-    /// This field is used by some providers (e.g., Google) to provide a signature
-    /// that can verify the authenticity and integrity of the tool call. When present,
-    /// it allows verification that the tool call was actually generated by the model
-    /// and has not been tampered with.
-    ///
-    /// This is an optional, provider-specific feature and will be `None` for providers
-    /// that don't support tool call signatures.
-    pub signature: Option<String>,
-    /// Additional provider-specific parameters to be sent to the completion model provider
-    pub additional_params: Option<serde_json::Value>,
-}
-
-impl ToolCall {
-    pub fn new(id: String, function: ToolFunction) -> Self {
-        Self {
-            id,
-            call_id: None,
-            function,
-            signature: None,
-            additional_params: None,
-        }
-    }
-
-    pub fn with_call_id(mut self, call_id: String) -> Self {
-        self.call_id = Some(call_id);
-        self
-    }
-
-    pub fn with_signature(mut self, signature: Option<String>) -> Self {
-        self.signature = signature;
-        self
-    }
-
-    pub fn with_additional_params(mut self, additional_params: Option<serde_json::Value>) -> Self {
-        self.additional_params = additional_params;
-        self
-    }
-}
-
-/// Describes a tool function to call with a name and arguments, generally produced by a provider.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ToolFunction {
-    /// Tool/function name to invoke.
-    pub name: String,
-    /// JSON arguments for the tool/function.
-    pub arguments: serde_json::Value,
-}
-
-impl ToolFunction {
-    /// Create a tool function call payload.
-    pub fn new(name: String, arguments: serde_json::Value) -> Self {
-        Self { name, arguments }
-    }
-}
-
-// ================================================================
-// Base content models
-// ================================================================
-
-/// Basic text content.
-///
-/// `additional_params` carries provider-specific fields that arrive on text
-/// content blocks (e.g. Anthropic returns citation metadata on assistant text
-/// blocks). It is flattened during serialization so the inner JSON keys appear
-/// at the same level as `text`, matching the wire format of provider APIs.
-#[derive(Default, Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct Text {
-    /// Text content.
-    pub text: String,
-    /// Provider-specific text fields.
-    #[serde(flatten, skip_serializing_if = "Option::is_none")]
-    pub additional_params: Option<serde_json::Value>,
-}
-
-impl Text {
-    /// Construct a new text block with no provider-specific fields.
+    /// Reasoning text with no provider item.
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            additional_params: None,
+            ..Self::default()
+        }
+    }
+}
+
+/// The result of a tool call, sent back to the model.
+///
+/// Build it from the call it answers with [`ToolCall::result`], so its id
+/// and name match the call.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ToolResult {
+    /// The id of the answered call.
+    pub call: CallId,
+    /// Executed tool name, which may differ from the model-requested name after
+    /// hook repair. Required for provider replay independently of call identity.
+    pub name: ToolName,
+    /// One or more content items produced by the tool.
+    pub content: Vec<ToolResultContent>,
+    /// Whether the tool failed, was refused, or never ran: `content` then
+    /// says why.
+    #[serde(default, skip_serializing_if = "crate::json_utils::is_false")]
+    pub is_error: bool,
+}
+
+/// Describes one typed item in a tool result.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ToolResultContent {
+    /// Literal text. Providers must not reinterpret it as structured JSON.
+    Text(Text),
+    /// An image supplied explicitly by the tool.
+    Image(Image),
+    /// Structured JSON supplied explicitly by the tool runtime.
+    Json {
+        /// The structured value.
+        value: serde_json::Value,
+    },
+}
+
+impl ToolResultContent {
+    /// Borrow literal text content.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(&text.text),
+            Self::Image(_) | Self::Json { .. } => None,
+        }
+    }
+
+    /// Borrow structured JSON content.
+    pub fn as_json(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Json { value } => Some(value),
+            Self::Text(_) | Self::Image(_) => None,
+        }
+    }
+
+    /// Deserialize JSON content into a typed value.
+    ///
+    /// Structured JSON is decoded directly. Literal text is parsed only because
+    /// the caller explicitly requested JSON decoding, which supports transcripts
+    /// recorded before structured tool output was preserved canonically. This
+    /// helper never changes the content sent to a model or provider.
+    pub fn deserialize_json<T>(&self) -> Result<T, serde_json::Error>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        match self {
+            Self::Json { value } => T::deserialize(value),
+            Self::Text(text) => serde_json::from_str(&text.text),
+            Self::Image(_) => Err(<serde_json::Error as serde::de::Error>::custom(
+                "cannot decode image tool-result content as JSON",
+            )),
+        }
+    }
+}
+
+/// A tool call: its id, and the function and arguments requested.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ToolCall {
+    /// Application annotations, excluded from provider wire encoding and replay identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    /// The call's one identity: the provider's id, or one rig issued when
+    /// the provider sent none.
+    pub id: CallId,
+    /// Function name and JSON arguments requested by the model.
+    pub function: ToolFunction,
+    /// The provider item this call was decoded from.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "native::lenient"
+    )]
+    pub native: Option<Native>,
+}
+
+impl ToolCall {
+    /// A call with `id` and no provider item.
+    pub fn new(id: CallId, function: ToolFunction) -> Self {
+        Self {
+            id,
+            function,
+            native: None,
+            metadata: None,
+        }
+    }
+
+    /// A call the provider identified by `wire_id`; rig issues an id when it
+    /// is empty.
+    pub fn from_wire(wire_id: impl Into<String>, function: ToolFunction) -> Self {
+        Self::new(CallId::from_wire(wire_id), function)
+    }
+
+    /// The result answering this call: its id and name, and `content`.
+    pub fn result(&self, content: Vec<ToolResultContent>) -> ToolResult {
+        ToolResult {
+            call: self.id.clone(),
+            name: self.function.name.clone(),
+            content,
+            is_error: false,
+        }
+    }
+
+    /// The result reporting that this call failed, with `content` saying
+    /// why.
+    pub fn error_result(&self, content: Vec<ToolResultContent>) -> ToolResult {
+        ToolResult {
+            is_error: true,
+            ..self.result(content)
+        }
+    }
+}
+
+/// A tool function to call: its name and its arguments, always a JSON
+/// object.
+///
+/// Arguments the model sent that are not an object are kept as text in
+/// `invalid_arguments`, with `arguments` holding what could be read of them
+/// (`{}` when nothing could), so a malformed call never fails a reply and
+/// every wire receives an object.
+///
+/// ```
+/// use rig_core::message::{ToolFunction, ToolName};
+///
+/// let name = ToolName::new("search")?;
+/// let call = ToolFunction::parse(name.clone(), r#"{"q": "ab"#);
+/// assert_eq!(call.arguments["q"], "ab");
+/// assert_eq!(call.invalid_arguments.as_deref(), Some(r#"{"q": "ab"#));
+///
+/// let call = ToolFunction::new(name, serde_json::json!("{\"q\":1}"));
+/// assert_eq!(call.arguments["q"], 1);
+/// assert!(call.invalid_arguments.is_none());
+/// # Ok::<(), rig_core::message::EmptyToolName>(())
+/// ```
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct ToolFunction {
+    /// Tool/function name to invoke.
+    pub name: ToolName,
+    /// The arguments.
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+    /// The arguments as the model sent them, when they were not a JSON
+    /// object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_arguments: Option<String>,
+}
+
+impl ToolFunction {
+    /// A call to `name` with `arguments`. An object is kept; a string
+    /// holding an object is unwrapped once; `null` is `{}`; anything else is
+    /// `{}` with its JSON text in `invalid_arguments`.
+    pub fn new(name: ToolName, arguments: serde_json::Value) -> Self {
+        use serde_json::Value;
+        let (arguments, invalid_arguments) = match arguments {
+            Value::Object(arguments) => (arguments, None),
+            Value::Null => (serde_json::Map::new(), None),
+            Value::String(text) => {
+                return Self::parse(name, &text);
+            }
+            other => (serde_json::Map::new(), Some(other.to_string())),
+        };
+        Self {
+            name,
+            arguments,
+            invalid_arguments,
+        }
+    }
+
+    /// A call to `name` with the argument JSON `text`. Blank text is `{}`.
+    /// Text that is not an object keeps what a cut-off object still states,
+    /// or `{}`, and is kept in `invalid_arguments`. A string holding an
+    /// object is unwrapped once.
+    pub fn parse(name: ToolName, text: &str) -> Self {
+        use serde_json::Value;
+        let parsed = crate::json_utils::parse_tool_arguments(text);
+        let (arguments, invalid) = match parsed {
+            Ok(Value::Object(arguments)) => (arguments, false),
+            Ok(Value::Null) => (serde_json::Map::new(), false),
+            Ok(Value::String(inner)) => match serde_json::from_str(&inner) {
+                Ok(Value::Object(arguments)) => (arguments, false),
+                _ => (serde_json::Map::new(), true),
+            },
+            Ok(_) => (serde_json::Map::new(), true),
+            Err(_) => (
+                crate::json_utils::parse_partial_object(text).unwrap_or_default(),
+                true,
+            ),
+        };
+        Self {
+            name,
+            arguments,
+            invalid_arguments: invalid.then(|| text.to_owned()),
+        }
+    }
+
+    /// The arguments as a JSON value.
+    pub fn arguments_value(&self) -> serde_json::Value {
+        serde_json::Value::Object(self.arguments.clone())
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolFunction {
+    /// Arguments stored in any JSON shape are read through
+    /// [`ToolFunction::new`], so a history saved before arguments were
+    /// always objects still loads.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            name: ToolName,
+            #[serde(default)]
+            arguments: serde_json::Value,
+            #[serde(default)]
+            invalid_arguments: Option<String>,
+        }
+        let Repr {
+            name,
+            arguments,
+            invalid_arguments,
+        } = Repr::deserialize(deserializer)?;
+        let mut function = Self::new(name, arguments);
+        if invalid_arguments.is_some() {
+            function.invalid_arguments = invalid_arguments;
+        }
+        Ok(function)
+    }
+}
+
+/// Text. On an assistant turn, `native` holds the provider item the block
+/// was decoded from, and [`Text::citations`] what the provider says supports
+/// it; user and tool-result text leave both empty.
+#[non_exhaustive]
+#[derive(Default, Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(from = "TextRepr")]
+pub struct Text {
+    /// Application annotations, excluded from provider wire encoding and replay identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    /// Text content.
+    pub text: String,
+    /// The citations and the fingerprint of the text they fit; read through
+    /// [`Text::citations`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    citations: Option<citation::Citations>,
+    /// The provider item this block was decoded from.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "native::lenient"
+    )]
+    pub native: Option<Native>,
+}
+
+/// A stored [`Text`], read leniently: unreadable citations or native load
+/// as none.
+#[derive(Deserialize)]
+struct TextRepr {
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+    text: String,
+    #[serde(default, deserialize_with = "citation::lenient")]
+    citations: Option<citation::Citations>,
+    #[serde(default, deserialize_with = "native::lenient")]
+    native: Option<Native>,
+}
+
+impl From<TextRepr> for Text {
+    fn from(repr: TextRepr) -> Self {
+        let TextRepr {
+            metadata,
+            text,
+            citations,
+            native,
+        } = repr;
+        Self {
+            metadata,
+            text,
+            citations,
+            native,
+        }
+        .checked()
+    }
+}
+
+impl Text {
+    /// Attach application annotations without changing provider replay identity.
+    pub fn with_metadata(mut self, metadata: Option<serde_json::Value>) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Text with no provider item and no citations.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            metadata: None,
+            text: text.into(),
+            citations: None,
+            native: None,
         }
     }
 
@@ -344,7 +675,8 @@ impl std::fmt::Display for Text {
     }
 }
 
-/// Image content containing image data and metadata about it.
+/// Image content containing image data and metadata about it. On an
+/// assistant turn, `native` holds the provider item it was decoded from.
 #[derive(Default, Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Image {
     /// Image source data.
@@ -355,39 +687,18 @@ pub struct Image {
     /// Provider-specific image detail preference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<ImageDetail>,
-    /// Provider-specific image fields.
-    #[serde(flatten, skip_serializing_if = "Option::is_none")]
-    pub additional_params: Option<serde_json::Value>,
-}
-
-impl Image {
-    pub fn try_into_url(self) -> Result<String, MessageError> {
-        match self.data {
-            DocumentSourceKind::Url(url) => Ok(url),
-            DocumentSourceKind::Base64(data) => {
-                let Some(media_type) = self.media_type else {
-                    return Err(MessageError::ConversionError(
-                        "A media type is required to create a valid base64-encoded image URL"
-                            .to_string(),
-                    ));
-                };
-
-                Ok(format!(
-                    "data:image/{ty};base64,{data}",
-                    ty = media_type.to_mime_type()
-                ))
-            }
-            unknown => Err(MessageError::ConversionError(format!(
-                "Tried to convert unknown type to a URL: {unknown:?}"
-            ))),
-        }
-    }
+    /// The provider item this image was decoded from.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "native::lenient"
+    )]
+    pub native: Option<Native>,
 }
 
 /// The kind of image source (to be used).
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
-#[non_exhaustive]
 pub enum DocumentSourceKind {
     /// A file URL/URI.
     Url(String),
@@ -406,33 +717,23 @@ pub enum DocumentSourceKind {
 
 impl DocumentSourceKind {
     /// Create a URL-backed source.
-    pub fn url(url: &str) -> Self {
-        Self::Url(url.to_string())
+    pub fn url(url: impl Into<String>) -> Self {
+        Self::Url(url.into())
     }
 
     /// Create a base64-backed source.
-    pub fn base64(base64_string: &str) -> Self {
-        Self::Base64(base64_string.to_string())
+    pub fn base64(base64_string: impl Into<String>) -> Self {
+        Self::Base64(base64_string.into())
     }
 
     /// Create a provider file ID-backed source.
-    pub fn file_id(file_id: &str) -> Self {
-        Self::FileId(file_id.to_string())
-    }
-
-    /// Create a raw byte source.
-    pub fn raw(bytes: impl Into<Vec<u8>>) -> Self {
-        Self::Raw(bytes.into())
+    pub fn file_id(file_id: impl Into<String>) -> Self {
+        Self::FileId(file_id.into())
     }
 
     /// Create a string-backed source.
-    pub fn string(input: &str) -> Self {
+    pub fn string(input: impl Into<String>) -> Self {
         Self::String(input.into())
-    }
-
-    /// Create an unknown source placeholder.
-    pub fn unknown() -> Self {
-        Self::Unknown
     }
 
     /// Return the contained URL, base64 string, or file ID, if this source stores one.
@@ -465,9 +766,6 @@ pub struct Audio {
     /// Audio media type, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<AudioMediaType>,
-    /// Provider-specific audio fields.
-    #[serde(flatten, skip_serializing_if = "Option::is_none")]
-    pub additional_params: Option<serde_json::Value>,
 }
 
 /// Video content containing video data and metadata about it.
@@ -478,8 +776,9 @@ pub struct Video {
     /// Video media type, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<VideoMediaType>,
-    /// Provider-specific video fields.
-    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    /// Provider-specific video fields, a JSON object (Gemini's
+    /// `video_metadata`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_params: Option<serde_json::Value>,
 }
 
@@ -491,12 +790,13 @@ pub struct Document {
     /// Document media type, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<DocumentMediaType>,
-    /// Provider-specific document fields.
-    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    /// Provider-specific document fields, a JSON object (Anthropic's
+    /// `title`, `context` and `citations`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_params: Option<serde_json::Value>,
 }
 
-/// Describes the format of the content, which can be base64 or string.
+/// Content representation as base64, text, or a URL.
 #[derive(Default, Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentFormat {
@@ -591,14 +891,9 @@ pub enum ImageDetail {
     Auto,
 }
 
-// ================================================================
-// Impl. for message models
-// ================================================================
-
 impl Message {
-    /// This helper method is primarily used to extract the first string prompt from a `Message`.
-    /// Since `Message` might have more than just text content, we need to find the first text.
-    pub(crate) fn rag_text(&self) -> Option<String> {
+    /// Clones the first text block of a user message, or returns `None`.
+    pub fn rag_text(&self) -> Option<String> {
         match self {
             Message::User { content } => {
                 for item in content.iter() {
@@ -613,407 +908,186 @@ impl Message {
         }
     }
 
-    /// Helper constructor to make creating system messages easier.
+    /// Creates a system instruction message.
     pub fn system(text: impl Into<String>) -> Self {
         Message::System {
             content: text.into(),
         }
     }
 
-    /// Helper constructor to make creating user messages easier.
+    /// Creates a user message containing one text block.
     pub fn user(text: impl Into<String>) -> Self {
         Message::User {
-            content: OneOrMany::one(UserContent::text(text)),
+            content: vec![UserContent::text(text)],
         }
     }
 
-    /// Helper constructor to make creating assistant messages easier.
+    /// Creates a hand-built assistant message containing one text block.
     pub fn assistant(text: impl Into<String>) -> Self {
-        Message::Assistant {
-            id: None,
-            content: OneOrMany::one(AssistantContent::text(text)),
-        }
+        Message::Assistant(AssistantMessage::new(vec![AssistantContent::text(text)]))
     }
 
-    /// Helper constructor to make creating assistant messages easier.
-    pub fn assistant_with_id(id: String, text: impl Into<String>) -> Self {
-        Message::Assistant {
-            id: Some(id),
-            content: OneOrMany::one(AssistantContent::text(text)),
-        }
-    }
-
-    /// Helper constructor to make creating tool result messages easier.
-    pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
+    /// Creates a user message containing a text tool result answering the
+    /// call `call` to the tool `name`. To answer a call you hold, prefer
+    /// [`ToolCall::result`] with [`Self::tool_results`].
+    pub fn tool_result(call: CallId, name: ToolName, content: impl Into<String>) -> Self {
         Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: id.into(),
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::text(content)),
-            })),
+            content: vec![UserContent::tool_result(
+                call,
+                name,
+                vec![ToolResultContent::text(content)],
+            )],
         }
     }
 
-    pub fn tool_result_with_call_id(
-        id: impl Into<String>,
-        call_id: Option<String>,
-        content: impl Into<String>,
-    ) -> Self {
+    /// Creates a user message carrying `results`, in order.
+    pub fn tool_results(results: Vec<ToolResult>) -> Self {
         Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: id.into(),
-                call_id,
-                content: OneOrMany::one(ToolResultContent::text(content)),
-            })),
+            content: results.into_iter().map(UserContent::ToolResult).collect(),
         }
     }
 }
 
+/// Generates media constructors without fetching or decoding source data.
+macro_rules! media_ctors {
+    () => {};
+    (
+        $(#[$meta:meta])* $name:ident => Image($kind:ident: $data:ty);
+        $($rest:tt)*
+    ) => {
+        $(#[$meta])*
+        pub fn $name(
+            data: impl Into<$data>,
+            media_type: Option<ImageMediaType>,
+            detail: Option<ImageDetail>,
+        ) -> Self {
+            Self::Image(Image {
+                data: DocumentSourceKind::$kind(data.into()),
+                media_type,
+                detail,
+                native: None,
+            })
+        }
+        media_ctors! { $($rest)* }
+    };
+    (
+        $(#[$meta:meta])* $name:ident => $variant:ident(params $mt:ty, $kind:ident: $data:ty);
+        $($rest:tt)*
+    ) => {
+        $(#[$meta])*
+        pub fn $name(data: impl Into<$data>, media_type: Option<$mt>) -> Self {
+            Self::$variant($variant {
+                data: DocumentSourceKind::$kind(data.into()),
+                media_type,
+                additional_params: None,
+            })
+        }
+        media_ctors! { $($rest)* }
+    };
+    (
+        $(#[$meta:meta])* $name:ident => $variant:ident($mt:ty, $kind:ident: $data:ty);
+        $($rest:tt)*
+    ) => {
+        $(#[$meta])*
+        pub fn $name(data: impl Into<$data>, media_type: Option<$mt>) -> Self {
+            Self::$variant($variant {
+                data: DocumentSourceKind::$kind(data.into()),
+                media_type,
+            })
+        }
+        media_ctors! { $($rest)* }
+    };
+}
+
 impl UserContent {
-    /// Helper constructor to make creating user text content easier.
+    /// Creates user text content.
     pub fn text(text: impl Into<String>) -> Self {
         UserContent::Text(text.into().into())
     }
 
-    /// Helper constructor to make creating user image content easier.
-    pub fn image_base64(
-        data: impl Into<String>,
-        media_type: Option<ImageMediaType>,
-        detail: Option<ImageDetail>,
-    ) -> Self {
-        UserContent::Image(Image {
-            data: DocumentSourceKind::Base64(data.into()),
-            media_type,
-            detail,
-            additional_params: None,
-        })
+    media_ctors! {
+        /// Creates user image content from base64-encoded data.
+        image_base64 => Image(Base64: String);
+        /// Creates user image content from unencoded bytes.
+        image_raw => Image(Raw: Vec<u8>);
+        /// Creates user image content referencing a URL.
+        image_url => Image(Url: String);
+        /// Creates user audio content from base64-encoded data.
+        audio_base64 => Audio(AudioMediaType, Base64: String);
+        /// Creates user audio content from unencoded bytes.
+        audio_raw => Audio(AudioMediaType, Raw: Vec<u8>);
+        /// Creates user audio content referencing a URL.
+        audio_url => Audio(AudioMediaType, Url: String);
+        /// Creates user video content from base64-encoded data.
+        video_base64 => Video(params VideoMediaType, Base64: String);
+        /// Creates user video content from unencoded bytes.
+        video_raw => Video(params VideoMediaType, Raw: Vec<u8>);
+        /// Creates user video content referencing a URL.
+        video_url => Video(params VideoMediaType, Url: String);
+        /// Creates user document content from base64-encoded data.
+        document_base64 => Document(params DocumentMediaType, Base64: String);
+        /// Creates user document content from unencoded bytes.
+        document_raw => Document(params DocumentMediaType, Raw: Vec<u8>);
+        /// Creates user document content referencing a URL.
+        document_url => Document(params DocumentMediaType, Url: String);
+        /// Creates user document content from literal text, such as a plain
+        /// text or Markdown file. Binary formats belong in
+        /// [`Self::document_base64`] or [`Self::document_raw`].
+        document_text => Document(params DocumentMediaType, String: String);
     }
 
-    /// Helper constructor to make creating user image content from raw unencoded bytes easier.
-    pub fn image_raw(
-        data: impl Into<Vec<u8>>,
-        media_type: Option<ImageMediaType>,
-        detail: Option<ImageDetail>,
-    ) -> Self {
-        UserContent::Image(Image {
-            data: DocumentSourceKind::Raw(data.into()),
-            media_type,
-            detail,
-            ..Default::default()
-        })
-    }
-
-    /// Helper constructor to make creating user image content easier.
-    pub fn image_url(
-        url: impl Into<String>,
-        media_type: Option<ImageMediaType>,
-        detail: Option<ImageDetail>,
-    ) -> Self {
-        UserContent::Image(Image {
-            data: DocumentSourceKind::Url(url.into()),
-            media_type,
-            detail,
-            additional_params: None,
-        })
-    }
-
-    /// Helper constructor to make creating user audio content easier.
-    pub fn audio(data: impl Into<String>, media_type: Option<AudioMediaType>) -> Self {
-        UserContent::Audio(Audio {
-            data: DocumentSourceKind::Base64(data.into()),
-            media_type,
-            additional_params: None,
-        })
-    }
-
-    /// Helper constructor to make creating user audio content from raw unencoded bytes easier.
-    pub fn audio_raw(data: impl Into<Vec<u8>>, media_type: Option<AudioMediaType>) -> Self {
-        UserContent::Audio(Audio {
-            data: DocumentSourceKind::Raw(data.into()),
-            media_type,
-            ..Default::default()
-        })
-    }
-
-    /// Helper to create an audio resource from a URL
-    pub fn audio_url(url: impl Into<String>, media_type: Option<AudioMediaType>) -> Self {
-        UserContent::Audio(Audio {
-            data: DocumentSourceKind::Url(url.into()),
-            media_type,
-            ..Default::default()
-        })
-    }
-
-    /// Helper constructor to make creating user video content easier.
-    pub fn video(data: impl Into<String>, media_type: Option<VideoMediaType>) -> Self {
-        UserContent::Video(Video {
-            data: DocumentSourceKind::Base64(data.into()),
-            media_type,
-            additional_params: None,
-        })
-    }
-
-    /// Helper constructor to make creating user video content from raw unencoded bytes easier.
-    pub fn video_raw(data: impl Into<Vec<u8>>, media_type: Option<VideoMediaType>) -> Self {
-        UserContent::Video(Video {
-            data: DocumentSourceKind::Raw(data.into()),
-            media_type,
-            ..Default::default()
-        })
-    }
-
-    /// Helper to create a video resource from a URL
-    pub fn video_url(url: impl Into<String>, media_type: Option<VideoMediaType>) -> Self {
-        UserContent::Video(Video {
-            data: DocumentSourceKind::Url(url.into()),
-            media_type,
-            ..Default::default()
-        })
-    }
-
-    /// Helper constructor to make creating user document content easier.
-    /// This creates a document that assumes the data being passed in is a raw string.
-    pub fn document(data: impl Into<String>, media_type: Option<DocumentMediaType>) -> Self {
-        let data: String = data.into();
-        UserContent::Document(Document {
-            data: DocumentSourceKind::string(&data),
-            media_type,
-            additional_params: None,
-        })
-    }
-
-    /// Helper to create a document from raw unencoded bytes
-    pub fn document_raw(data: impl Into<Vec<u8>>, media_type: Option<DocumentMediaType>) -> Self {
-        UserContent::Document(Document {
-            data: DocumentSourceKind::Raw(data.into()),
-            media_type,
-            ..Default::default()
-        })
-    }
-
-    /// Helper to create a document from a URL
-    pub fn document_url(url: impl Into<String>, media_type: Option<DocumentMediaType>) -> Self {
-        UserContent::Document(Document {
-            data: DocumentSourceKind::Url(url.into()),
-            media_type,
-            ..Default::default()
-        })
-    }
-
-    /// Helper constructor to make creating user tool result content easier.
-    pub fn tool_result(id: impl Into<String>, content: OneOrMany<ToolResultContent>) -> Self {
+    /// Creates a tool result answering the call `call` to the tool `name`.
+    pub fn tool_result(call: CallId, name: ToolName, content: Vec<ToolResultContent>) -> Self {
         UserContent::ToolResult(ToolResult {
-            id: id.into(),
-            call_id: None,
+            call,
+            name,
             content,
-        })
-    }
-
-    /// Helper constructor to make creating user tool result content easier.
-    pub fn tool_result_with_call_id(
-        id: impl Into<String>,
-        call_id: String,
-        content: OneOrMany<ToolResultContent>,
-    ) -> Self {
-        UserContent::ToolResult(ToolResult {
-            id: id.into(),
-            call_id: Some(call_id),
-            content,
+            is_error: false,
         })
     }
 }
 
 impl AssistantContent {
-    /// Helper constructor to make creating assistant text content easier.
+    /// Creates assistant text content.
     pub fn text(text: impl Into<String>) -> Self {
         AssistantContent::Text(text.into().into())
     }
 
-    /// Helper constructor to make creating assistant image content easier.
-    pub fn image_base64(
-        data: impl Into<String>,
-        media_type: Option<ImageMediaType>,
-        detail: Option<ImageDetail>,
-    ) -> Self {
-        AssistantContent::Image(Image {
-            data: DocumentSourceKind::Base64(data.into()),
-            media_type,
-            detail,
-            additional_params: None,
-        })
+    media_ctors! {
+        /// Creates assistant image content from base64-encoded data.
+        image_base64 => Image(Base64: String);
     }
 
-    /// Helper constructor to make creating assistant tool call content easier.
-    pub fn tool_call(
-        id: impl Into<String>,
-        name: impl Into<String>,
-        arguments: serde_json::Value,
-    ) -> Self {
-        AssistantContent::ToolCall(ToolCall::new(
-            id.into(),
-            ToolFunction {
-                name: name.into(),
-                arguments,
-            },
-        ))
+    /// Creates a tool call from a provider-issued ID, name, and arguments.
+    /// Rig issues an id when `id` is empty.
+    pub fn tool_call(id: impl Into<String>, name: ToolName, arguments: serde_json::Value) -> Self {
+        AssistantContent::ToolCall(ToolCall::from_wire(id, ToolFunction::new(name, arguments)))
     }
 
-    pub fn tool_call_with_call_id(
-        id: impl Into<String>,
-        call_id: String,
-        name: impl Into<String>,
-        arguments: serde_json::Value,
-    ) -> Self {
-        AssistantContent::ToolCall(
-            ToolCall::new(
-                id.into(),
-                ToolFunction {
-                    name: name.into(),
-                    arguments,
-                },
-            )
-            .with_call_id(call_id),
-        )
-    }
-
-    pub fn reasoning(reasoning: impl AsRef<str>) -> Self {
-        AssistantContent::Reasoning(Reasoning::new(reasoning.as_ref()))
+    /// Creates reasoning text with no provider item.
+    pub fn reasoning(reasoning: impl Into<String>) -> Self {
+        AssistantContent::Reasoning(Reasoning::new(reasoning))
     }
 }
 
 impl ToolResultContent {
-    /// Helper constructor to make creating tool result text content easier.
+    /// Creates literal text tool-result content.
     pub fn text(text: impl Into<String>) -> Self {
         ToolResultContent::Text(text.into().into())
     }
 
-    /// Helper constructor to make tool result images from a base64-encoded string.
-    pub fn image_base64(
-        data: impl Into<String>,
-        media_type: Option<ImageMediaType>,
-        detail: Option<ImageDetail>,
-    ) -> Self {
-        ToolResultContent::Image(Image {
-            data: DocumentSourceKind::Base64(data.into()),
-            media_type,
-            detail,
-            additional_params: None,
-        })
+    /// Creates structured JSON tool-result content.
+    pub fn json(value: serde_json::Value) -> Self {
+        ToolResultContent::Json { value }
     }
 
-    /// Helper constructor to make tool result images from a base64-encoded string.
-    pub fn image_raw(
-        data: impl Into<Vec<u8>>,
-        media_type: Option<ImageMediaType>,
-        detail: Option<ImageDetail>,
-    ) -> Self {
-        ToolResultContent::Image(Image {
-            data: DocumentSourceKind::Raw(data.into()),
-            media_type,
-            detail,
-            ..Default::default()
-        })
-    }
-
-    /// Helper constructor to make tool result images from a URL.
-    pub fn image_url(
-        url: impl Into<String>,
-        media_type: Option<ImageMediaType>,
-        detail: Option<ImageDetail>,
-    ) -> Self {
-        ToolResultContent::Image(Image {
-            data: DocumentSourceKind::Url(url.into()),
-            media_type,
-            detail,
-            additional_params: None,
-        })
-    }
-
-    /// Parse a tool output string into appropriate ToolResultContent(s).
-    ///
-    /// Supports three formats:
-    /// 1. Simple text: Any string → `OneOrMany::one(Text)`
-    /// 2. Image JSON: `{"type": "image", "data": "...", "mimeType": "..."}` → `OneOrMany::one(Image)`
-    /// 3. Hybrid JSON: `{"response": {...}, "parts": [...]}` → `OneOrMany::many([Text, Image, ...])`
-    ///
-    /// If JSON parsing fails, treats the entire string as text.
-    pub fn from_tool_output(output: impl Into<String>) -> OneOrMany<ToolResultContent> {
-        let output_str = output.into();
-
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output_str) {
-            if json.get("response").is_some() || json.get("parts").is_some() {
-                let mut results: Vec<ToolResultContent> = Vec::new();
-
-                if let Some(response) = json.get("response") {
-                    results.push(ToolResultContent::Text(Text::new(response.to_string())));
-                }
-
-                if let Some(parts) = json.get("parts").and_then(|p| p.as_array()) {
-                    for part in parts {
-                        let is_image = part
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .is_some_and(|t| t == "image");
-
-                        if !is_image {
-                            continue;
-                        }
-
-                        if let (Some(data), Some(mime_type)) = (
-                            part.get("data").and_then(|v| v.as_str()),
-                            part.get("mimeType").and_then(|v| v.as_str()),
-                        ) {
-                            let data_kind =
-                                if data.starts_with("http://") || data.starts_with("https://") {
-                                    DocumentSourceKind::Url(data.to_string())
-                                } else {
-                                    DocumentSourceKind::Base64(data.to_string())
-                                };
-
-                            results.push(ToolResultContent::Image(Image {
-                                data: data_kind,
-                                media_type: ImageMediaType::from_mime_type(mime_type),
-                                detail: None,
-                                additional_params: None,
-                            }));
-                        }
-                    }
-                }
-
-                if !results.is_empty() {
-                    return OneOrMany::many(results).unwrap_or_else(|_| {
-                        OneOrMany::one(ToolResultContent::Text(output_str.into()))
-                    });
-                }
-            }
-
-            let is_image = json
-                .get("type")
-                .and_then(|v| v.as_str())
-                .is_some_and(|t| t == "image");
-
-            if is_image
-                && let (Some(data), Some(mime_type)) = (
-                    json.get("data").and_then(|v| v.as_str()),
-                    json.get("mimeType").and_then(|v| v.as_str()),
-                )
-            {
-                let data_kind = if data.starts_with("http://") || data.starts_with("https://") {
-                    DocumentSourceKind::Url(data.to_string())
-                } else {
-                    DocumentSourceKind::Base64(data.to_string())
-                };
-
-                return OneOrMany::one(ToolResultContent::Image(Image {
-                    data: data_kind,
-                    media_type: ImageMediaType::from_mime_type(mime_type),
-                    detail: None,
-                    additional_params: None,
-                }));
-            }
-        }
-
-        OneOrMany::one(ToolResultContent::Text(output_str.into()))
+    media_ctors! {
+        /// Creates tool-result image content from base64-encoded data.
+        image_base64 => Image(Base64: String);
+        /// Creates tool-result image content from raw, unencoded bytes.
+        image_raw => Image(Raw: Vec<u8>);
+        /// Creates tool-result image content referencing a URL.
+        image_url => Image(Url: String);
     }
 }
 
@@ -1029,17 +1103,9 @@ impl MimeType for MediaType {
     fn from_mime_type(mime_type: &str) -> Option<Self> {
         ImageMediaType::from_mime_type(mime_type)
             .map(MediaType::Image)
-            .or_else(|| {
-                DocumentMediaType::from_mime_type(mime_type)
-                    .map(MediaType::Document)
-                    .or_else(|| {
-                        AudioMediaType::from_mime_type(mime_type)
-                            .map(MediaType::Audio)
-                            .or_else(|| {
-                                VideoMediaType::from_mime_type(mime_type).map(MediaType::Video)
-                            })
-                    })
-            })
+            .or_else(|| DocumentMediaType::from_mime_type(mime_type).map(MediaType::Document))
+            .or_else(|| AudioMediaType::from_mime_type(mime_type).map(MediaType::Audio))
+            .or_else(|| VideoMediaType::from_mime_type(mime_type).map(MediaType::Video))
     }
 
     fn to_mime_type(&self) -> &'static str {
@@ -1052,122 +1118,71 @@ impl MimeType for MediaType {
     }
 }
 
-impl MimeType for ImageMediaType {
-    fn from_mime_type(mime_type: &str) -> Option<Self> {
-        match mime_type {
-            "image/jpeg" => Some(ImageMediaType::JPEG),
-            "image/png" => Some(ImageMediaType::PNG),
-            "image/gif" => Some(ImageMediaType::GIF),
-            "image/webp" => Some(ImageMediaType::WEBP),
-            "image/heic" => Some(ImageMediaType::HEIC),
-            "image/heif" => Some(ImageMediaType::HEIF),
-            "image/svg+xml" => Some(ImageMediaType::SVG),
-            _ => None,
-        }
-    }
+// Emits both directions of a [`MimeType`] impl from a single pair list, so a
+// variant's parse and emit spellings cannot drift apart. Extra `| "alias"`
+// spellings parse to the same variant; only the first (canonical) string is
+// emitted by `to_mime_type`.
+macro_rules! impl_mime_type {
+    ($ty:ident { $($variant:ident => $canonical:literal $(| $alias:literal)*),+ $(,)? }) => {
+        impl MimeType for $ty {
+            fn from_mime_type(mime_type: &str) -> Option<Self> {
+                match mime_type {
+                    $($canonical $(| $alias)* => Some($ty::$variant),)+
+                    _ => None,
+                }
+            }
 
-    fn to_mime_type(&self) -> &'static str {
-        match self {
-            ImageMediaType::JPEG => "image/jpeg",
-            ImageMediaType::PNG => "image/png",
-            ImageMediaType::GIF => "image/gif",
-            ImageMediaType::WEBP => "image/webp",
-            ImageMediaType::HEIC => "image/heic",
-            ImageMediaType::HEIF => "image/heif",
-            ImageMediaType::SVG => "image/svg+xml",
+            fn to_mime_type(&self) -> &'static str {
+                match self {
+                    $($ty::$variant => $canonical,)+
+                }
+            }
         }
-    }
+    };
 }
 
-impl MimeType for DocumentMediaType {
-    fn from_mime_type(mime_type: &str) -> Option<Self> {
-        match mime_type {
-            "application/pdf" => Some(DocumentMediaType::PDF),
-            "text/plain" => Some(DocumentMediaType::TXT),
-            "text/rtf" => Some(DocumentMediaType::RTF),
-            "text/html" => Some(DocumentMediaType::HTML),
-            "text/css" => Some(DocumentMediaType::CSS),
-            "text/md" | "text/markdown" => Some(DocumentMediaType::MARKDOWN),
-            "text/csv" => Some(DocumentMediaType::CSV),
-            "text/xml" => Some(DocumentMediaType::XML),
-            "application/x-javascript" | "text/x-javascript" => Some(DocumentMediaType::Javascript),
-            "application/x-python" | "text/x-python" => Some(DocumentMediaType::Python),
-            _ => None,
-        }
-    }
+impl_mime_type!(ImageMediaType {
+    JPEG => "image/jpeg",
+    PNG => "image/png",
+    GIF => "image/gif",
+    WEBP => "image/webp",
+    HEIC => "image/heic",
+    HEIF => "image/heif",
+    SVG => "image/svg+xml",
+});
 
-    fn to_mime_type(&self) -> &'static str {
-        match self {
-            DocumentMediaType::PDF => "application/pdf",
-            DocumentMediaType::TXT => "text/plain",
-            DocumentMediaType::RTF => "text/rtf",
-            DocumentMediaType::HTML => "text/html",
-            DocumentMediaType::CSS => "text/css",
-            DocumentMediaType::MARKDOWN => "text/markdown",
-            DocumentMediaType::CSV => "text/csv",
-            DocumentMediaType::XML => "text/xml",
-            DocumentMediaType::Javascript => "application/x-javascript",
-            DocumentMediaType::Python => "application/x-python",
-        }
-    }
-}
+impl_mime_type!(DocumentMediaType {
+    PDF => "application/pdf",
+    TXT => "text/plain",
+    RTF => "text/rtf",
+    HTML => "text/html",
+    CSS => "text/css",
+    MARKDOWN => "text/markdown" | "text/md",
+    CSV => "text/csv",
+    XML => "text/xml",
+    Javascript => "application/x-javascript" | "text/x-javascript",
+    Python => "application/x-python" | "text/x-python",
+});
 
-impl MimeType for AudioMediaType {
-    fn from_mime_type(mime_type: &str) -> Option<Self> {
-        match mime_type {
-            "audio/wav" => Some(AudioMediaType::WAV),
-            "audio/mp3" => Some(AudioMediaType::MP3),
-            "audio/aiff" => Some(AudioMediaType::AIFF),
-            "audio/aac" => Some(AudioMediaType::AAC),
-            "audio/ogg" => Some(AudioMediaType::OGG),
-            "audio/flac" => Some(AudioMediaType::FLAC),
-            "audio/m4a" => Some(AudioMediaType::M4A),
-            "audio/pcm16" => Some(AudioMediaType::PCM16),
-            "audio/pcm24" => Some(AudioMediaType::PCM24),
-            _ => None,
-        }
-    }
+impl_mime_type!(AudioMediaType {
+    WAV => "audio/wav",
+    MP3 => "audio/mp3",
+    AIFF => "audio/aiff",
+    AAC => "audio/aac",
+    OGG => "audio/ogg",
+    FLAC => "audio/flac",
+    M4A => "audio/m4a",
+    PCM16 => "audio/pcm16",
+    PCM24 => "audio/pcm24",
+});
 
-    fn to_mime_type(&self) -> &'static str {
-        match self {
-            AudioMediaType::WAV => "audio/wav",
-            AudioMediaType::MP3 => "audio/mp3",
-            AudioMediaType::AIFF => "audio/aiff",
-            AudioMediaType::AAC => "audio/aac",
-            AudioMediaType::OGG => "audio/ogg",
-            AudioMediaType::FLAC => "audio/flac",
-            AudioMediaType::M4A => "audio/m4a",
-            AudioMediaType::PCM16 => "audio/pcm16",
-            AudioMediaType::PCM24 => "audio/pcm24",
-        }
-    }
-}
-
-impl MimeType for VideoMediaType {
-    fn from_mime_type(mime_type: &str) -> Option<Self>
-    where
-        Self: Sized,
-    {
-        match mime_type {
-            "video/avi" => Some(VideoMediaType::AVI),
-            "video/mp4" => Some(VideoMediaType::MP4),
-            "video/mpeg" => Some(VideoMediaType::MPEG),
-            "video/mov" => Some(VideoMediaType::MOV),
-            "video/webm" => Some(VideoMediaType::WEBM),
-            &_ => None,
-        }
-    }
-
-    fn to_mime_type(&self) -> &'static str {
-        match self {
-            VideoMediaType::AVI => "video/avi",
-            VideoMediaType::MP4 => "video/mp4",
-            VideoMediaType::MPEG => "video/mpeg",
-            VideoMediaType::MOV => "video/mov",
-            VideoMediaType::WEBM => "video/webm",
-        }
-    }
-}
+impl_mime_type!(VideoMediaType {
+    AVI => "video/avi",
+    MP4 => "video/mp4",
+    MPEG => "video/mpeg",
+    MOV => "video/mov",
+    WEBM => "video/webm",
+});
 
 impl std::str::FromStr for ImageDetail {
     type Err = ();
@@ -1182,30 +1197,69 @@ impl std::str::FromStr for ImageDetail {
     }
 }
 
-// ================================================================
-// FromStr, From<String>, and From<&str> impls
-// ================================================================
-
-impl From<String> for Text {
-    fn from(text: String) -> Self {
-        Text {
-            text,
-            additional_params: None,
+/// `From` impls for [`Text`] from string-like types.
+macro_rules! text_from {
+    ($($src:ty),+ $(,)?) => {$(
+        impl From<$src> for Text {
+            fn from(text: $src) -> Self {
+                Text::new(text)
+            }
         }
-    }
+    )+};
 }
 
-impl From<&String> for Text {
-    fn from(text: &String) -> Self {
-        text.to_owned().into()
-    }
+text_from!(String, &String, &str);
+
+/// `From<String>` impls that forward into a content type's `text` constructor.
+macro_rules! text_content_from_string {
+    ($($ty:ident),+ $(,)?) => {$(
+        impl From<String> for $ty {
+            fn from(text: String) -> Self {
+                $ty::text(text)
+            }
+        }
+    )+};
 }
 
-impl From<&str> for Text {
-    fn from(text: &str) -> Self {
-        text.to_owned().into()
-    }
+text_content_from_string!(ToolResultContent, AssistantContent, UserContent);
+
+/// One-line `From<T> for Message` forwards: convert the value, wrap it in the
+/// named content variant, and build a single-content message.
+macro_rules! single_content_message_from {
+    (User { $($src:ty => $variant:ident),+ $(,)? }) => {$(
+        impl From<$src> for Message {
+            fn from(value: $src) -> Self {
+                Message::User {
+                    content: vec![UserContent::$variant(value.into())],
+                }
+            }
+        }
+    )+};
+    (Assistant { $($src:ty => $variant:ident),+ $(,)? }) => {$(
+        impl From<$src> for Message {
+            fn from(value: $src) -> Self {
+                Message::Assistant(AssistantMessage::new(vec![AssistantContent::$variant(
+                    value.into(),
+                )]))
+            }
+        }
+    )+};
 }
+
+single_content_message_from!(User {
+    String => Text,
+    &str => Text,
+    &String => Text,
+    Text => Text,
+    Image => Image,
+    Audio => Audio,
+    Document => Document,
+    ToolResult => ToolResult,
+});
+
+single_content_message_from!(Assistant {
+    ToolCall => ToolCall,
+});
 
 impl FromStr for Text {
     type Err = Infallible;
@@ -1221,135 +1275,35 @@ impl From<&Message> for Message {
     }
 }
 
-impl From<String> for Message {
-    fn from(text: String) -> Self {
-        Message::User {
-            content: OneOrMany::one(UserContent::Text(text.into())),
-        }
-    }
-}
-
-impl From<&str> for Message {
-    fn from(text: &str) -> Self {
-        Message::User {
-            content: OneOrMany::one(UserContent::Text(text.into())),
-        }
-    }
-}
-
-impl From<&String> for Message {
-    fn from(text: &String) -> Self {
-        Message::User {
-            content: OneOrMany::one(UserContent::Text(text.into())),
-        }
-    }
-}
-
-impl From<Text> for Message {
-    fn from(text: Text) -> Self {
-        Message::User {
-            content: OneOrMany::one(UserContent::Text(text)),
-        }
-    }
-}
-
-impl From<Image> for Message {
-    fn from(image: Image) -> Self {
-        Message::User {
-            content: OneOrMany::one(UserContent::Image(image)),
-        }
-    }
-}
-
-impl From<Audio> for Message {
-    fn from(audio: Audio) -> Self {
-        Message::User {
-            content: OneOrMany::one(UserContent::Audio(audio)),
-        }
-    }
-}
-
-impl From<Document> for Message {
-    fn from(document: Document) -> Self {
-        Message::User {
-            content: OneOrMany::one(UserContent::Document(document)),
-        }
-    }
-}
-
-impl From<String> for ToolResultContent {
-    fn from(text: String) -> Self {
-        ToolResultContent::text(text)
-    }
-}
-
-impl From<String> for AssistantContent {
-    fn from(text: String) -> Self {
-        AssistantContent::text(text)
-    }
-}
-
-impl From<String> for UserContent {
-    fn from(text: String) -> Self {
-        UserContent::text(text)
-    }
-}
-
 impl From<AssistantContent> for Message {
     fn from(content: AssistantContent) -> Self {
-        Message::Assistant {
-            id: None,
-            content: OneOrMany::one(content),
-        }
+        Message::Assistant(AssistantMessage::new(vec![content]))
+    }
+}
+
+impl From<AssistantMessage> for Message {
+    fn from(message: AssistantMessage) -> Self {
+        Message::Assistant(message)
     }
 }
 
 impl From<UserContent> for Message {
     fn from(content: UserContent) -> Self {
         Message::User {
-            content: OneOrMany::one(content),
+            content: vec![content],
         }
     }
 }
 
-impl From<OneOrMany<AssistantContent>> for Message {
-    fn from(content: OneOrMany<AssistantContent>) -> Self {
-        Message::Assistant { id: None, content }
+impl From<Vec<AssistantContent>> for Message {
+    fn from(content: Vec<AssistantContent>) -> Self {
+        Message::Assistant(AssistantMessage::new(content))
     }
 }
 
-impl From<OneOrMany<UserContent>> for Message {
-    fn from(content: OneOrMany<UserContent>) -> Self {
+impl From<Vec<UserContent>> for Message {
+    fn from(content: Vec<UserContent>) -> Self {
         Message::User { content }
-    }
-}
-
-impl From<ToolCall> for Message {
-    fn from(tool_call: ToolCall) -> Self {
-        Message::Assistant {
-            id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(tool_call)),
-        }
-    }
-}
-
-impl From<ToolResult> for Message {
-    fn from(tool_result: ToolResult) -> Self {
-        Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(tool_result)),
-        }
-    }
-}
-
-impl From<ToolResultContent> for Message {
-    fn from(tool_result_content: ToolResultContent) -> Self {
-        Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
-                id: String::new(),
-                call_id: None,
-                content: OneOrMany::one(tool_result_content),
-            })),
-        }
     }
 }
 
@@ -1361,13 +1315,9 @@ pub enum ToolChoice {
     None,
     Required,
     Specific {
-        function_names: Vec<String>,
+        function_names: Vec<ToolName>,
     },
 }
-
-// ================================================================
-// Error types
-// ================================================================
 
 /// Error type to represent issues with converting messages to and from specific provider messages.
 #[derive(Debug, Error)]
@@ -1376,75 +1326,11 @@ pub enum MessageError {
     ConversionError(String),
 }
 
-impl From<MessageError> for CompletionError {
+impl From<MessageError> for ProviderError {
     fn from(error: MessageError) -> Self {
-        CompletionError::RequestError(error.into())
+        ProviderError::request(error)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Message, Reasoning, ReasoningContent};
-
-    #[test]
-    fn reasoning_constructors_and_accessors_work() {
-        let single = Reasoning::new("think");
-        assert_eq!(single.first_text(), Some("think"));
-        assert_eq!(single.first_signature(), None);
-
-        let signed = Reasoning::new_with_signature("signed", Some("sig-1".to_string()));
-        assert_eq!(signed.first_text(), Some("signed"));
-        assert_eq!(signed.first_signature(), Some("sig-1"));
-
-        let multi = Reasoning::multi(vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(multi.display_text(), "a\nb");
-        assert_eq!(multi.first_text(), Some("a"));
-
-        let redacted = Reasoning::redacted("redacted-value");
-        assert_eq!(redacted.display_text(), "redacted-value");
-        assert_eq!(redacted.first_text(), None);
-
-        let encrypted = Reasoning::encrypted("enc");
-        assert_eq!(encrypted.encrypted_content(), Some("enc"));
-        assert_eq!(encrypted.display_text(), "");
-
-        let summaries = Reasoning::summaries(vec!["s1".to_string(), "s2".to_string()]);
-        assert_eq!(summaries.display_text(), "s1\ns2");
-        assert_eq!(summaries.encrypted_content(), None);
-    }
-
-    #[test]
-    fn reasoning_content_serde_roundtrip() {
-        let variants = vec![
-            ReasoningContent::Text {
-                text: "plain".to_string(),
-                signature: Some("sig".to_string()),
-            },
-            ReasoningContent::Encrypted("opaque".to_string()),
-            ReasoningContent::Redacted {
-                data: "redacted".to_string(),
-            },
-            ReasoningContent::Summary("summary".to_string()),
-        ];
-
-        for variant in variants {
-            let json = serde_json::to_string(&variant).expect("serialize");
-            let roundtrip: ReasoningContent = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(roundtrip, variant);
-        }
-    }
-
-    #[test]
-    fn system_message_constructor_and_serde_roundtrip() {
-        let message = Message::system("You are concise.");
-
-        match &message {
-            Message::System { content } => assert_eq!(content, "You are concise."),
-            _ => panic!("Expected system message"),
-        }
-
-        let json = serde_json::to_string(&message).expect("serialize");
-        let roundtrip: Message = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(roundtrip, message);
-    }
-}
+mod tests;

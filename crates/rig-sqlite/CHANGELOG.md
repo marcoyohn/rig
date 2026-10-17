@@ -6,6 +6,79 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## [0.44.0](https://github.com/0xPlaygrounds/rig/compare/rig-sqlite-v0.43.0...rig-sqlite-v0.44.0) - 2026-10-07
+
+### Other
+
+- *(vector_store)* [**breaking**] named VectorStoreIndex search results ([#2688](https://github.com/0xPlaygrounds/rig/pull/2688)) (by [gold-silver-copper](https://github.com/gold-silver-copper))
+- *(sqlite)* render filters through SqlCondition and delete SqliteRenderedFilter ([#2693](https://github.com/0xPlaygrounds/rig/pull/2693)) (by [gold-silver-copper](https://github.com/gold-silver-copper))
+
+### Contributors
+
+* [gold-silver-copper](https://github.com/gold-silver-copper)
+## [0.43.0](https://github.com/0xPlaygrounds/rig/compare/rig-sqlite-v0.42.0...rig-sqlite-v0.43.0) - 2026-09-30
+
+### Added
+
+- [**breaking**] the effect-bus critical path — one protocol, one channel, typed views ([#2443](https://github.com/0xPlaygrounds/rig/pull/2443)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2443
+- [**breaking**] rig-reqwest — cut the bundled transport into its own crate; rig-core has no default transport and no reqwest/tokio ([#2397](https://github.com/0xPlaygrounds/rig/pull/2397)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2397
+- [**breaking**] type-erasure sweep part 2 — normalize embedding/rerank responses, erase rerank and image-embedding models, move ModelLister construction to a hook ([#2389](https://github.com/0xPlaygrounds/rig/pull/2389)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2389
+- [**breaking**] finish the type-erasure sweep — normalize transcription/image/audio responses, move construction off every model trait, erase the embedding model in vector stores ([#2385](https://github.com/0xPlaygrounds/rig/pull/2385)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2385
+
+### Fixed
+
+- pre-0.43 release fixes (docs.rs, opt-in rig::cassette, rust-version, READMEs) ([#2638](https://github.com/0xPlaygrounds/rig/pull/2638)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2638
+- publish the facade, not the repository — and stop asking for dependencies nothing uses ([#2563](https://github.com/0xPlaygrounds/rig/pull/2563)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2563
+
+### Other
+
+- *(rig-core)* [**breaking**] the driver alone writes provider, request id and raw ([#2626](https://github.com/0xPlaygrounds/rig/pull/2626)) (by [gold-silver-copper](https://github.com/gold-silver-copper))
+- [**breaking**] archimpro — one typed decoder and one fold per wire ([#2617](https://github.com/0xPlaygrounds/rig/pull/2617)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2617
+- *(rig-core)* [**breaking**] a smaller model layer (Operation, Fold, Wire, Decoder, Transport) ([#2613](https://github.com/0xPlaygrounds/rig/pull/2613)) (by [gold-silver-copper](https://github.com/gold-silver-copper))
+- [**breaking**] provider clients own their transport; conversations use plain values ([#2611](https://github.com/0xPlaygrounds/rig/pull/2611)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2611
+- *(rig-core)* [**breaking**] unify provider operation errors ([#2582](https://github.com/0xPlaygrounds/rig/pull/2582)) (by [gold-silver-copper](https://github.com/gold-silver-copper))
+- finish the comment cleanup across the workspace ([#2575](https://github.com/0xPlaygrounds/rig/pull/2575)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2575
+- Unify every provider onto one wire model ([#2538](https://github.com/0xPlaygrounds/rig/pull/2538)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2538
+- [**breaking**] retire five clippy heuristics and unbox everything they made us write ([#2536](https://github.com/0xPlaygrounds/rig/pull/2536)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2536
+- [**breaking**] collapse the client machinery to Provider + Has* ([#2441](https://github.com/0xPlaygrounds/rig/pull/2441)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2441
+- move every inline test module to a sibling file ([#2433](https://github.com/0xPlaygrounds/rig/pull/2433)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2433
+- ownership sweep round 4 — avoidable clones, dead public items, is_false dedup ([#2416](https://github.com/0xPlaygrounds/rig/pull/2416)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2416
+- idiomatic Rust sweep across the workspace ([#2409](https://github.com/0xPlaygrounds/rig/pull/2409)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2409
+- [**breaking**] ownership audit round 2 — borrow-shaped telemetry getters, slice-shaped embed seams, Copy usage types, dead Default/Debug transport bounds ([#2392](https://github.com/0xPlaygrounds/rig/pull/2392)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2392
+- [**breaking**] ownership audit — borrow-shaped signatures, dead clones, clone_from in accumulators, minimal bounds ([#2391](https://github.com/0xPlaygrounds/rig/pull/2391)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2391
+
+### Contributors
+
+* [gold-silver-copper](https://github.com/gold-silver-copper)
+## [0.42.0](https://github.com/0xPlaygrounds/rig/compare/rig-sqlite-v0.41.0...rig-sqlite-v0.42.0) - 2026-08-16
+
+### Other
+
+- reconcile the changelogs and the migration guide with what actually merged ([#2353](https://github.com/0xPlaygrounds/rig/pull/2353)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2353
+- workspace-wide LOC consolidation pass 6 (net −3,424 lines) ([#2308](https://github.com/0xPlaygrounds/rig/pull/2308)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2308
+- [**breaking**] `OneOrMany<T>` becomes `Vec<T>` — the fake is deleted, the enforcement moves ([#2273](https://github.com/0xPlaygrounds/rig/pull/2273)) (by [gold-silver-copper](https://github.com/gold-silver-copper)) - #2273
+
+### Contributors
+
+* [gold-silver-copper](https://github.com/gold-silver-copper)
+
+### Fixed
+
+- *(sqlite)* a filter built from `SqliteSearchFilter::default()` now composes instead of erroring. `default()` produced an internal `Raw { condition: "1 = 1" }` node that was special-cased only at the top level; nested under `or` it reached the document-table renderer and failed with `SQLite filter cannot be safely lowered; raw filters cannot be validated as document-table constraints` — so `SqliteSearchFilter::default().or(other)`, the natural way to fold filters, died on a message naming a concept the public API never exposed. The default is now a dedicated no-op node: it contributes no constraint at the top level and renders as the tautology `1 = 1` when it is composed under `and`/`or`/`not` on the document path, pinned by `default_filter_composes_under_or_as_a_tautology`
+
+### Changed
+
+- *(vector-store)* [**breaking**] `InsertDocuments::insert_documents` takes `Vec<(Doc, Vec<Embedding>)>` instead of `Vec<(Doc, OneOrMany<Embedding>)>`, following rig-core's removal of the non-empty container — a source-only signature change; serialized embeddings are unchanged
+
+## [0.40.0](https://github.com/0xPlaygrounds/rig/compare/rig-sqlite-v0.39.0...rig-sqlite-v0.40.0) - 2026-07-10
+
+### Other
+
+- run doctests and stop rig-sqlite opting out of them ([#1939](https://github.com/0xPlaygrounds/rig/pull/1939)) (by @gold-silver-copper) - #1939
+
+### Contributors
+
+* @gold-silver-copper
 ## [0.39.0](https://github.com/0xPlaygrounds/rig/compare/rig-sqlite-v0.38.2...rig-sqlite-v0.39.0) - 2026-06-19
 
 ### Fixed

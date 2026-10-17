@@ -1,6 +1,15 @@
-// ================================================================
-//! Google Gemini gRPC Completion Integration
-// ================================================================
+//! The Gemini `GenerateContent` completion wire over gRPC.
+//!
+//! ```no_run
+//! use rig_core::Model;
+//! use rig_gemini_grpc::{GeminiGrpc, completion::{GEMINI_2_5_FLASH, GenerateContent}};
+//!
+//! # async fn example() -> Result<(), rig_gemini_grpc::GeminiGrpcError> {
+//! let model = GeminiGrpc::new("API_KEY").await?.completion(GEMINI_2_5_FLASH);
+//! # let _ = model;
+//! # Ok(())
+//! # }
+//! ```
 
 /// `gemini-2.5-flash` completion model
 pub const GEMINI_2_5_FLASH: &str = "gemini-2.5-flash";
@@ -9,962 +18,214 @@ pub const GEMINI_2_0_FLASH_LITE: &str = "gemini-2.0-flash-lite";
 /// `gemini-2.0-flash` completion model
 pub const GEMINI_2_0_FLASH: &str = "gemini-2.0-flash";
 
-use base64::Engine as _;
-use rig_core::OneOrMany;
-use rig_core::completion::{self, CompletionError, CompletionRequest};
-use rig_core::message::{self, MimeType, Reasoning};
-use rig_core::providers::gemini::completion::gemini_api_types::{
-    Schema as GeminiSchema, tool_parameters_to_schema,
-};
-use rig_core::telemetry::ProviderResponseExt;
-use std::convert::TryFrom;
+use futures::StreamExt;
+use rig_core::completion::CompletionRequest;
+use rig_core::driver::{Exchange, Opened, Opening, Transport};
+use rig_core::error::EncodeError;
+use rig_core::error::ProviderError;
+use rig_core::message;
+use rig_core::operation::Completion;
+use rig_core::providers::gemini::completion as rest;
+use rig_core::wire::{Descriptor, Mode, Wire};
 
-use super::Client;
-use super::proto::{self, GenerateContentRequest, GenerateContentResponse};
+use super::GeminiGrpc;
+use super::proto::{GenerateContentRequest, GenerateContentResponse};
 
-// =================================================================
-// Rig Implementation Types
-// =================================================================
-
-#[derive(Clone, Debug)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
+/// The `GenerateContent` endpoint for one model: `GenerateContent` for a
+/// unary call, `StreamGenerateContent` for a streamed one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenerateContent {
     pub model: String,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: impl Into<String>) -> Self {
+impl GenerateContent {
+    pub fn new(model: impl Into<String>) -> Self {
         Self {
-            client,
             model: model.into(),
         }
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
-    type Response = GenerateContentResponse;
-    type StreamingResponse = super::streaming::StreamingCompletionResponse;
-    type Client = super::Client;
+impl Wire for GenerateContent {
+    type Op = Completion;
+    type Payload = GenerateContentRequest;
+    type Frame = GenerateContentResponse;
+    type Decoder<'id> = crate::streaming::GrpcAdapter;
+    type Reassembler = rig_core::providers::gemini::streaming::document::GenerateContentResponse;
 
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
+    fn describe(&self) -> Descriptor<'_> {
+        Descriptor::new(PROVIDER_NAME)
+            .model(self.model.as_str())
+            .replay(self)
     }
 
-    async fn completion(
-        &self,
-        completion_request: CompletionRequest,
-    ) -> Result<completion::CompletionResponse<GenerateContentResponse>, CompletionError> {
-        let request = create_grpc_request(self.model.clone(), completion_request)?;
-
-        let mut grpc_client = self
-            .client
-            .grpc_client()
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
-
-        let response = grpc_client
-            .generate_content(request)
-            .await
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?
-            .into_inner();
-
-        response.try_into()
-    }
-
-    async fn stream(
+    /// The REST wire's request, transcoded: every field the shared encoder
+    /// builds reaches the protobuf request, and one the proto does not
+    /// declare is an error rather than dropped.
+    fn encode(
         &self,
         request: CompletionRequest,
-    ) -> Result<
-        rig_core::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
-        CompletionError,
-    > {
-        super::streaming::stream(self.client.clone(), self.model.clone(), request).await
+        _mode: Mode,
+    ) -> Result<GenerateContentRequest, EncodeError> {
+        let model = request.model.clone().unwrap_or_else(|| self.model.clone());
+        let body = rest::request_body(&request, self, &model, None, |body| {
+            body.insert("model".to_owned(), format!("models/{model}").into());
+        })?;
+        Ok(crate::rest::from_rest(serde_json::to_value(&body)?)?)
+    }
+
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
+        crate::streaming::GrpcAdapter::default()
     }
 }
 
-// Helper function to create gRPC request from Rig's CompletionRequest
-pub(crate) fn create_grpc_request(
-    model: String,
-    completion_request: CompletionRequest,
-) -> Result<GenerateContentRequest, CompletionError> {
-    let CompletionRequest {
-        model: _,
-        preamble,
-        chat_history,
-        documents: _,
-        tools,
-        temperature,
-        max_tokens,
-        tool_choice: _,
-        additional_params: _,
-        output_schema: _,
-    } = completion_request;
-
-    let (history_system, chat_history) = split_system_messages_from_history(chat_history);
-    let mut contents = Vec::new();
-
-    // Convert chat history to gRPC Content messages
-    for msg in chat_history {
-        contents.push(rig_message_to_grpc_content(msg)?);
+impl rig_core::completion::ReplayTarget for GenerateContent {
+    /// The GenerateContent mapping, for what the gRPC request declares.
+    fn map_options(
+        &self,
+        request: &rig_core::completion::CompletionRequest,
+        fields: rig_core::completion::options::OptionFields<'_>,
+    ) -> rig_core::completion::options::OptionMap {
+        let model = request.model.as_deref().unwrap_or(&self.model);
+        rest::generate_content_options(model, rest::Route::Grpc, fields)
     }
 
-    // Handle system instruction (preamble)
-    let mut system_parts = Vec::new();
-    if let Some(preamble) = preamble
-        && !preamble.is_empty()
-    {
-        system_parts.push(proto::Part {
-            data: Some(proto::part::Data::Text(preamble)),
-            thought: false,
-            thought_signature: Vec::new(),
-            part_metadata: None,
-        });
+    fn api(&self) -> rig_core::message::Api {
+        rig_core::message::Api::from_static("gemini.generate_content")
     }
-    for content in history_system {
-        if !content.is_empty() {
-            system_parts.push(proto::Part {
-                data: Some(proto::part::Data::Text(content)),
-                thought: false,
-                thought_signature: Vec::new(),
-                part_metadata: None,
-            });
-        }
+
+    fn provider(&self) -> &str {
+        PROVIDER_NAME
     }
-    let system_instruction = if system_parts.is_empty() {
-        None
-    } else {
-        Some(proto::Content {
-            parts: system_parts,
-            role: "model".to_string(),
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// What the model reads, as on every GenerateContent wire.
+    fn accepts(&self, model: &str) -> rig_core::completion::Accepts {
+        rest::accepts(model)
+    }
+
+    /// The media the Gemini API takes, as on the REST wire.
+    fn encodes(&self, _model: &str, media: rig_core::completion::Media<'_>) -> bool {
+        rest::encodes(media, false)
+    }
+
+    fn normalize_tool_call_id(
+        &self,
+        id: &str,
+        model: &str,
+        _source: Option<&message::Origin>,
+    ) -> String {
+        rest::normalize_tool_call_id(model, id)
+    }
+
+    /// Gemini takes system text only in `systemInstruction`: later system
+    /// messages fold into the leading one, as pi's `collapseSystemMessages`.
+    fn later_system(&self, _model: &str) -> rig_core::completion::LaterSystem {
+        rig_core::completion::LaterSystem::Leading
+    }
+
+    fn call_id_slot(&self) -> Option<&'static str> {
+        rest::CALL_ID_SLOT
+    }
+
+    /// Tools in `additional_params` or a cached content count, as on the
+    /// REST wire.
+    fn declares_tools(&self, request: &rig_core::completion::CompletionRequest) -> bool {
+        rest::declares_tools(self, request)
+    }
+}
+
+impl Transport<GenerateContent> for GeminiGrpc {
+    fn send(
+        &self,
+        request: GenerateContentRequest,
+        exchange: Exchange,
+    ) -> Opening<GenerateContentResponse> {
+        let mode = exchange.mode;
+        let mut client = self.grpc_client();
+        Opening::new(async move {
+            Ok(match mode {
+                Mode::Unary => match client.generate_content(request).await {
+                    Ok(response) => unary(response.into_inner())?,
+                    Err(status) => Opened::failed(rpc_error(&status)),
+                },
+                Mode::Streaming => match client.stream_generate_content(request).await {
+                    Ok(response) => {
+                        let mut chunks = response.into_inner();
+                        // Stop receiving after a tonic failure.
+                        Opened::new(async_stream::stream! {
+                            while let Some(item) = chunks.next().await {
+                                match item {
+                                    Ok(chunk) => yield Ok(chunk),
+                                    Err(status) => {
+                                        yield Err(rpc_error(&status));
+                                        break;
+                                    }
+                                }
+                            }
+                        })
+                    }
+                    Err(status) => Opened::failed(rpc_error(&status)),
+                },
+            })
         })
-    };
-
-    // Handle generation config
-    let generation_config = if temperature.is_some() || max_tokens.is_some() {
-        Some(proto::GenerationConfig {
-            temperature: temperature.map(|t| t as f32),
-            max_output_tokens: max_tokens.map(|t| t as i32),
-            ..Default::default()
-        })
-    } else {
-        None
-    };
-
-    // Handle tools (functions)
-    let tools = if !tools.is_empty() {
-        let function_declarations = tools
-            .into_iter()
-            .map(|tool| {
-                Ok(proto::FunctionDeclaration {
-                    name: tool.name,
-                    description: tool.description,
-                    parameters: tool_parameters_to_proto_schema(&tool.parameters)?,
-                    ..Default::default()
-                })
-            })
-            .collect::<Result<Vec<_>, CompletionError>>()?;
-
-        vec![proto::Tool {
-            function_declarations,
-            code_execution: None,
-        }]
-    } else {
-        vec![]
-    };
-
-    Ok(GenerateContentRequest {
-        model: format!("models/{}", model),
-        contents,
-        tools,
-        safety_settings: vec![],
-        generation_config,
-        tool_config: None,
-        system_instruction,
-        cached_content: String::new(),
-    })
-}
-
-// Convert Rig message to gRPC Content
-fn rig_message_to_grpc_content(msg: message::Message) -> Result<proto::Content, CompletionError> {
-    match msg {
-        message::Message::System { .. } => Err(CompletionError::RequestError(
-            "System messages must be sent via Gemini gRPC system_instruction".into(),
-        )),
-        message::Message::User { content } => {
-            let parts = content
-                .into_iter()
-                .map(rig_user_content_to_grpc_part)
-                .collect::<Result<Vec<_>, _>>()?;
-
-            Ok(proto::Content {
-                parts,
-                role: "user".to_string(),
-            })
-        }
-        message::Message::Assistant { content, .. } => {
-            let parts = content
-                .into_iter()
-                .map(rig_assistant_content_to_grpc_part)
-                .collect::<Result<Vec<_>, _>>()?;
-
-            Ok(proto::Content {
-                parts,
-                role: "model".to_string(),
-            })
-        }
     }
 }
 
-fn split_system_messages_from_history(
-    history: OneOrMany<message::Message>,
-) -> (Vec<String>, Vec<message::Message>) {
-    let mut system = Vec::new();
-    let mut remaining = Vec::new();
-
-    for message in history {
-        match message {
-            message::Message::System { content } => system.push(content),
-            other => remaining.push(other),
-        }
-    }
-
-    (system, remaining)
+/// A unary reply: its one message, whose REST JSON is the response's `raw`.
+/// A message that does not transcode fails as its decoding would.
+pub(crate) fn unary(
+    response: GenerateContentResponse,
+) -> Result<Opened<GenerateContentResponse>, ProviderError> {
+    let document = crate::streaming::document::rest_document(&response)?;
+    Ok(Opened::new(futures::stream::iter([Ok(response)])).with_document(document))
 }
 
-// Convert Rig UserContent to gRPC Part
-fn rig_user_content_to_grpc_part(
-    content: message::UserContent,
-) -> Result<proto::Part, CompletionError> {
-    match content {
-        message::UserContent::Text(message::Text { text, .. }) => Ok(proto::Part {
-            data: Some(proto::part::Data::Text(text)),
-            thought: false,
-            thought_signature: Vec::new(),
-            part_metadata: None,
-        }),
-        message::UserContent::ToolResult(result) => {
-            let response_text = match &result.content.first() {
-                message::ToolResultContent::Text(t) => t.text.clone(),
-                message::ToolResultContent::Image(_) => {
-                    return Err(CompletionError::RequestError(
-                        "Tool result content must be text".into(),
-                    ));
-                }
-            };
+/// Stable descriptor name reported on normalized responses from this provider.
+pub const PROVIDER_NAME: &str = "gemini-grpc";
 
-            let result_value: serde_json::Value = serde_json::from_str(&response_text)
-                .unwrap_or_else(|_| serde_json::json!(response_text));
+/// Preserves tonic status display text with RPC code and retry classification.
+/// Transport failures use the same provider-body representation.
+pub(crate) fn rpc_error(status: &tonic::Status) -> ProviderError {
+    ProviderError::from_provider_body(status.to_string())
+        .with_provider_code(Some(grpc_code_name(status.code())))
+        .with_transient(Some(transient_grpc_code(status.code())))
+}
 
-            let response_struct =
-                json_to_prost_struct(serde_json::json!({ "result": result_value }))?;
-
-            Ok(proto::Part {
-                data: Some(proto::part::Data::FunctionResponse(
-                    proto::FunctionResponse {
-                        name: result.id,
-                        response: Some(response_struct),
-                        id: result.call_id.unwrap_or_default(),
-                    },
-                )),
-                thought: false,
-                thought_signature: Vec::new(),
-                part_metadata: None,
-            })
-        }
-        message::UserContent::Image(img) => {
-            let Some(media_type) = img.media_type else {
-                return Err(CompletionError::RequestError(
-                    "Media type for image is required for Gemini".into(),
-                ));
-            };
-
-            match media_type {
-                message::ImageMediaType::JPEG
-                | message::ImageMediaType::PNG
-                | message::ImageMediaType::WEBP
-                | message::ImageMediaType::HEIC
-                | message::ImageMediaType::HEIF => {}
-                _ => {
-                    return Err(CompletionError::RequestError(
-                        format!("Unsupported image media type {media_type:?}").into(),
-                    ));
-                }
+/// The gRPC status code's canonical name (`UNAVAILABLE`): the code the
+/// provider answered with, kept apart from the message so a report can
+/// key on it.
+pub(crate) fn grpc_code_name(code: tonic::Code) -> String {
+    format!("{code:?}")
+        .chars()
+        .fold(String::new(), |mut name, c| {
+            if c.is_ascii_uppercase() && !name.is_empty() {
+                name.push('_');
             }
-
-            let mime_type = media_type.to_mime_type().to_string();
-
-            let data = match img.data {
-                message::DocumentSourceKind::Url(file_uri) => {
-                    return Ok(proto::Part {
-                        data: Some(proto::part::Data::FileData(proto::FileData {
-                            mime_type,
-                            file_uri,
-                        })),
-                        thought: false,
-                        thought_signature: Vec::new(),
-                        part_metadata: None,
-                    });
-                }
-                message::DocumentSourceKind::Raw(bytes) => bytes,
-                message::DocumentSourceKind::Base64(data)
-                | message::DocumentSourceKind::String(data) => decode_base64_bytes(&data)?,
-                message::DocumentSourceKind::Unknown => {
-                    return Err(CompletionError::RequestError(
-                        "Image content has no body".into(),
-                    ));
-                }
-                _ => {
-                    return Err(CompletionError::RequestError(
-                        "Unsupported document source kind".into(),
-                    ));
-                }
-            };
-
-            Ok(proto::Part {
-                data: Some(proto::part::Data::InlineData(proto::Blob {
-                    mime_type,
-                    data,
-                })),
-                thought: false,
-                thought_signature: Vec::new(),
-                part_metadata: None,
-            })
-        }
-        _ => Err(CompletionError::RequestError(
-            "Unsupported user content type".into(),
-        )),
-    }
-}
-
-// Convert Rig AssistantContent to gRPC Part
-fn rig_assistant_content_to_grpc_part(
-    content: message::AssistantContent,
-) -> Result<proto::Part, CompletionError> {
-    match content {
-        message::AssistantContent::Text(message::Text { text, .. }) => Ok(proto::Part {
-            data: Some(proto::part::Data::Text(text)),
-            thought: false,
-            thought_signature: Vec::new(),
-            part_metadata: None,
-        }),
-        message::AssistantContent::ToolCall(tool_call) => {
-            let args = json_to_prost_struct(tool_call.function.arguments)?;
-
-            Ok(proto::Part {
-                data: Some(proto::part::Data::FunctionCall(proto::FunctionCall {
-                    name: tool_call.function.name,
-                    args: Some(args),
-                    id: tool_call.call_id.unwrap_or(tool_call.id),
-                })),
-                thought: false,
-                thought_signature: decode_optional_base64(tool_call.signature)?,
-                part_metadata: None,
-            })
-        }
-        message::AssistantContent::Reasoning(reasoning) => Ok(proto::Part {
-            data: Some(proto::part::Data::Text(reasoning.display_text())),
-            thought: true,
-            thought_signature: decode_optional_base64(
-                reasoning.first_signature().map(|s| s.to_string()),
-            )?,
-            part_metadata: None,
-        }),
-        _ => Err(CompletionError::RequestError(
-            "Unsupported assistant content type".into(),
-        )),
-    }
-}
-
-// Convert gRPC GenerateContentResponse to Rig CompletionResponse
-impl TryFrom<GenerateContentResponse> for completion::CompletionResponse<GenerateContentResponse> {
-    type Error = CompletionError;
-
-    fn try_from(response: GenerateContentResponse) -> Result<Self, Self::Error> {
-        let candidate = response.candidates.first().ok_or_else(|| {
-            CompletionError::ResponseError("No response candidates in response".into())
-        })?;
-
-        let content_ref = candidate.content.as_ref().ok_or_else(|| {
-            CompletionError::ResponseError(format!(
-                "Gemini candidate missing content (finish_reason={})",
-                candidate.finish_reason
-            ))
-        })?;
-
-        let mut assistant_contents = Vec::new();
-
-        for part in &content_ref.parts {
-            let assistant_content = match &part.data {
-                Some(proto::part::Data::Text(text)) => {
-                    if part.thought {
-                        completion::AssistantContent::Reasoning(Reasoning::new_with_signature(
-                            text,
-                            encode_optional_base64(&part.thought_signature),
-                        ))
-                    } else {
-                        completion::AssistantContent::text(text)
-                    }
-                }
-                Some(proto::part::Data::InlineData(inline_data)) => {
-                    let mime_type = message::MediaType::from_mime_type(&inline_data.mime_type);
-                    match mime_type {
-                        Some(message::MediaType::Image(media_type)) => {
-                            let b64 =
-                                base64::engine::general_purpose::STANDARD.encode(&inline_data.data);
-                            completion::AssistantContent::image_base64(
-                                b64,
-                                Some(media_type),
-                                Some(message::ImageDetail::default()),
-                            )
-                        }
-                        _ => {
-                            return Err(CompletionError::ResponseError(format!(
-                                "Unsupported media type {mime_type:?}"
-                            )));
-                        }
-                    }
-                }
-                Some(proto::part::Data::FunctionCall(function_call)) => {
-                    let args = function_call
-                        .args
-                        .as_ref()
-                        .map(prost_struct_to_json)
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-
-                    let mut tool_call = message::ToolCall::new(
-                        if function_call.id.is_empty() {
-                            function_call.name.clone()
-                        } else {
-                            function_call.id.clone()
-                        },
-                        message::ToolFunction::new(function_call.name.clone(), args),
-                    );
-
-                    if !function_call.id.is_empty() {
-                        tool_call = tool_call.with_call_id(function_call.id.clone());
-                    }
-
-                    tool_call =
-                        tool_call.with_signature(encode_optional_base64(&part.thought_signature));
-
-                    completion::AssistantContent::ToolCall(tool_call)
-                }
-                _ => {
-                    return Err(CompletionError::ResponseError(
-                        "Response did not contain a message or tool call".into(),
-                    ));
-                }
-            };
-
-            assistant_contents.push(assistant_content);
-        }
-
-        let choice = OneOrMany::many(assistant_contents).map_err(|_| {
-            CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".to_owned(),
-            )
-        })?;
-
-        let usage = response
-            .usage_metadata
-            .as_ref()
-            .map(|usage| completion::Usage {
-                input_tokens: usage.prompt_token_count as u64,
-                output_tokens: usage.candidates_token_count as u64,
-                total_tokens: usage.total_token_count as u64,
-                cached_input_tokens: usage.cached_content_token_count as u64,
-                cache_creation_input_tokens: 0,
-                tool_use_prompt_tokens: 0,
-                reasoning_tokens: 0,
-            })
-            .unwrap_or_default();
-
-        Ok(completion::CompletionResponse {
-            choice,
-            usage,
-            raw_response: response,
-            message_id: None,
+            name.push(c.to_ascii_uppercase());
+            name
         })
-    }
 }
 
-// Implement ProviderResponseExt for telemetry
-impl ProviderResponseExt for GenerateContentResponse {
-    type OutputMessage = proto::Candidate;
-    type Usage = proto::UsageMetadata;
-
-    fn get_response_id(&self) -> Option<String> {
-        if self.response_id.is_empty() {
-            None
-        } else {
-            Some(self.response_id.clone())
-        }
-    }
-
-    fn get_response_model_name(&self) -> Option<String> {
-        if self.model_version.is_empty() {
-            None
-        } else {
-            Some(self.model_version.clone())
-        }
-    }
-
-    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-        self.candidates.clone()
-    }
-
-    fn get_text_response(&self) -> Option<String> {
-        self.candidates.first().and_then(|c| {
-            c.content.as_ref().and_then(|content| {
-                let text: Vec<String> = content
-                    .parts
-                    .iter()
-                    .filter_map(|part| {
-                        if let Some(proto::part::Data::Text(text)) = &part.data {
-                            Some(text.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(text.join("\n"))
-                }
-            })
-        })
-    }
-
-    fn get_usage(&self) -> Option<Self::Usage> {
-        self.usage_metadata
-    }
-}
-
-fn decode_base64_bytes(input: &str) -> Result<Vec<u8>, CompletionError> {
-    let data = input.trim();
-
-    // Allow `data:<mime>;base64,<data>` inputs.
-    let data = if let Some(rest) = data.strip_prefix("data:") {
-        rest.split_once(',').map(|(_, b64)| b64).unwrap_or(data)
-    } else {
-        data
-    };
-
-    let mut last_err: Option<String> = None;
-
-    for engine in [
-        &base64::engine::general_purpose::STANDARD,
-        &base64::engine::general_purpose::URL_SAFE,
-        &base64::engine::general_purpose::STANDARD_NO_PAD,
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-    ] {
-        match engine.decode(data) {
-            Ok(bytes) => return Ok(bytes),
-            Err(err) => last_err = Some(err.to_string()),
-        }
-    }
-
-    let err = last_err.unwrap_or_else(|| "unknown base64 decode error".to_string());
-    Err(CompletionError::RequestError(
-        format!("Invalid base64 data: {err}").into(),
-    ))
-}
-
-fn decode_optional_base64(sig: Option<String>) -> Result<Vec<u8>, CompletionError> {
-    let Some(sig) = sig else {
-        return Ok(Vec::new());
-    };
-    decode_base64_bytes(&sig)
-}
-
-fn encode_optional_base64(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() {
-        None
-    } else {
-        Some(base64::engine::general_purpose::STANDARD.encode(bytes))
-    }
-}
-
-fn json_to_prost_struct(value: serde_json::Value) -> Result<proto::Struct, CompletionError> {
-    match value {
-        serde_json::Value::Object(map) => Ok(proto::Struct {
-            fields: map
-                .into_iter()
-                .map(|(k, v)| (k, json_to_prost_value(v)))
-                .collect(),
-        }),
-        _ => Err(CompletionError::RequestError(
-            "Expected a JSON object for google.protobuf.Struct".into(),
-        )),
-    }
-}
-
-fn json_to_prost_value(value: serde_json::Value) -> proto::Value {
-    match value {
-        serde_json::Value::Null => proto::Value {
-            kind: Some(proto::value::Kind::NullValue(
-                proto::NullValue::NullValue as i32,
-            )),
-        },
-        serde_json::Value::Bool(b) => proto::Value {
-            kind: Some(proto::value::Kind::BoolValue(b)),
-        },
-        serde_json::Value::Number(n) => proto::Value {
-            kind: Some(proto::value::Kind::NumberValue(
-                n.as_f64().unwrap_or_default(),
-            )),
-        },
-        serde_json::Value::String(s) => proto::Value {
-            kind: Some(proto::value::Kind::StringValue(s)),
-        },
-        serde_json::Value::Array(items) => proto::Value {
-            kind: Some(proto::value::Kind::ListValue(proto::ListValue {
-                values: items.into_iter().map(json_to_prost_value).collect(),
-            })),
-        },
-        serde_json::Value::Object(map) => proto::Value {
-            kind: Some(proto::value::Kind::StructValue(proto::Struct {
-                fields: map
-                    .into_iter()
-                    .map(|(k, v)| (k, json_to_prost_value(v)))
-                    .collect(),
-            })),
-        },
-    }
-}
-
-fn prost_struct_to_json(st: &proto::Struct) -> serde_json::Value {
-    let mut out = serde_json::Map::with_capacity(st.fields.len());
-    for (k, v) in &st.fields {
-        out.insert(k.clone(), prost_value_to_json(v));
-    }
-    serde_json::Value::Object(out)
-}
-
-fn prost_value_to_json(v: &proto::Value) -> serde_json::Value {
-    match &v.kind {
-        None | Some(proto::value::Kind::NullValue(_)) => serde_json::Value::Null,
-        Some(proto::value::Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(proto::value::Kind::NumberValue(n)) => serde_json::Number::from_f64(*n)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Some(proto::value::Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(proto::value::Kind::StructValue(st)) => prost_struct_to_json(st),
-        Some(proto::value::Kind::ListValue(list)) => {
-            serde_json::Value::Array(list.values.iter().map(prost_value_to_json).collect())
-        }
-    }
-}
-
-// Convert the JSON Schema carried by `ToolDefinition.parameters` into the typed
-// `proto::Schema` expected by `FunctionDeclaration.parameters`.
-//
-// Without this, every tool was sent to Gemini with `parameters = None`, which
-// caused the model to invoke tools with no argument shape (issue #1710).
-//
-// An empty object schema (`{"type": "object", "properties": {}}`, the default
-// when a tool takes no arguments) is mapped to `None` rather than a vacuous
-// schema, matching the convention used by `rig-core::providers::gemini`.
-fn tool_parameters_to_proto_schema(
-    value: &serde_json::Value,
-) -> Result<Option<proto::Schema>, CompletionError> {
-    tool_parameters_to_schema(value.clone()).map(|schema| schema.map(gemini_schema_to_proto_schema))
-}
-
-fn gemini_schema_to_proto_schema(schema: GeminiSchema) -> proto::Schema {
-    proto::Schema {
-        r#type: json_type_to_proto_type(&schema.r#type) as i32,
-        format: schema.format.unwrap_or_default(),
-        description: schema.description.unwrap_or_default(),
-        nullable: schema.nullable.unwrap_or(false),
-        r#enum: schema.r#enum.unwrap_or_default(),
-        items: schema
-            .items
-            .map(|items| Box::new(gemini_schema_to_proto_schema(*items))),
-        properties: schema
-            .properties
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(name, schema)| (name, gemini_schema_to_proto_schema(schema)))
-            .collect(),
-        required: schema.required.unwrap_or_default(),
-    }
-}
-
-fn json_type_to_proto_type(t: &str) -> proto::Type {
-    match t {
-        "string" => proto::Type::String,
-        "number" => proto::Type::Number,
-        "integer" => proto::Type::Integer,
-        "boolean" => proto::Type::Boolean,
-        "array" => proto::Type::Array,
-        "object" => proto::Type::Object,
-        "null" => proto::Type::Null,
-        _ => proto::Type::Unspecified,
-    }
+/// Recognizes transient gRPC codes; other codes are non-transient.
+pub(crate) fn transient_grpc_code(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Aborted
+    )
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_decode_base64_bytes_accepts_url_safe_with_padding() {
-        assert!(matches!(
-            decode_base64_bytes("_-wgVQA="),
-            Ok(bytes) if bytes == vec![0xFF, 0xEC, 0x20, 0x55, 0x00]
-        ));
-    }
-
-    #[test]
-    fn test_decode_base64_bytes_accepts_url_safe_no_pad() {
-        assert!(matches!(
-            decode_base64_bytes("_-wgVQA"),
-            Ok(bytes) if bytes == vec![0xFF, 0xEC, 0x20, 0x55, 0x00]
-        ));
-    }
-
-    #[test]
-    fn test_decode_base64_bytes_accepts_standard_no_pad() {
-        assert!(matches!(
-            decode_base64_bytes("Zg"),
-            Ok(bytes) if bytes == b"f".to_vec()
-        ));
-    }
-
-    #[test]
-    fn test_decode_base64_bytes_accepts_data_uri_prefix() {
-        assert!(matches!(
-            decode_base64_bytes("data:text/plain;base64,Zm9v"),
-            Ok(bytes) if bytes == b"foo".to_vec()
-        ));
-    }
-
-    // ============================================================
-    // tool_parameters_to_proto_schema — regression coverage for #1710
-    // ============================================================
-
-    #[test]
-    fn tool_params_empty_object_maps_to_none() {
-        let v = serde_json::json!({"type": "object", "properties": {}});
-        assert!(tool_parameters_to_proto_schema(&v).unwrap().is_none());
-    }
-
-    #[test]
-    fn tool_params_null_maps_to_none() {
-        assert!(
-            tool_parameters_to_proto_schema(&serde_json::Value::Null)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn tool_params_object_with_scalar_properties_round_trips() {
-        let v = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "city":      { "type": "string",  "description": "City name" },
-                "max_price": { "type": "integer", "description": "Cap, USD"  }
-            },
-            "required": ["city"]
-        });
-
-        let schema = tool_parameters_to_proto_schema(&v)
-            .expect("schema conversion")
-            .expect("schema");
-        assert_eq!(schema.r#type, proto::Type::Object as i32);
-        assert_eq!(schema.required, vec!["city".to_string()]);
-        assert_eq!(schema.properties.len(), 2);
-
-        let city = schema.properties.get("city").expect("city prop");
-        assert_eq!(city.r#type, proto::Type::String as i32);
-        assert_eq!(city.description, "City name");
-
-        let max_price = schema.properties.get("max_price").expect("max_price prop");
-        assert_eq!(max_price.r#type, proto::Type::Integer as i32);
-    }
-
-    #[test]
-    fn tool_params_array_with_typed_items() {
-        let v = serde_json::json!({
-            "type": "array",
-            "items": { "type": "string" }
-        });
-
-        let schema = tool_parameters_to_proto_schema(&v)
-            .expect("schema conversion")
-            .expect("schema");
-        assert_eq!(schema.r#type, proto::Type::Array as i32);
-        let items = schema.items.expect("items");
-        assert_eq!(items.r#type, proto::Type::String as i32);
-    }
-
-    #[test]
-    fn tool_params_enum_strings_preserved() {
-        let v = serde_json::json!({
-            "type": "string",
-            "enum": ["celsius", "fahrenheit"]
-        });
-
-        let schema = tool_parameters_to_proto_schema(&v)
-            .expect("schema conversion")
-            .expect("schema");
-        assert_eq!(schema.r#type, proto::Type::String as i32);
-        assert_eq!(
-            schema.r#enum,
-            vec!["celsius".to_string(), "fahrenheit".to_string()]
-        );
-    }
-
-    #[test]
-    fn tool_params_resolves_defs_ref_properties() {
-        let v = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "destination": { "$ref": "#/$defs/Destination" }
-            },
-            "required": ["destination"],
-            "$defs": {
-                "Destination": {
-                    "type": "object",
-                    "properties": {
-                        "city": { "type": "string" },
-                        "country_code": { "type": "string" }
-                    },
-                    "required": ["city"]
-                }
-            }
-        });
-
-        let schema = tool_parameters_to_proto_schema(&v)
-            .expect("schema conversion")
-            .expect("schema");
-        let destination = schema
-            .properties
-            .get("destination")
-            .expect("destination prop");
-
-        assert_eq!(destination.r#type, proto::Type::Object as i32);
-        assert_eq!(destination.required, vec!["city".to_string()]);
-        assert_eq!(
-            destination
-                .properties
-                .get("city")
-                .expect("city prop")
-                .r#type,
-            proto::Type::String as i32
-        );
-    }
-
-    #[test]
-    fn tool_params_nullable_type_array_preserves_non_null_type() {
-        let v = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "nickname": { "type": ["null", "string"] }
-            }
-        });
-
-        let schema = tool_parameters_to_proto_schema(&v)
-            .expect("schema conversion")
-            .expect("schema");
-        let nickname = schema.properties.get("nickname").expect("nickname prop");
-
-        assert_eq!(nickname.r#type, proto::Type::String as i32);
-        assert!(nickname.nullable);
-    }
-
-    #[test]
-    fn tool_params_any_of_uses_non_null_schema() {
-        let v = serde_json::json!({
-            "anyOf": [
-                { "type": "null" },
-                {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string" }
-                    },
-                    "required": ["query"]
-                }
-            ]
-        });
-
-        let schema = tool_parameters_to_proto_schema(&v)
-            .expect("schema conversion")
-            .expect("schema");
-
-        assert_eq!(schema.r#type, proto::Type::Object as i32);
-        assert!(schema.nullable);
-        assert_eq!(schema.required, vec!["query".to_string()]);
-        assert_eq!(
-            schema.properties.get("query").expect("query prop").r#type,
-            proto::Type::String as i32
-        );
-    }
-
-    #[test]
-    fn tool_params_array_without_items_defaults_to_string_items() {
-        let v = serde_json::json!({ "type": "array" });
-
-        let schema = tool_parameters_to_proto_schema(&v)
-            .expect("schema conversion")
-            .expect("schema");
-
-        assert_eq!(schema.r#type, proto::Type::Array as i32);
-        assert_eq!(
-            schema.items.expect("items").r#type,
-            proto::Type::String as i32
-        );
-    }
-
-    #[test]
-    fn create_grpc_request_populates_tool_parameters() {
-        use rig_core::completion::ToolDefinition;
-
-        let tool = ToolDefinition {
-            name: "get_weather".to_string(),
-            description: "Look up the current weather for a city.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "city": { "type": "string", "description": "City name" }
-                },
-                "required": ["city"]
-            }),
-        };
-
-        let req = create_grpc_request(
-            "gemini-2.5-flash".to_string(),
-            CompletionRequest {
-                model: None,
-                preamble: None,
-                chat_history: OneOrMany::one(message::Message::user("forecast in Berlin?")),
-                documents: Vec::new(),
-                tools: vec![tool],
-                temperature: None,
-                max_tokens: None,
-                tool_choice: None,
-                additional_params: None,
-                output_schema: None,
-            },
-        )
-        .expect("request build");
-
-        assert_eq!(req.tools.len(), 1);
-        let tool = req.tools.first().expect("tool entry");
-        let decl = tool
-            .function_declarations
-            .first()
-            .expect("function declaration");
-        assert_eq!(decl.name, "get_weather");
-
-        // The regression in #1710 was `parameters: None` here.
-        let params = decl.parameters.as_ref().expect("parameters populated");
-        assert_eq!(params.r#type, proto::Type::Object as i32);
-        assert_eq!(params.required, vec!["city".to_string()]);
-        assert!(params.properties.contains_key("city"));
-    }
-}
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing
+)]
+pub(crate) mod tests;

@@ -1,10 +1,9 @@
-use rig_core::client::{EmbeddingsClient, ProviderClient};
 use rig_core::providers::openai;
 use rig_core::vector_store::request::VectorSearchRequest;
 use rig_core::{
     Embed,
     embeddings::EmbeddingsBuilder,
-    providers::openai::Client,
+    providers::openai::OpenAI,
     vector_store::{InsertDocuments, VectorStoreIndex},
 };
 use rig_sqlite::{
@@ -59,8 +58,8 @@ async fn main() -> Result<(), anyhow::Error> {
         )
         .init();
 
-    // Initialize OpenAI client
-    let openai_client = Client::from_env()?;
+    // The OpenAI client, from `OPENAI_API_KEY`.
+    let openai_client = OpenAI::from_env()?;
 
     // Initialize the `sqlite-vec`extension
     // See: https://alexgarcia.xyz/sqlite-vec/rust.html
@@ -74,7 +73,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let conn = Connection::open("vector_store.db").await?;
 
     // Select the embedding model and generate our embeddings
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_ADA_002, None)
+        .erase();
 
     let documents = vec![
         Document {
@@ -97,8 +98,12 @@ async fn main() -> Result<(), anyhow::Error> {
         .await?;
 
     // Initialize SQLite vector store
-    let vector_store: SqliteVectorStore<_, Document> =
-        SqliteVectorStore::with_distance_metric(conn, &model, SqliteDistanceMetric::Cosine).await?;
+    let vector_store: SqliteVectorStore<Document> = SqliteVectorStore::with_distance_metric(
+        conn,
+        model.capabilities().ndims,
+        SqliteDistanceMetric::Cosine,
+    )
+    .await?;
 
     // Add embeddings to vector store
     vector_store.insert_documents(embeddings).await?;

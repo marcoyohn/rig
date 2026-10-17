@@ -1,14 +1,11 @@
 //! Moonshot reasoning-history roundtrip smoke test.
-
-use rig::OneOrMany;
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::CompletionModel;
 use rig::message::{AssistantContent, Message, Reasoning};
 use rig::providers::moonshot;
 
 use crate::support::{assert_contains_any_case_insensitive, assert_nonempty_response};
+use rig::completion::CompletionRequest;
 
-fn response_text(choice: &rig::OneOrMany<AssistantContent>) -> String {
+fn response_text(choice: &[AssistantContent]) -> String {
     choice
         .iter()
         .filter_map(|content| match content {
@@ -21,25 +18,19 @@ fn response_text(choice: &rig::OneOrMany<AssistantContent>) -> String {
 #[tokio::test]
 #[ignore = "requires MOONSHOT_API_KEY"]
 async fn assistant_reasoning_content_roundtrips_in_history() {
-    let model = moonshot::Client::from_env()
-        .expect("moonshot client should build")
-        .completion_model(moonshot::KIMI_K2_5);
-    let assistant = Message::Assistant {
-        id: None,
-        content: OneOrMany::many(vec![
-            AssistantContent::Reasoning(Reasoning::new("Remember the chosen color.")),
-            AssistantContent::text("Understood. I will remember teal."),
-        ])
-        .expect("assistant content"),
-    };
+    let model = moonshot::from_env()
+        .expect("MOONSHOT_API_KEY should be set")
+        .completion(moonshot::KIMI_K3);
+    let assistant = Message::Assistant(rig::message::AssistantMessage::new(vec![
+        AssistantContent::Reasoning(Reasoning::new("Remember the chosen color.")),
+        AssistantContent::text("Understood. I will remember teal."),
+    ]));
 
     let response = model
-        .completion(
-            model
-                .completion_request("What color was I asked to remember? Reply with one word.")
+        .call(
+            CompletionRequest::new("What color was I asked to remember? Reply with one word.")
                 .message(Message::user("Remember the secret color is teal."))
-                .message(assistant)
-                .build(),
+                .message(assistant),
         )
         .await
         .expect("reasoning-history completion should succeed");

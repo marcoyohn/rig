@@ -1,11 +1,6 @@
-#![allow(
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::unwrap_used,
-    clippy::unreachable
-)]
-
+use crate::common::{
+    WORD_DEFINITIONS, axis_embedding, mock_embeddings, openai_client, skip_if_docker_unavailable,
+};
 use futures::StreamExt;
 use mongodb::{
     Collection, SearchIndexModel,
@@ -13,13 +8,15 @@ use mongodb::{
     options::ClientOptions,
 };
 use rig::mongodb::{MongoDbVectorIndex, SearchParams};
+use rig::vector_store::VectorSearchResult;
+use rig::vector_store::request::VectorSearchRequest;
 use rig::{
     Embed,
+    driver::Model,
     embeddings::EmbeddingsBuilder,
     providers::openai,
     vector_store::{InsertDocuments, VectorStoreIndex},
 };
-use rig::{client::EmbeddingsClient, vector_store::request::VectorSearchRequest};
 use serde_json::json;
 use testcontainers::{
     GenericImage, ImageExt,
@@ -38,28 +35,15 @@ struct Word {
 
 const VECTOR_SEARCH_INDEX_NAME: &str = "vector_index";
 const MONGODB_PORT: u16 = 27017;
+// Pinned like `pgvector:pg17` / `scylla:5.4`: a floating `latest` defeats
+// layer caching and lets a rerun silently test a different database version.
+const MONGODB_IMAGE: &str = "mongodb/mongodb-atlas-local";
+const MONGODB_TAG: &str = "8.0.5";
 const COLLECTION_NAME: &str = "words";
 const DATABASE_NAME: &str = "rig";
 const USERNAME: &str = "riguser";
 const PASSWORD: &str = "rigpassword";
-const EMBEDDING_DIMENSIONS: usize = 1536;
 const VECTOR_SEARCH_MAX_ATTEMPTS: usize = 5;
-
-fn axis_embedding(axis: usize) -> Vec<f64> {
-    let mut embedding = vec![0.0; EMBEDDING_DIMENSIONS];
-    embedding[axis] = 1.0;
-    embedding
-}
-
-fn skip_if_docker_unavailable(test_name: &str) -> bool {
-    let docker_socket = std::path::Path::new("/var/run/docker.sock");
-    if std::env::var_os("DOCKER_HOST").is_some() || docker_socket.exists() {
-        return false;
-    }
-
-    eprintln!("skipping {test_name}: Docker is unavailable");
-    true
-}
 
 #[tokio::test]
 async fn vector_search_test() {
@@ -70,89 +54,24 @@ async fn vector_search_test() {
     // Setup mock openai API
     let server = httpmock::MockServer::start();
 
-    server.mock(|when, then| {
-        when.method(httpmock::Method::POST)
-            .path("/embeddings")
-            .header("Authorization", "Bearer TEST")
-            .json_body(json!({
-                "input": [
-                    "Definition of a *flurbo*: A flurbo is a green alien that lives on cold planets",
-                    "Definition of a *glarb-glarb*: A glarb-glarb is an ancient tool used by the ancestors of the inhabitants of planet Jiro to farm the land.",
-                    "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans."
-                ],
-                "model": "text-embedding-ada-002",
-            }));
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!({
-                "object": "list",
-                "data": [
-                  {
-                    "object": "embedding",
-                    "embedding": axis_embedding(0),
-                    "index": 0
-                  },
-                  {
-                    "object": "embedding",
-                    "embedding": axis_embedding(1),
-                    "index": 1
-                  },
-                  {
-                    "object": "embedding",
-                    "embedding": axis_embedding(2),
-                    "index": 2
-                  }
-                ],
-                "model": "text-embedding-ada-002",
-                "usage": {
-                  "prompt_tokens": 8,
-                  "total_tokens": 8
-                }
-            }
-        ));
-    });
-    server.mock(|when, then| {
-        when.method(httpmock::Method::POST)
-            .path("/embeddings")
-            .header("Authorization", "Bearer TEST")
-            .json_body(json!({
-                "input": [
-                    "What is a linglingdong?"
-                ],
-                "model": "text-embedding-ada-002",
-            }));
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!({
-                    "object": "list",
-                    "data": [
-                      {
-                        "object": "embedding",
-                        "embedding": axis_embedding(2),
-                        "index": 0
-                      }
-                    ],
-                    "model": "text-embedding-ada-002",
-                    "usage": {
-                      "prompt_tokens": 8,
-                      "total_tokens": 8
-                    }
-                }
-            ));
-    });
+    mock_embeddings(
+        &server,
+        json!({ "input": WORD_DEFINITIONS, "model": "text-embedding-ada-002" }),
+        (0..3).map(axis_embedding),
+    );
+    mock_embeddings(
+        &server,
+        json!({ "input": ["What is a linglingdong?"], "model": "text-embedding-ada-002" }),
+        [axis_embedding(2)],
+    );
 
-    // Initialize OpenAI client
-    let openai_client = openai::Client::builder()
-        .api_key("TEST")
-        .base_url(server.base_url())
-        .build()
-        .unwrap();
+    let openai_client = openai_client(&server);
 
     // Select the embedding model and generate our embeddings
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let model = openai_client.embedding(openai::TEXT_EMBEDDING_ADA_002, None);
 
     // Setup a local MongoDB Atlas container for testing. NOTE: docker service must be running.
-    let container = GenericImage::new("mongodb/mongodb-atlas-local", "latest")
+    let container = GenericImage::new(MONGODB_IMAGE, MONGODB_TAG)
         .with_exposed_port(MONGODB_PORT.tcp())
         .with_wait_for(WaitFor::Duration {
             length: std::time::Duration::from_secs(5),
@@ -197,12 +116,12 @@ async fn vector_search_test() {
             Ok(search_results) => {
                 observed_results = search_results
                     .iter()
-                    .map(|(_, _, value)| value.clone())
+                    .map(|result| result.document.clone())
                     .collect();
 
                 if search_results
                     .first()
-                    .and_then(|(_, _, value)| value.get("_id"))
+                    .and_then(|result| result.document.get("_id"))
                     == Some(&json!("doc2"))
                 {
                     results = search_results;
@@ -223,7 +142,11 @@ async fn vector_search_test() {
         "expected doc2 to be the top vector search result after {VECTOR_SEARCH_MAX_ATTEMPTS} attempts; observed results: {observed_results:?}"
     );
 
-    let (score, _, value) = &results.first().unwrap();
+    let VectorSearchResult {
+        score,
+        document: value,
+        ..
+    } = &results.first().unwrap();
 
     assert_eq!(
         *value,
@@ -232,7 +155,7 @@ async fn vector_search_test() {
             "definition": "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans.".to_string(),
             "score": score
         })
-    )
+    );
 }
 
 #[tokio::test]
@@ -244,52 +167,21 @@ async fn insert_documents_test() {
     // Setup mock openai API
     let server = httpmock::MockServer::start();
 
-    server.mock(|when, then| {
-        when.method(httpmock::Method::POST)
-            .path("/embeddings")
-            .header("Authorization", "Bearer TEST")
-            .json_body(json!({
-                "input": [
-                    "Test document 1",
-                    "Test document 2"
-                ],
-                "model": "text-embedding-ada-002",
-            }));
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!({
-                "object": "list",
-                "data": [
-                  {
-                    "object": "embedding",
-                    "embedding": vec![0.1; 1536],
-                    "index": 0
-                  },
-                  {
-                    "object": "embedding",
-                    "embedding": vec![0.2; 1536],
-                    "index": 1
-                  }
-                ],
-                "model": "text-embedding-ada-002",
-                "usage": {
-                  "prompt_tokens": 4,
-                  "total_tokens": 4
-                }
-            }));
-    });
+    mock_embeddings(
+        &server,
+        json!({
+            "input": ["Test document 1", "Test document 2"],
+            "model": "text-embedding-ada-002",
+        }),
+        [vec![0.1; 1536], vec![0.2; 1536]],
+    );
 
-    // Initialize OpenAI client
-    let openai_client = openai::Client::builder()
-        .api_key("TEST")
-        .base_url(server.base_url())
-        .build()
-        .unwrap();
+    let openai_client = openai_client(&server);
 
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let model = openai_client.embedding(openai::TEXT_EMBEDDING_ADA_002, None);
 
     // Setup MongoDB container
-    let container = GenericImage::new("mongodb/mongodb-atlas-local", "latest")
+    let container = GenericImage::new(MONGODB_IMAGE, MONGODB_TAG)
         .with_exposed_port(MONGODB_PORT.tcp())
         .with_wait_for(WaitFor::Duration {
             length: std::time::Duration::from_secs(5),
@@ -316,7 +208,7 @@ async fn insert_documents_test() {
         },
     ];
 
-    // Generate embeddings using EmbeddingsBuilder (returns Vec<(Word, OneOrMany<Embedding>)>)
+    // Generate embeddings using EmbeddingsBuilder (returns Vec<(Word, Vec<Embedding>)>)
     let documents_with_embeddings = EmbeddingsBuilder::new(model.clone())
         .documents(test_words)
         .unwrap()
@@ -418,16 +310,13 @@ async fn create_search_index(collection: &Collection<bson::Document>) {
                         .await;
 
                     if indexes.iter().any(|idx| {
-                        idx.as_ref()
-                            .ok()
-                            .map(|i| {
-                                // Check both name and status
-                                let name_matches =
-                                    i.get_str("name").ok() == Some(VECTOR_SEARCH_INDEX_NAME);
-                                let status_ready = i.get_str("status").ok() == Some("READY");
-                                name_matches && status_ready
-                            })
-                            .unwrap_or(false)
+                        idx.as_ref().ok().is_some_and(|i| {
+                            // Check both name and status
+                            let name_matches =
+                                i.get_str("name").ok() == Some(VECTOR_SEARCH_INDEX_NAME);
+                            let status_ready = i.get_str("status").ok() == Some("READY");
+                            name_matches && status_ready
+                        })
                     }) {
                         return;
                     }
@@ -477,21 +366,14 @@ async fn bootstrap_collection(host: String, port: u16) -> Collection<bson::Docum
     collection
 }
 
-async fn create_embeddings(model: openai::EmbeddingModel) -> Vec<bson::Document> {
-    let words = vec![
-        Word {
-            id: "doc0".to_string(),
-            definition: "Definition of a *flurbo*: A flurbo is a green alien that lives on cold planets".to_string(),
-        },
-        Word {
-            id: "doc1".to_string(),
-            definition: "Definition of a *glarb-glarb*: A glarb-glarb is an ancient tool used by the ancestors of the inhabitants of planet Jiro to farm the land.".to_string(),
-        },
-        Word {
-            id: "doc2".to_string(),
-            definition: "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans.".to_string(),
-        }
-    ];
+async fn create_embeddings(model: Model<openai::wire::Embeddings>) -> Vec<bson::Document> {
+    let words = WORD_DEFINITIONS
+        .iter()
+        .enumerate()
+        .map(|(i, definition)| Word {
+            id: format!("doc{i}"),
+            definition: definition.to_string(),
+        });
 
     let embeddings = EmbeddingsBuilder::new(model)
         .documents(words)
@@ -502,11 +384,12 @@ async fn create_embeddings(model: openai::EmbeddingModel) -> Vec<bson::Document>
 
     embeddings
         .iter()
-        .map(|(Word { id, definition, .. }, embedding)| {
+        .map(|(Word { id, definition, .. }, embeddings)| {
+            let embedding = embeddings.first().expect("expected at least one embedding");
             doc! {
                 "_id": id.clone(),
                 "definition": definition.clone(),
-                "embedding": embedding.first().vec.clone(),
+                "embedding": embedding.vec.clone(),
             }
         })
         .collect()

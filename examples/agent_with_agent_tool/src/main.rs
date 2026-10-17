@@ -1,10 +1,7 @@
 use anyhow::Result;
 use rig::prelude::*;
-use rig::{
-    completion::{Prompt, ToolDefinition},
-    providers,
-    tool::Tool,
-};
+use rig::providers::openai::OpenAI;
+use rig::{providers, tool::Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -26,28 +23,32 @@ impl Tool for Adder {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "add".to_string(),
-            description: "Add x and y together".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The first number to add"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The second number to add"
-                    }
-                },
-                "required": ["x", "y"],
-            }),
-        }
+    fn description(&self) -> String {
+        "Add x and y together".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The first number to add"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The second number to add"
+                }
+            },
+            "required": ["x", "y"],
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         println!("[tool-call] Adding {} and {}", args.x, args.y);
         let result = args.x + args.y;
         Ok(result)
@@ -63,28 +64,32 @@ impl Tool for Subtract {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "subtract".to_string(),
-            description: "Subtract y from x (i.e.: x - y)".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The number to subtract from"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The number to subtract"
-                    }
-                },
-                "required": ["x", "y"],
-            }),
-        }
+    fn description(&self) -> String {
+        "Subtract y from x (i.e.: x - y)".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The number to subtract from"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The number to subtract"
+                }
+            },
+            "required": ["x", "y"],
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         println!("[tool-call] Subtracting {} from {}", args.y, args.x);
         let result = args.x - args.y;
         Ok(result)
@@ -98,24 +103,27 @@ async fn main() -> Result<(), anyhow::Error> {
         .with_target(false)
         .init();
 
-    // Create OpenAI client
-    let openai_client = providers::openai::Client::from_env()?;
+    // The OpenAI client, from `OPENAI_API_KEY`.
+    let openai_client = OpenAI::from_env()?;
+
+    // One model serves both agents: erase it once, clone the handle.
+    let model = openai_client.completion(providers::openai::GPT_4O).erase();
 
     // Create agent with a single context prompt and two tools
-    let calculator_agent = openai_client
-        .agent(providers::openai::GPT_4O)
+    let calculator_agent = AgentBuilder::new(model.clone())
         .preamble("You are a calculator here to help the user perform arithmetic operations. Use the tools provided to answer the user's question.")
         .max_tokens(1024)
+        .default_max_turns(2)
         .tool(Adder)
         .tool(Subtract)
         .build();
 
     // Create agent which has the calculator_agent as a tool
-    let agent_using_agent = openai_client
-        .agent(providers::openai::GPT_4O)
+    let agent_using_agent = AgentBuilder::new(model)
         .preamble("You are a helpful assistant that can solve problems. Use the tool provided to answer the user's question.")
         .max_tokens(1024)
-        .tool(calculator_agent)
+        .default_max_turns(2)
+        .dynamic_tool(calculator_agent.into_tool()?)
         .build();
 
     // Prompt the agent and print the response
@@ -123,7 +131,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     println!(
         "OpenAI Agent-Using Agent: {}",
-        agent_using_agent.prompt("Calculate 2 - 5").await?
+        agent_using_agent.prompt("Calculate 2 - 5").await?.output()
     );
 
     Ok(())

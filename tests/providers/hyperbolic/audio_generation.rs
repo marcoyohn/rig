@@ -1,23 +1,18 @@
 //! Hyperbolic audio generation smoke test.
 
-use rig::audio_generation::AudioGenerationModel;
-use rig::client::ProviderClient;
-use rig::client::audio_generation::AudioGenerationClient;
 use rig::providers::hyperbolic;
 
 use crate::support::{AUDIO_TEXT, assert_nonempty_bytes};
+use rig::audio_generation::AudioGenerationRequestBuilder;
 
 #[tokio::test]
 #[ignore = "requires HYPERBOLIC_API_KEY"]
 async fn audio_generation_smoke() {
-    let client = hyperbolic::Client::from_env().expect("client should build");
-    let model = client.audio_generation_model("EN");
+    let provider = hyperbolic::from_env().expect("config should build from env");
+    let model = provider.audio_generation("EN");
 
     let response = model
-        .audio_generation_request()
-        .text(AUDIO_TEXT)
-        .voice("EN-US")
-        .send()
+        .call(AudioGenerationRequestBuilder::new(AUDIO_TEXT, "EN-US").build())
         .await
         .expect("audio generation should succeed");
 

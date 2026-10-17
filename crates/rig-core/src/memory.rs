@@ -1,33 +1,24 @@
-//! Conversation memory: Rig-managed persistent conversation history for agents.
-//!
-//! Memory differs from existing agent context features:
-//! - [`crate::agent::AgentBuilder::context`]: static documents always included in prompts.
-//! - [`crate::agent::AgentBuilder::dynamic_context`]: RAG documents fetched from a vector store.
-//! - [`crate::agent::prompt_request::PromptRequest::with_history`]: caller-managed message history.
-//! - **Memory** (this module): Rig-managed history loaded and saved automatically per
-//!   conversation id.
-//!
-//! # Example
+//! Conversation history storage, filtering, and compaction interfaces.
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! use rig_core::client::{CompletionClient, ProviderClient};
-//! use rig_core::completion::Prompt;
-//! use rig_core::memory::InMemoryConversationMemory;
-//! use rig_core::providers::openai;
+//! use rig_core::{
+//!     completion::Message,
+//!     memory::{ConversationMemory, InMemoryConversationMemory},
+//! };
 //!
 //! let memory = InMemoryConversationMemory::new();
-//!
-//! let openai = openai::Client::from_env()?;
-//! let agent = openai.agent("gpt-4o").memory(memory).build();
-//!
-//! agent.prompt("My name is Alice.")
-//!     .conversation("thread-1")
+//! memory
+//!     .append(
+//!         &"thread-1".into(),
+//!         vec![
+//!             Message::user("My name is Alice."),
+//!             Message::assistant("Hello, Alice!"),
+//!         ],
+//!     )
 //!     .await?;
-//!
-//! let answer = agent.prompt("What's my name?")
-//!     .conversation("thread-1")
-//!     .await?;
+//! let history = memory.load(&"thread-1".into()).await?;
+//! assert_eq!(history.len(), 2);
 //! # Ok(()) }
 //! ```
 //!
@@ -40,6 +31,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::id::ConversationId;
 use crate::{
     completion::Message,
     wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync},
@@ -55,11 +47,10 @@ pub type MemoryBackendError = Box<dyn std::error::Error + 'static>;
 
 /// Errors produced by a [`ConversationMemory`] backend.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum MemoryError {
     /// The backing store failed to load, append, or clear messages.
     #[error("Memory backend error: {0}")]
-    Backend(MemoryBackendError),
+    Backend(#[source] MemoryBackendError),
 
     /// A history-shaping filter or policy rejected the loaded history.
     #[error("Memory policy error: {0}")]
@@ -85,18 +76,20 @@ impl MemoryError {
 /// A persistent conversation history backend.
 ///
 /// Implementors store an ordered list of [`Message`]s per `conversation_id`. Rig
-/// invokes [`ConversationMemory::load`] before sending a prompt and
-/// [`ConversationMemory::append`] after a successful turn.
+/// runtimes invoke [`ConversationMemory::load`] before sending a prompt and
+/// [`ConversationMemory::append`] after a successful run.
 ///
-/// Implementations should keep `append` cheap; it runs inline before the agent
-/// returns its response.
+/// Appends run inline before the agent returns its response. Load failures
+/// prevent model calls; append failures are reported alongside the successful
+/// answer without retry. Writes are not transactional or exactly-once: an
+/// error may occur after the backend has persisted messages.
 pub trait ConversationMemory: WasmCompatSend + WasmCompatSync {
     /// Load the full conversation history for `conversation_id`.
     ///
     /// Returns an empty `Vec` if the conversation has no stored messages.
     fn load<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
     ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>>;
 
     /// Append `messages` to the conversation identified by `conversation_id`.
@@ -105,70 +98,80 @@ pub trait ConversationMemory: WasmCompatSend + WasmCompatSync {
     /// response, and any tool-call/tool-result pairs that occurred during the turn.
     fn append<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
         messages: Vec<Message>,
     ) -> WasmBoxedFuture<'a, Result<(), MemoryError>>;
 
     /// Remove all stored messages for `conversation_id`.
     fn clear<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
     ) -> WasmBoxedFuture<'a, Result<(), MemoryError>>;
 }
 
-impl<M> ConversationMemory for Arc<M>
-where
-    M: ConversationMemory + ?Sized,
-{
-    fn load<'a>(
-        &'a self,
-        conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
-        (**self).load(conversation_id)
-    }
+macro_rules! forward_memory_trait {
+    (ConversationMemory: $($ptr:ident)+) => {$(
+        impl<M> ConversationMemory for $ptr<M>
+        where
+            M: ConversationMemory + ?Sized,
+        {
+            fn load<'a>(
+                &'a self,
+                conversation_id: &'a ConversationId,
+            ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
+                (**self).load(conversation_id)
+            }
 
-    fn append<'a>(
-        &'a self,
-        conversation_id: &'a str,
-        messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
-        (**self).append(conversation_id, messages)
-    }
+            fn append<'a>(
+                &'a self,
+                conversation_id: &'a ConversationId,
+                messages: Vec<Message>,
+            ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+                (**self).append(conversation_id, messages)
+            }
 
-    fn clear<'a>(
-        &'a self,
-        conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
-        (**self).clear(conversation_id)
-    }
+            fn clear<'a>(
+                &'a self,
+                conversation_id: &'a ConversationId,
+            ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+                (**self).clear(conversation_id)
+            }
+        }
+    )+};
+    (DemotionHook: $($ptr:ident)+) => {$(
+        impl<H> DemotionHook for $ptr<H>
+        where
+            H: DemotionHook + ?Sized,
+        {
+            fn on_demote<'a>(
+                &'a self,
+                conversation_id: &'a ConversationId,
+                messages: Vec<Message>,
+            ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+                (**self).on_demote(conversation_id, messages)
+            }
+        }
+    )+};
+    (Compactor: $($ptr:ident)+) => {$(
+        impl<C> Compactor for $ptr<C>
+        where
+            C: Compactor + ?Sized,
+        {
+            type Artifact = C::Artifact;
+
+            fn compact<'a>(
+                &'a self,
+                conversation_id: &'a ConversationId,
+                evicted: &'a [Message],
+                carry_over: Option<&'a Self::Artifact>,
+            ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+                (**self).compact(conversation_id, evicted, carry_over)
+            }
+        }
+    )+};
 }
 
-impl<M> ConversationMemory for Box<M>
-where
-    M: ConversationMemory + ?Sized,
-{
-    fn load<'a>(
-        &'a self,
-        conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
-        (**self).load(conversation_id)
-    }
-
-    fn append<'a>(
-        &'a self,
-        conversation_id: &'a str,
-        messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
-        (**self).append(conversation_id, messages)
-    }
-
-    fn clear<'a>(
-        &'a self,
-        conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
-        (**self).clear(conversation_id)
-    }
-}
+forward_memory_trait!(ConversationMemory: Arc Box);
 
 /// A history-shaping closure applied during [`InMemoryConversationMemory::load`].
 ///
@@ -185,38 +188,13 @@ impl<F> MessageFilter for F where
 {
 }
 
-/// A side-channel for messages that a memory policy or adapter removes from
-/// active history during [`ConversationMemory::load`].
+/// Receives messages removed from active history during [`ConversationMemory::load`].
+/// Hooks are awaited inline, so their latency delays the next turn.
 ///
-/// Truncating policies (sliding window, token budget, …) drop older turns
-/// once their limit is exceeded. Without a hook those messages are silently
-/// lost. A [`DemotionHook`] receives the demoted messages and can persist
-/// them into a long-tail store (semantic memory, episodic recall, archival
-/// storage, …), turning truncation into demotion.
-///
-/// The trait is defined here in `rig-core` so that *any* memory backend
-/// (in-memory, vector store, file archive, …) can implement it without
-/// taking on a `rig-memory` dependency. The composing adapter that actually
-/// wires a [`ConversationMemory`] backend, a policy, and a hook together
-/// lives in the `rig-memory` companion crate.
-///
-/// Hooks should be inexpensive: their future is awaited inline on every
-/// `load` that produces demoted messages, so a slow hook delays the agent's
-/// next turn. Offload heavy I/O (network writes, disk fsyncs, …) to a
-/// background task or a buffered channel inside the implementation.
-///
-/// # Idempotency contract
-///
-/// Implementations **must** be idempotent on the
-/// `(conversation_id, messages)` pair. Composing adapters such as the
-/// `DemotingPolicyMemory` in `rig-memory` track in-process delivery
-/// watermarks to avoid replaying the same demotion within a single
-/// process lifetime, but those watermarks are not persisted: across
-/// process restarts (or when a new adapter is constructed over an
-/// existing backend) the hook will receive previously-delivered
-/// messages again. Hooks that append to durable storage should
-/// deduplicate by content hash, by `(conversation_id, message_id)`,
-/// or by an equivalent stable key.
+/// Implementations must be idempotent on `(conversation_id, messages)`.
+/// Adapter delivery watermarks are not persisted; restarts or newly constructed
+/// adapters may redeliver messages. Durable hooks should deduplicate with a
+/// stable key such as a conversation ID and content hash.
 pub trait DemotionHook: WasmCompatSend + WasmCompatSync {
     /// Receive `messages` that were demoted out of the active window for
     /// `conversation_id`.
@@ -225,7 +203,7 @@ pub trait DemotionHook: WasmCompatSend + WasmCompatSync {
     /// as [`MemoryError::Backend`] by the composing adapter.
     fn on_demote<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
         messages: Vec<Message>,
     ) -> WasmBoxedFuture<'a, Result<(), MemoryError>>;
 }
@@ -238,68 +216,27 @@ pub struct NoopDemotionHook;
 impl DemotionHook for NoopDemotionHook {
     fn on_demote<'a>(
         &'a self,
-        _conversation_id: &'a str,
+        _conversation_id: &'a ConversationId,
         _messages: Vec<Message>,
     ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
         Box::pin(async move { Ok(()) })
     }
 }
 
-/// Forwarding impl so callers can pass `Arc<H>` wherever a `DemotionHook`
-/// is expected (e.g. when sharing a single hook between multiple memory
-/// adapters).
-impl<H> DemotionHook for Arc<H>
-where
-    H: DemotionHook + ?Sized,
-{
-    fn on_demote<'a>(
-        &'a self,
-        conversation_id: &'a str,
-        messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
-        (**self).on_demote(conversation_id, messages)
-    }
-}
+forward_memory_trait!(DemotionHook: Arc);
 
-/// Derives a single [`Message`]-shaped artifact from a slice of messages
-/// that a memory policy has evicted from the active window.
+/// Derives an artifact from evicted messages for insertion before recent history.
+/// Compaction runs inline during loading and delays the next turn.
 ///
-/// Where a [`DemotionHook`] is a one-way drain — observe what fell out and
-/// return `()` — a `Compactor` is the inverse: it takes the evicted prefix
-/// (and optionally the previous summary) and produces a derived artifact
-/// that the composing adapter splices *back into* the active history. The
-/// resulting prompt is no longer a verbatim suffix of the conversation; it
-/// is `[summary, ...recent_window]`.
+/// `carry_over` contains the previous artifact, if any. Combine it with the
+/// evicted messages to preserve earlier context in a rolling summary, or ignore
+/// it to summarize only the newly evicted messages.
 ///
-/// Implementations typically wrap an LLM call (`LlmCompactor<M>`) or a
-/// pure template rollup. They run inline on the load path whenever the
-/// policy demotes new messages, so a slow compactor delays the agent's
-/// next turn — keep them fast or offload to a cached/background pipeline.
-///
-/// # Rolling summaries
-///
-/// `carry_over` is the artifact produced by the previous compaction for
-/// this conversation, if any. Implementations that want a *recursive*
-/// summary (the canonical pattern for long-running agents) should
-/// summarize `evicted` *together with* `carry_over` so context lost in
-/// earlier compactions is preserved transitively. Stateless implementations
-/// can ignore `carry_over` and produce a fresh summary of `evicted` alone.
-///
-/// # Idempotency contract
-///
-/// Composing adapters track per-conversation in-process delivery so the
-/// same `evicted` slice is not compacted twice within a process lifetime,
-/// but those watermarks are not persisted across restarts. Implementations
-/// that have side effects (writing summaries to a vector store, billing an
-/// LLM call) should deduplicate by conversation id and content hash, the
-/// same way [`DemotionHook`] implementations do.
+/// Delivery watermarks are not persisted across restarts. Implementations with
+/// side effects should deduplicate by conversation ID and content hash.
 pub trait Compactor: WasmCompatSend + WasmCompatSync {
-    /// The summary value produced by [`Compactor::compact`].
-    ///
-    /// `Into<Message>` is required so the composing adapter can splice the
-    /// artifact at the front of the loaded history. `Clone` is required so
-    /// the adapter can keep a private copy as `carry_over` for the next
-    /// compaction.
+    /// Summary convertible to a history message and clonable for the next
+    /// compaction's `carry_over`.
     type Artifact: Into<Message> + Clone + WasmCompatSend + WasmCompatSync + 'static;
 
     /// Produce a summary artifact for `evicted`, optionally combining it
@@ -313,29 +250,13 @@ pub trait Compactor: WasmCompatSend + WasmCompatSync {
     /// variant.
     fn compact<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
         evicted: &'a [Message],
         carry_over: Option<&'a Self::Artifact>,
     ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>>;
 }
 
-/// Forwarding impl so callers can pass `Arc<C>` wherever a `Compactor` is
-/// expected (e.g. when sharing a single compactor across adapters).
-impl<C> Compactor for Arc<C>
-where
-    C: Compactor + ?Sized,
-{
-    type Artifact = C::Artifact;
-
-    fn compact<'a>(
-        &'a self,
-        conversation_id: &'a str,
-        evicted: &'a [Message],
-        carry_over: Option<&'a Self::Artifact>,
-    ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
-        (**self).compact(conversation_id, evicted, carry_over)
-    }
-}
+forward_memory_trait!(Compactor: Arc);
 
 /// A simple thread-safe in-memory [`ConversationMemory`] backed by a `HashMap`.
 ///
@@ -346,7 +267,7 @@ where
 /// Reusable named policies live in the `rig-memory` companion crate.
 #[derive(Clone, Default)]
 pub struct InMemoryConversationMemory {
-    inner: Arc<Mutex<HashMap<String, Vec<Message>>>>,
+    inner: Arc<Mutex<HashMap<ConversationId, Vec<Message>>>>,
     filter: Option<Arc<dyn MessageFilter>>,
 }
 
@@ -356,11 +277,8 @@ impl InMemoryConversationMemory {
         Self::default()
     }
 
-    /// Apply `filter` to the loaded message list on every `load`.
-    ///
-    /// The filter runs after raw messages are read from the store and before
-    /// they are returned to the agent. Use it for truncation, summarization, or
-    /// any other shaping. For reusable named policies, depend on `rig-memory`.
+    /// Replaces the filter applied to each loaded history after releasing the
+    /// store lock. Filtering does not modify stored messages.
     pub fn with_filter<F>(mut self, filter: F) -> Self
     where
         F: MessageFilter + 'static,
@@ -371,7 +289,7 @@ impl InMemoryConversationMemory {
 
     fn lock(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, HashMap<String, Vec<Message>>>, MemoryError> {
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<ConversationId, Vec<Message>>>, MemoryError> {
         self.inner
             .lock()
             .map_err(|e| MemoryError::Internal(e.to_string()))
@@ -389,7 +307,7 @@ impl std::fmt::Debug for InMemoryConversationMemory {
 impl ConversationMemory for InMemoryConversationMemory {
     fn load<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
     ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
         Box::pin(async move {
             let messages = {
@@ -405,13 +323,13 @@ impl ConversationMemory for InMemoryConversationMemory {
 
     fn append<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
         messages: Vec<Message>,
     ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
         Box::pin(async move {
             let mut guard = self.lock()?;
             guard
-                .entry(conversation_id.to_string())
+                .entry(conversation_id.clone())
                 .or_default()
                 .extend(messages);
             Ok(())
@@ -420,7 +338,7 @@ impl ConversationMemory for InMemoryConversationMemory {
 
     fn clear<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
     ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
         Box::pin(async move {
             let mut guard = self.lock()?;
@@ -431,85 +349,4 @@ impl ConversationMemory for InMemoryConversationMemory {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::completion::Message;
-
-    fn user(text: &str) -> Message {
-        Message::user(text)
-    }
-
-    fn assistant(text: &str) -> Message {
-        Message::assistant(text)
-    }
-
-    #[tokio::test]
-    async fn round_trip() {
-        let mem = InMemoryConversationMemory::new();
-        assert!(mem.load("c1").await.unwrap().is_empty());
-
-        mem.append("c1", vec![user("hello"), assistant("hi")])
-            .await
-            .unwrap();
-
-        let loaded = mem.load("c1").await.unwrap();
-        assert_eq!(loaded.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn isolation_between_conversations() {
-        let mem = InMemoryConversationMemory::new();
-        mem.append("a", vec![user("hi a")]).await.unwrap();
-        mem.append("b", vec![user("hi b")]).await.unwrap();
-
-        assert_eq!(mem.load("a").await.unwrap().len(), 1);
-        assert_eq!(mem.load("b").await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn clear_removes_history() {
-        let mem = InMemoryConversationMemory::new();
-        mem.append("c", vec![user("x")]).await.unwrap();
-        mem.clear("c").await.unwrap();
-        assert!(mem.load("c").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn with_filter_transforms_loaded_messages() {
-        let mem = InMemoryConversationMemory::new()
-            .with_filter(|msgs: Vec<Message>| msgs.into_iter().rev().take(2).collect());
-
-        mem.append(
-            "c",
-            vec![user("1"), assistant("2"), user("3"), assistant("4")],
-        )
-        .await
-        .unwrap();
-
-        let loaded = mem.load("c").await.unwrap();
-        assert_eq!(loaded.len(), 2, "filter should retain only 2 messages");
-    }
-
-    #[tokio::test]
-    async fn arc_conversation_memory_forwards_to_inner() {
-        let inner = Arc::new(InMemoryConversationMemory::new());
-        let mem: Arc<dyn ConversationMemory> = inner.clone();
-
-        mem.append("c", vec![user("hello")]).await.unwrap();
-
-        assert_eq!(inner.load("c").await.unwrap().len(), 1);
-        mem.clear("c").await.unwrap();
-        assert!(inner.load("c").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn boxed_conversation_memory_forwards_to_inner() {
-        let mem: Box<dyn ConversationMemory> = Box::new(InMemoryConversationMemory::new());
-
-        mem.append("c", vec![user("hello")]).await.unwrap();
-
-        assert_eq!(mem.load("c").await.unwrap().len(), 1);
-        mem.clear("c").await.unwrap();
-        assert!(mem.load("c").await.unwrap().is_empty());
-    }
-}
+mod tests;

@@ -1,7 +1,5 @@
 //! Moonshot context smoke test.
 
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::Prompt;
 use rig::providers::moonshot;
 
 use crate::support::{CONTEXT_DOCS, CONTEXT_PROMPT, assert_contains_any_case_insensitive};
@@ -9,19 +7,21 @@ use crate::support::{CONTEXT_DOCS, CONTEXT_PROMPT, assert_contains_any_case_inse
 #[tokio::test]
 #[ignore = "requires MOONSHOT_API_KEY"]
 async fn context_smoke() {
-    let client = moonshot::Client::from_env().expect("moonshot client should build");
+    let client = moonshot::from_env().expect("MOONSHOT_API_KEY should be set");
     let agent = CONTEXT_DOCS
         .iter()
         .copied()
-        .fold(client.agent(moonshot::MOONSHOT_CHAT), |builder, doc| {
-            builder.context(doc)
-        })
+        .fold(
+            rig::AgentBuilder::new(client.completion(moonshot::KIMI_K3)),
+            |builder, doc| builder.context(doc),
+        )
         .build();
 
     let response = agent
         .prompt(CONTEXT_PROMPT)
         .await
-        .expect("context prompt should succeed");
+        .expect("context prompt should succeed")
+        .output();
 
     assert_contains_any_case_insensitive(
         &response,

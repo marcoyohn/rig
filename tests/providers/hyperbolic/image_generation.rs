@@ -1,24 +1,23 @@
 //! Hyperbolic image generation smoke test.
 
-use rig::client::ProviderClient;
-use rig::client::image_generation::ImageGenerationClient;
-use rig::image_generation::ImageGenerationModel;
 use rig::providers::hyperbolic;
 
 use crate::support::{IMAGE_PROMPT, assert_nonempty_bytes};
+use rig::image_generation::ImageGenerationRequestBuilder;
 
 #[tokio::test]
 #[ignore = "requires HYPERBOLIC_API_KEY"]
 async fn image_generation_smoke() {
-    let client = hyperbolic::Client::from_env().expect("client should build");
-    let model = client.image_generation_model(hyperbolic::SDXL_TURBO);
+    let provider = hyperbolic::from_env().expect("config should build from env");
+    let model = provider.image_generation(hyperbolic::SDXL_TURBO);
 
     let response = model
-        .image_generation_request()
-        .prompt(IMAGE_PROMPT)
-        .width(1024)
-        .height(1024)
-        .send()
+        .call(
+            ImageGenerationRequestBuilder::new(IMAGE_PROMPT)
+                .width(1024)
+                .height(1024)
+                .build(),
+        )
         .await
         .expect("image generation should succeed");
 

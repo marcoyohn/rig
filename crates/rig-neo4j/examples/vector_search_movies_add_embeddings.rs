@@ -8,7 +8,7 @@
 use std::env;
 
 use rig_core::{
-    providers::openai::{self, Client},
+    providers::openai::{self, OpenAI},
     vector_store::{
         VectorStoreIndex,
         request::{SearchFilter, VectorSearchRequest},
@@ -16,7 +16,6 @@ use rig_core::{
 };
 
 use neo4rs::*;
-use rig_core::client::EmbeddingsClient;
 use rig_neo4j::{Neo4jClient, ToBoltType, vector_index::IndexConfig};
 use serde::{Deserialize, Serialize};
 
@@ -35,9 +34,9 @@ const INDEX_NAME: &str = "moviePlots";
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Initialize OpenAI client
+    // The OpenAI client, from `OPENAI_API_KEY`.
     let openai_api_key = env::var("OPENAI_API_KEY")?;
-    let openai_client: Client = Client::new(&openai_api_key)?;
+    let openai_client = OpenAI::new(&openai_api_key);
 
     let neo4j_uri = env::var("NEO4J_URI")?;
     let neo4j_username = env::var("NEO4J_USERNAME")?;
@@ -101,11 +100,15 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Select the embedding model and generate our embeddings
-    let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let model = openai_client.embedding(openai::TEXT_EMBEDDING_ADA_002, None);
 
     // Since we are starting from scratch, we need to create the DB vector index
     neo4j_client
-        .create_vector_index(IndexConfig::new(INDEX_NAME), NODE_LABEL, &model)
+        .create_vector_index(
+            IndexConfig::new(INDEX_NAME),
+            NODE_LABEL,
+            model.capabilities().ndims,
+        )
         .await?;
 
     // ❗IMPORTANT: Reuse the same model that was used to generate the embeddings
@@ -123,11 +126,11 @@ async fn main() -> Result<(), anyhow::Error> {
         .top_n::<Movie>(req)
         .await?
         .into_iter()
-        .map(|(score, id, doc)| display::SearchResult {
-            title: doc.title,
-            id,
-            description: doc.plot,
-            score,
+        .map(|result| display::SearchResult {
+            title: result.document.title,
+            id: result.id,
+            description: result.document.plot,
+            score: result.score,
         })
         .collect::<Vec<_>>();
 

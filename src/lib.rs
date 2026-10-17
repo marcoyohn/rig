@@ -1,40 +1,200 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 //! Public facade for Rig.
 //!
-//! The `rig` crate is the user-facing entry point for Rig. It re-exports the
-//! full public API of `rig_core`, so core traits, builders, providers, tools,
-//! vector-store abstractions, and request/response types are available through
-//! `rig::...` paths.
+//! Re-exports `rig_core` at `rig::...` paths and, under the default `agent`
+//! feature, the runtime from `rig_agent` at `rig::agent`. `rig::tool` then
+//! carries the contextual tool API alongside the portable contracts, which are
+//! always available. `use rig::prelude::*;` brings in [`Model`], [`DynModel`]
+//! and the common agent types.
 //!
-//! # Companion integrations
-//!
-//! Companion provider and vector-store crates are exposed as feature-gated
-//! modules on this facade. Enable only the integrations your application uses:
+//! Companion provider and vector-store crates are feature-gated modules, named
+//! after their features wherever module naming allows:
 //!
 //! ```toml
 //! [dependencies]
-//! rig = { version = "0.36.0", features = ["lancedb", "fastembed"] }
+//! rig = { version = "*", features = ["lancedb", "fastembed"] }
 //! ```
 //!
-//! This enables modules such as `rig::lancedb` and `rig::fastembed`. Other
-//! companion integrations follow the same pattern, with feature names aligned to
-//! their facade module paths wherever Rust module naming allows it.
-//!
-//! # When to use `rig-core` directly
-//!
-//! Depend on the `rig-core` package directly when you only need the core Rig
-//! implementation crate, including provider abstractions, built-in core
-//! providers, tools, memory traits, and vector-store traits, without the root
-//! facade's companion integration feature surface.
+//! Depend on `rig-core` directly to skip this facade's companion integrations.
 
 pub use rig_core::*;
 
-/// Conversation memory APIs and optional memory policy helpers.
+/// The bundled `reqwest` transport (`rig-reqwest`). A provider client built
+/// with no transport named (`OpenAI::from_env()`) sends through its shared
+/// client; `with_http` puts a client on any other `HttpClientExt`.
+#[cfg(feature = "reqwest")]
+#[cfg_attr(docsrs, doc(cfg(feature = "reqwest")))]
+pub use rig_reqwest;
+
+/// The bundled `tokio-tungstenite` websocket backend (`rig-tungstenite`), on
+/// native targets. With the `websocket` feature,
+/// `model.responses_websocket().connect()` opens a session over it with no
+/// backend named; without it, rig has no websocket backend and a session is
+/// opened with `responses_websocket().connect_with(..)` and any
+/// [`rig_core::ws_client::WebSocketClientExt`] implementation.
+#[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+pub use rig_tungstenite;
+
+/// Provider clients, their configurations, and the models they build.
+pub mod providers {
+    pub use rig_core::providers::*;
+}
+
+/// Transport-agnostic HTTP contracts, plus the bundled reqwest transport type.
+pub mod http_client {
+    pub use rig_core::http_client::*;
+    #[cfg(feature = "reqwest")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "reqwest")))]
+    pub use rig_reqwest::ReqwestClient;
+}
+
+#[cfg(feature = "agent")]
+#[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
+pub use rig_agent::{Agent, AgentBuilder, AgentRun, AgentRunner, TypedPromptResponse};
+
+/// Direct access to the portable provider and data contracts.
+pub mod core {
+    pub use rig_core::*;
+}
+
+/// The classic runtime's effect bus (`rig_agent::bus`): the dispatcher,
+/// the registrar, the driver, the typed views. What a handler implements is
+/// `rig::core::serve`; the vocabulary is `rig::core::effect`. Effects
+/// without the classic agent are `rig-ecs`'s.
+#[cfg(feature = "agent")]
+#[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
+pub mod bus {
+    pub use rig_agent::bus::*;
+}
+
+/// Effect-log recording and replay; optional runtime and native HTTP integrations.
+#[cfg(feature = "cassette")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cassette")))]
+pub use rig_cassette as cassette;
+
+/// The sans-IO run layer of rig-agent (`rig_agent::run`): `AgentRun` and its
+/// step/turn types, the run's spec, request preparation, output policy and
+/// per-turn patch, its response and error types, the invalid-call decision
+/// data, the streamed-turn assembler and the loop-side transcript helpers.
+/// rig-core keeps only the message-model invariants (`rig::core::transcript`).
+#[cfg(feature = "agent")]
+#[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
+pub mod run {
+    pub use rig_agent::run::*;
+}
+
+/// Classic agent orchestration and lifecycle APIs.
+#[cfg(feature = "agent")]
+#[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
+pub mod agent {
+    pub use rig_agent::agent::*;
+
+    /// Contextual tools for the classic agent runtime.
+    pub mod tool {
+        pub use rig_agent::tool::*;
+    }
+}
+
+/// Environment handling for provider configurations.
+pub mod client {
+    pub use rig_core::client::*;
+}
+
+/// Low-level completion contracts plus the classic runtime's errors.
+pub mod completion {
+    #[cfg(feature = "agent")]
+    pub use rig_agent::completion::{PromptError, StructuredOutputError};
+    pub use rig_core::completion::*;
+}
+
+/// Classic typed extraction.
+#[cfg(feature = "agent")]
+#[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
+pub mod extractor {
+    pub use rig_agent::extractor::*;
+}
+
+/// Classic runtime integrations.
+#[cfg(feature = "agent")]
+#[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
+pub mod integrations {
+    pub use rig_agent::integrations::*;
+}
+
+/// Common portable imports plus additive classic-runtime conveniences.
+pub mod prelude {
+    // The contextual `Tool` and its mutable `ToolContext`.
+    #[cfg(feature = "agent")]
+    pub use crate::tool::{Tool, ToolContext};
+    #[cfg(feature = "agent")]
+    pub use rig_agent::prelude::{
+        Agent, AgentBuilder, MultiTurnStreamItem, PromptError, RunEvents, StreamingResult,
+        StructuredOutputError, ToolSet,
+    };
+    pub use rig_core::prelude::*;
+}
+
+/// Low-level streaming values.
+pub mod streaming {
+    pub use rig_core::streaming::*;
+}
+
+/// Tools: contextual authoring, the erased tool set, and the live registry.
 ///
-/// This module is always available and re-exports the core memory traits and
-/// in-process backend from `rig_core::memory`. Enabling the `memory` feature
-/// additionally re-exports policy types from the `rig-memory` companion crate
-/// into this same module.
+/// The contextual and portable contracts come from `rig-core` and need no
+/// feature. The registry, tool set, and catalog belong to the agent runtime and
+/// need the `agent` feature; they also live at [`crate::agent::tool`].
+pub mod tool {
+    /// Derive a stable serialized key for a tool-context value.
+    #[cfg(feature = "derive")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
+    pub use rig_derive::ContextValue;
+
+    #[cfg(feature = "agent")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
+    pub use rig_agent::tool::{
+        RegisteredTool, ToolCatalog, ToolDispatch, ToolLease, ToolSet, execute_tool,
+    };
+    pub use rig_core::tool::builtin;
+    pub use rig_core::tool::{
+        ContextValue, DynamicTool, ErasedTool, Tool, ToolContext, ToolContextError, ToolEmbedding,
+        tool_definition, tool_name,
+    };
+    pub use rig_core::tool::{
+        IntoToolOutput, ToolErrorKind, ToolExecutionError, ToolOutput, ToolResult,
+    };
+    pub use rig_core::tool::{PortableTool, PortableToolEmbedding};
+
+    /// MCP tool support from `rig-rmcp`, which supports native targets only.
+    #[cfg(all(feature = "rmcp", not(target_family = "wasm")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rmcp")))]
+    pub mod rmcp {
+        pub use rig_rmcp::*;
+    }
+    /// The live registry, layered over the contracts above.
+    #[cfg(feature = "agent")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
+    pub use rig_agent::tool::server;
+
+    /// The complete portable `rig-core` tool surface, under one explicit path.
+    pub mod portable {
+        pub use rig_core::tool::*;
+    }
+}
+
+#[cfg(all(feature = "agent", any(test, feature = "test-utils")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
+pub mod test_utils {
+    pub use rig_agent::test_utils::*;
+}
+
+#[cfg(feature = "derive")]
+#[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
+pub use rig_derive::rig_tool;
+
+/// Conversation memory traits and the in-process backend, plus the `rig-memory`
+/// policy types when the `memory` feature is enabled.
 pub mod memory {
     pub use rig_core::memory::*;
 
@@ -43,109 +203,65 @@ pub mod memory {
     pub use rig_memory::*;
 }
 
-#[cfg(feature = "bedrock")]
-#[cfg_attr(docsrs, doc(cfg(feature = "bedrock")))]
-pub mod bedrock {
-    pub use rig_bedrock::*;
+/// Declares one feature-gated facade module per companion crate, each row giving
+/// the module, its crate, and the features enabling it.
+///
+/// The single-feature arm is separate so rustdoc renders "Available on crate
+/// feature `x` only" rather than a one-element `any`.
+macro_rules! companion_modules {
+    () => {};
+    (
+        $(#[doc = $doc:literal])*
+        $module:ident = $krate:ident [$feature:literal];
+        $($rest:tt)*
+    ) => {
+        $(#[doc = $doc])*
+        #[cfg(feature = $feature)]
+        #[cfg_attr(docsrs, doc(cfg(feature = $feature)))]
+        pub mod $module {
+            pub use $krate::*;
+        }
+        companion_modules! { $($rest)* }
+    };
+    (
+        $(#[doc = $doc:literal])*
+        $module:ident = $krate:ident [$($feature:literal),+ $(,)?];
+        $($rest:tt)*
+    ) => {
+        $(#[doc = $doc])*
+        #[cfg(any($(feature = $feature),+))]
+        #[cfg_attr(docsrs, doc(cfg(any($(feature = $feature),+))))]
+        pub mod $module {
+            pub use $krate::*;
+        }
+        companion_modules! { $($rest)* }
+    };
 }
 
-#[cfg(any(
-    feature = "fastembed",
-    feature = "fastembed-hf-hub",
-    feature = "fastembed-ort-download-binaries",
-))]
-#[cfg_attr(
-    docsrs,
-    doc(cfg(any(
-        feature = "fastembed",
-        feature = "fastembed-hf-hub",
-        feature = "fastembed-ort-download-binaries"
-    )))
-)]
-pub mod fastembed {
-    pub use rig_fastembed::*;
-}
-
-#[cfg(feature = "gemini-grpc")]
-#[cfg_attr(docsrs, doc(cfg(feature = "gemini-grpc")))]
-pub mod gemini_grpc {
-    pub use rig_gemini_grpc::*;
-}
-
-#[cfg(feature = "helixdb")]
-#[cfg_attr(docsrs, doc(cfg(feature = "helixdb")))]
-pub mod helixdb {
-    pub use rig_helixdb::*;
-}
-
-#[cfg(feature = "lancedb")]
-#[cfg_attr(docsrs, doc(cfg(feature = "lancedb")))]
-pub mod lancedb {
-    pub use rig_lancedb::*;
-}
-
-#[cfg(feature = "milvus")]
-#[cfg_attr(docsrs, doc(cfg(feature = "milvus")))]
-pub mod milvus {
-    pub use rig_milvus::*;
-}
-
-#[cfg(feature = "mongodb")]
-#[cfg_attr(docsrs, doc(cfg(feature = "mongodb")))]
-pub mod mongodb {
-    pub use rig_mongodb::*;
-}
-
-#[cfg(feature = "neo4j")]
-#[cfg_attr(docsrs, doc(cfg(feature = "neo4j")))]
-pub mod neo4j {
-    pub use rig_neo4j::*;
-}
-
-#[cfg(feature = "postgres")]
-#[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
-pub mod postgres {
-    pub use rig_postgres::*;
-}
-
-#[cfg(feature = "qdrant")]
-#[cfg_attr(docsrs, doc(cfg(feature = "qdrant")))]
-pub mod qdrant {
-    pub use rig_qdrant::*;
-}
-
-#[cfg(feature = "s3vectors")]
-#[cfg_attr(docsrs, doc(cfg(feature = "s3vectors")))]
-pub mod s3vectors {
-    pub use rig_s3vectors::*;
-}
-
-#[cfg(feature = "scylladb")]
-#[cfg_attr(docsrs, doc(cfg(feature = "scylladb")))]
-pub mod scylladb {
-    pub use rig_scylladb::*;
-}
-
-#[cfg(feature = "sqlite")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
-pub mod sqlite {
-    pub use rig_sqlite::*;
-}
-
-#[cfg(feature = "surrealdb")]
-#[cfg_attr(docsrs, doc(cfg(feature = "surrealdb")))]
-pub mod surrealdb {
-    pub use rig_surrealdb::*;
-}
-
-#[cfg(feature = "vectorize")]
-#[cfg_attr(docsrs, doc(cfg(feature = "vectorize")))]
-pub mod vectorize {
-    pub use rig_vectorize::*;
-}
-
-#[cfg(feature = "vertexai")]
-#[cfg_attr(docsrs, doc(cfg(feature = "vertexai")))]
-pub mod vertexai {
-    pub use rig_vertexai::*;
+companion_modules! {
+    /// Typed TypeSafe Jev judgments for routing and rubric evaluation.
+    typesafeai = rig_typesafeai ["typesafeai"];
+    bedrock = rig_bedrock ["bedrock"];
+    /// Local CPU inference with validated Llama/SmolLM2 and native tool-capable Qwen3 models,
+    /// and YOLOv8 pose estimation.
+    candle = rig_candle ["candle"];
+    fastembed = rig_fastembed [
+        "fastembed",
+        "fastembed-hf-hub",
+        "fastembed-ort-download-binaries",
+    ];
+    gemini_grpc = rig_gemini_grpc ["gemini-grpc"];
+    helixdb = rig_helixdb ["helixdb"];
+    lancedb = rig_lancedb ["lancedb"];
+    milvus = rig_milvus ["milvus"];
+    mongodb = rig_mongodb ["mongodb"];
+    neo4j = rig_neo4j ["neo4j"];
+    postgres = rig_postgres ["postgres"];
+    qdrant = rig_qdrant ["qdrant"];
+    s3vectors = rig_s3vectors ["s3vectors"];
+    scylladb = rig_scylladb ["scylladb"];
+    sqlite = rig_sqlite ["sqlite"];
+    surrealdb = rig_surrealdb ["surrealdb"];
+    vectorize = rig_vectorize ["vectorize"];
+    vertexai = rig_vertexai ["vertexai"];
 }

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, StringArray, types::Float64Type};
+use rig::Embed;
 use rig::embeddings::Embedding;
-use rig::{Embed, OneOrMany};
 use serde::Deserialize;
 
 #[derive(Embed, Clone, Deserialize, Debug)]
@@ -29,39 +29,43 @@ pub fn words() -> Vec<Word> {
     ]
 }
 
+/// A definition repeated to pad the table: an IVF-PQ index needs at least 256 rows.
+pub const FLUMBUZZLE: &str = "Definition of *flumbuzzle (noun)*: A sudden, inexplicable urge to rearrange or reorganize small objects, such as desk items or books, for no apparent reason.";
+
+/// 256 rows of [`FLUMBUZZLE`], with ids `doc0`..`doc255`.
+pub fn flumbuzzles() -> impl Iterator<Item = Word> {
+    (0..256).map(|i| Word {
+        id: format!("doc{i}"),
+        definition: FLUMBUZZLE.to_string(),
+    })
+}
+
 // Convert Word objects and their embedding to a RecordBatch.
 pub fn as_record_batch(
-    records: Vec<(Word, OneOrMany<Embedding>)>,
+    records: Vec<(Word, Vec<Embedding>)>,
     dims: usize,
 ) -> Result<RecordBatch, lancedb::arrow::arrow_schema::ArrowError> {
-    let id = StringArray::from_iter_values(
-        records
-            .iter()
-            .map(|(Word { id, .. }, _)| id)
-            .collect::<Vec<_>>(),
-    );
+    let id = StringArray::from_iter_values(records.iter().map(|(Word { id, .. }, _)| id));
 
     let definition = StringArray::from_iter_values(
         records
             .iter()
-            .map(|(Word { definition, .. }, _)| definition)
-            .collect::<Vec<_>>(),
+            .map(|(Word { definition, .. }, _)| definition),
     );
 
     let embedding = FixedSizeListArray::from_iter_primitive::<Float64Type, _, _>(
-        records
-            .into_iter()
-            .map(|(_, embeddings)| {
-                Some(
-                    embeddings
-                        .first()
-                        .vec
-                        .into_iter()
-                        .map(Some)
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>(),
+        records.into_iter().map(|(_, embeddings)| {
+            Some(
+                embeddings
+                    .into_iter()
+                    .next()
+                    .expect("expected at least one embedding")
+                    .vec
+                    .into_iter()
+                    .map(Some)
+                    .collect::<Vec<_>>(),
+            )
+        }),
         dims as i32,
     );
 

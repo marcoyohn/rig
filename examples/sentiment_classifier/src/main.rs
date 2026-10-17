@@ -3,8 +3,8 @@
 //! Run it to map a short sentence into a structured sentiment enum.
 
 use anyhow::Result;
-use rig::prelude::*;
-use rig::providers::openai;
+use rig::extractor::ExtractorBuilder;
+use rig::providers::openai::{self, OpenAI};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -24,11 +24,11 @@ struct DocumentSentiment {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let extractor = openai::Client::from_env()?
-        .extractor::<DocumentSentiment>(openai::GPT_4)
-        .build();
+    let client = OpenAI::from_env()?;
+    let extractor =
+        ExtractorBuilder::<DocumentSentiment>::new(client.completion(openai::GPT_4)).build();
 
-    let sentiment = extractor.extract("I am happy").await?;
+    let sentiment = extractor.extract("I am happy").await?.output;
 
     println!("GPT-4: {sentiment:?}");
 

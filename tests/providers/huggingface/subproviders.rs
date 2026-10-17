@@ -1,32 +1,27 @@
 //! Migrated from `examples/huggingface_subproviders.rs`.
 
-use rig::client::CompletionClient;
-use rig::completion::Prompt;
-use rig::providers::huggingface::{self, SubProvider};
+use rig::providers::openai::wire::{HUGGINGFACE, OpenAIConfig, SubRoute};
 
 use crate::support::{Adder, Subtract, assert_mentions_expected_number};
 
 #[tokio::test]
 #[ignore = "requires HUGGINGFACE_API_KEY"]
 async fn tool_prompt_across_subproviders() {
-    let api_key = std::env::var("HUGGINGFACE_API_KEY").expect("HUGGINGFACE_API_KEY must be set");
     let cases = [
-        ("deepseek-ai/DeepSeek-V3", SubProvider::Together),
+        ("deepseek-ai/DeepSeek-V3", SubRoute::Together),
         (
             "meta-llama/Meta-Llama-3.1-8B-Instruct",
-            SubProvider::HFInference,
+            SubRoute::HFInference,
         ),
-        ("Meta-Llama-3.1-8B-Instruct", SubProvider::SambaNova),
+        ("Meta-Llama-3.1-8B-Instruct", SubRoute::SambaNova),
     ];
 
-    for (model, subprovider) in cases {
-        let client = huggingface::Client::builder()
-            .api_key(&api_key)
-            .subprovider(subprovider)
-            .build()
-            .expect("client should build");
-        let agent = client
-            .agent(model)
+    for (model, sub_route) in cases {
+        let provider = OpenAIConfig::from_env_with(&HUGGINGFACE)
+            .expect("config should build from env")
+            .with_sub_route(sub_route)
+            .client();
+        let agent = rig::AgentBuilder::new(provider.completion(model))
             .preamble(
                 "You are a calculator here to help the user perform arithmetic operations. \
                  Use the provided tools to answer the user's question.",
@@ -40,6 +35,6 @@ async fn tool_prompt_across_subproviders() {
             .prompt("Calculate 2 - 5")
             .await
             .expect("prompt should succeed");
-        assert_mentions_expected_number(&response, -3);
+        assert_mentions_expected_number(&response.output(), -3);
     }
 }

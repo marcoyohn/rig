@@ -1,9 +1,6 @@
+use rig::extractor::ExtractorBuilder;
 use rig::prelude::*;
-
-use rig::completion::Prompt;
-
-use rig::providers::openai;
-use rig::providers::openai::client::Client;
+use rig::providers::openai::{self, OpenAI};
 
 use schemars::JsonSchema;
 
@@ -26,11 +23,12 @@ All operations should be O(1).
 ";
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Create OpenAI client
-    let openai_client = Client::from_env()?;
+    // The OpenAI client, from `OPENAI_API_KEY`.
+    let openai_client = OpenAI::from_env()?;
+    // One model serves both agents: erase it once, clone the handle.
+    let model = openai_client.completion(openai::GPT_4).erase();
 
-    let generator_agent = openai_client
-        .agent(openai::GPT_4)
+    let generator_agent = AgentBuilder::new(model.clone())
         .preamble(
             "
             Your goal is to complete the task based on <user input>. If there are feedback
@@ -47,8 +45,8 @@ async fn main() -> Result<(), anyhow::Error> {
         )
         .build();
 
-    let evaluator_agent = openai_client.extractor::<Evaluation>(openai::GPT_4)
-        .preamble("
+    let evaluator_agent = ExtractorBuilder::<Evaluation>::new(model)
+        .append_preamble("
             Evaluate this following code implementation for:
             1. code correctness
             2. time complexity
@@ -65,18 +63,19 @@ async fn main() -> Result<(), anyhow::Error> {
         .build();
 
     let mut memories: Vec<String> = Vec::new();
-    let mut response = generator_agent.prompt(TASK).await?;
+    let mut response = generator_agent.prompt(TASK).await?.output();
     memories.push(response.clone());
 
     loop {
         let eval_result = evaluator_agent
-            .extract(&format!("{TASK}\n\n{response}"))
-            .await?;
+            .extract(format!("{TASK}\n\n{response}"))
+            .await?
+            .output;
         if eval_result.evaluation_status == EvalStatus::Pass {
             break;
         } else {
             let context = format!("{TASK}\n\n{}", eval_result.feedback);
-            response = generator_agent.prompt(context).await?;
+            response = generator_agent.prompt(context).await?.output();
             memories.push(response.clone());
         }
     }

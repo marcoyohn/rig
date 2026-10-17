@@ -1,43 +1,38 @@
-//! PostgreSQL and pgvector integration for Rig.
+//! PostgreSQL and pgvector vector store for Rig.
 //!
-//! This crate provides [`PostgresVectorStore`], a Rig vector store backed by a
-//! PostgreSQL table with a `pgvector` embedding column. It supports the distance
-//! functions represented by [`PgVectorDistanceFunction`] and query filters via
-//! [`PgSearchFilter`].
-//!
-//! The root `rig` facade re-exports this crate as `rig::postgres` when the
-//! `postgres` feature is enabled.
+//! [`PostgresVectorStore`] searches a table holding a `pgvector` embedding
+//! column using a [`PgVectorDistanceFunction`] and optional [`PgSearchFilter`]
+//! conditions. The `rig` facade re-exports this crate as `rig::postgres` under
+//! the `postgres` feature.
 
 use std::{fmt::Display, ops::RangeInclusive};
 
 use rig_core::{
-    Embed, OneOrMany,
-    embeddings::{Embedding, EmbeddingModel},
+    Embed,
+    embeddings::Embedding,
     vector_store::{
-        InsertDocuments, VectorStoreError, VectorStoreIndex,
-        request::{SearchFilter, VectorSearchRequest},
+        InsertDocuments, VectorSearchIdResult, VectorSearchResult, VectorStoreError,
+        VectorStoreIndex,
+        request::{SearchFilter, SqlCondition, VectorSearchRequest},
     },
+    wasm_compat::WasmCompatSend,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, postgres::PgArguments, query::QueryAs};
 use uuid::Uuid;
 
-pub struct PostgresVectorStore<Model: EmbeddingModel> {
-    model: Model,
+/// Vector store over a Postgres table. Queries are embedded with the same model
+/// that populated the table, so results are meaningless under another model.
+pub struct PostgresVectorStore {
+    model: rig_core::DynModel<rig_core::operation::Embedding>,
     pg_pool: PgPool,
     documents_table: String,
     distance_function: PgVectorDistanceFunction,
 }
 
-/* PgVector supported distances
-<-> - L2 distance
-<#> - (negative) inner product
-<=> - cosine distance
-<+> - L1 distance (added in 0.7.0)
-<~> - Hamming distance (binary vectors, added in 0.7.0)
-<%> - Jaccard distance (binary vectors, added in 0.7.0)
- */
+/// pgvector distance operators. `Hamming` and `Jaccard` apply to binary vectors,
+/// and all operators except L2, inner product, and cosine require pgvector 0.7.
 pub enum PgVectorDistanceFunction {
     L2,
     InnerProduct,
@@ -60,132 +55,121 @@ impl Display for PgVectorDistanceFunction {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize, Debug)]
-pub struct PgSearchFilter {
-    condition: String,
-    values: Vec<serde_json::Value>,
+impl PgVectorDistanceFunction {
+    /// Builds a SQL expression increasing with similarity so a minimum-similarity
+    /// threshold applies as `score >= $n`. `embedding` and `query` are spliced
+    /// verbatim and must not carry untrusted input.
+    fn score_expression(&self, embedding: &str, query: &str) -> String {
+        match self {
+            PgVectorDistanceFunction::Cosine | PgVectorDistanceFunction::Jaccard => {
+                format!("1 - ({embedding} {self} {query})")
+            }
+            PgVectorDistanceFunction::InnerProduct
+            | PgVectorDistanceFunction::L2
+            | PgVectorDistanceFunction::L1
+            | PgVectorDistanceFunction::Hamming => format!("-({embedding} {self} {query})"),
+        }
+    }
 }
+
+/// Bind placeholder token. Query rendering numbers the placeholders that
+/// [`SqlCondition`] recorded, never other `$` characters in the text.
+const PLACEHOLDER: &str = "$";
+
+/// Postgres `WHERE` fragment with its bind values.
+///
+/// Values, `like`/`similar_to` patterns, and `between` bounds are bound as
+/// parameters. Keys are spliced into the SQL verbatim so that expressions such
+/// as `document->>'kind'` work, which means a key is executable SQL: never
+/// build one from untrusted input.
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+pub struct PgSearchFilter(SqlCondition<serde_json::Value>);
 
 impl SearchFilter for PgSearchFilter {
     type Value = serde_json::Value;
 
     fn eq(key: impl AsRef<str>, value: Self::Value) -> Self {
-        Self {
-            condition: format!("{} = $", key.as_ref()),
-            values: vec![value],
-        }
+        Self(SqlCondition::binary(key, "=", PLACEHOLDER, value))
     }
 
     fn gt(key: impl AsRef<str>, value: Self::Value) -> Self {
-        Self {
-            condition: format!("{} > $", key.as_ref()),
-            values: vec![value],
-        }
+        Self(SqlCondition::binary(key, ">", PLACEHOLDER, value))
     }
 
     fn lt(key: impl AsRef<str>, value: Self::Value) -> Self {
-        Self {
-            condition: format!("{} < $", key.as_ref()),
-            values: vec![value],
-        }
+        Self(SqlCondition::binary(key, "<", PLACEHOLDER, value))
     }
 
     fn and(self, rhs: Self) -> Self {
-        Self {
-            condition: format!("({}) AND ({})", self.condition, rhs.condition),
-            values: self.values.into_iter().chain(rhs.values).collect(),
-        }
+        Self(self.0.and(rhs.0))
     }
 
     fn or(self, rhs: Self) -> Self {
-        Self {
-            condition: format!("({}) OR ({})", self.condition, rhs.condition),
-            values: self.values.into_iter().chain(rhs.values).collect(),
-        }
+        Self(self.0.or(rhs.0))
     }
 }
 
 impl PgSearchFilter {
-    fn into_clause(self) -> (String, Vec<serde_json::Value>) {
-        (self.condition, self.values)
-    }
-
-    #[allow(clippy::should_implement_trait)]
     pub fn not(self) -> Self {
-        Self {
-            condition: format!("NOT ({})", self.condition),
-            values: self.values,
-        }
+        Self(self.0.not())
     }
 
-    pub fn gte(key: String, value: <Self as SearchFilter>::Value) -> Self {
-        Self {
-            condition: format!("{key} >= ?"),
-            values: vec![value],
-        }
+    pub fn gte(key: impl Into<String>, value: <Self as SearchFilter>::Value) -> Self {
+        let key = key.into();
+        Self(SqlCondition::binary(key, ">=", PLACEHOLDER, value))
     }
 
-    pub fn lte(key: String, value: <Self as SearchFilter>::Value) -> Self {
-        Self {
-            condition: format!("{key} <= ?"),
-            values: vec![value],
-        }
+    pub fn lte(key: impl Into<String>, value: <Self as SearchFilter>::Value) -> Self {
+        let key = key.into();
+        Self(SqlCondition::binary(key, "<=", PLACEHOLDER, value))
     }
 
-    pub fn is_null(key: String) -> Self {
-        Self {
-            condition: format!("{key} is null"),
-            ..Default::default()
-        }
+    pub fn is_null(key: &str) -> Self {
+        Self(SqlCondition::raw(format!("{key} is null")))
     }
 
-    pub fn is_not_null(key: String) -> Self {
-        Self {
-            condition: format!("{key} is not null"),
-            ..Default::default()
-        }
+    pub fn is_not_null(key: &str) -> Self {
+        Self(SqlCondition::raw(format!("{key} is not null")))
     }
 
-    pub fn between<T>(key: String, range: RangeInclusive<T>) -> Self
-    where
-        T: std::fmt::Display + Into<serde_json::Number> + Copy,
-    {
-        let lo = range.start();
-        let hi = range.end();
-
-        Self {
-            condition: format!("{key} between {lo} and {hi}"),
-            ..Default::default()
-        }
+    /// SQL `BETWEEN` with both bounds bound as parameters. A non-finite float
+    /// bound binds as `NULL`, so the condition matches no rows.
+    pub fn between<T: Into<Value>>(key: impl AsRef<str>, range: RangeInclusive<T>) -> Self {
+        let (lo, hi) = range.into_inner();
+        Self(SqlCondition::between(
+            key,
+            PLACEHOLDER,
+            lo.into(),
+            hi.into(),
+        ))
     }
 
-    pub fn member(key: String, values: Vec<<Self as SearchFilter>::Value>) -> Self {
-        let placeholders = values.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
-
-        Self {
-            condition: format!("{key} is in ({placeholders})"),
-            values,
-        }
+    pub fn member(key: &str, values: Vec<<Self as SearchFilter>::Value>) -> Self {
+        Self(SqlCondition::list(key, "IN", PLACEHOLDER, values))
     }
 
     // String matching ops
 
-    /// Tests whether the value at `key` matches the (case-sensitive) pattern
-    /// `pattern` should be a valid SQL string pattern, with '%' and '_' as wildcards
-    pub fn like(key: String, pattern: &'static str) -> Self {
-        Self {
-            condition: format!("{key} like {pattern}"),
-            ..Default::default()
-        }
+    /// Case-sensitive SQL `LIKE` match against a bound pattern, with `%` and `_`
+    /// as wildcards. Pass the bare pattern, such as `%apple%`, without quotes.
+    pub fn like(key: impl AsRef<str>, pattern: impl Into<String>) -> Self {
+        Self(SqlCondition::binary(
+            key,
+            "like",
+            PLACEHOLDER,
+            Value::String(pattern.into()),
+        ))
     }
 
-    /// Tests whether the value at `key` matches the SQL regex pattern
-    /// `pattern` should be a valid regex
-    pub fn similar_to(key: String, pattern: &'static str) -> Self {
-        Self {
-            condition: format!("{key} similar to {pattern}"),
-            ..Default::default()
-        }
+    /// SQL `SIMILAR TO` match against a bound pattern. Pass the bare pattern
+    /// without quotes.
+    pub fn similar_to(key: impl AsRef<str>, pattern: impl Into<String>) -> Self {
+        Self(SqlCondition::binary(
+            key,
+            "similar to",
+            PLACEHOLDER,
+            Value::String(pattern.into()),
+        ))
     }
 }
 
@@ -225,7 +209,6 @@ fn bind_value<S>(
                 builder.bind(Value::Array(xs))
             }
         }
-        // Will always be JSONB
         object => builder.bind(object),
     }
 }
@@ -234,7 +217,6 @@ fn bind_value<S>(
 pub struct SearchResult {
     id: Uuid,
     document: Value,
-    //embedded_text: String,
     distance: f64,
 }
 
@@ -245,89 +227,124 @@ pub struct SearchResultOnlyId {
 }
 
 impl SearchResult {
-    pub fn into_result<T: DeserializeOwned>(self) -> Result<(f64, String, T), VectorStoreError> {
-        let document: T =
-            serde_json::from_value(self.document).map_err(VectorStoreError::JsonError)?;
-        Ok((self.distance, self.id.to_string(), document))
+    pub fn into_result<T: DeserializeOwned>(
+        self,
+    ) -> Result<VectorSearchResult<T>, VectorStoreError> {
+        Ok(VectorSearchResult {
+            score: self.distance,
+            id: self.id.to_string(),
+            document: serde_json::from_value(self.document).map_err(VectorStoreError::JsonError)?,
+        })
     }
 }
 
-impl<Model> PostgresVectorStore<Model>
-where
-    Model: EmbeddingModel,
-{
+impl PostgresVectorStore {
     pub fn new(
-        model: Model,
+        model: impl Into<rig_core::DynModel<rig_core::operation::Embedding>>,
         pg_pool: PgPool,
         documents_table: Option<String>,
         distance_function: PgVectorDistanceFunction,
     ) -> Self {
         Self {
-            model,
+            model: model.into(),
             pg_pool,
-            documents_table: documents_table.unwrap_or(String::from("documents")),
+            documents_table: documents_table.unwrap_or_else(|| String::from("documents")),
             distance_function,
         }
     }
 
-    pub fn with_defaults(model: Model, pg_pool: PgPool) -> Self {
+    pub fn with_defaults(
+        model: impl Into<rig_core::DynModel<rig_core::operation::Embedding>>,
+        pg_pool: PgPool,
+    ) -> Self {
         Self::new(model, pg_pool, None, PgVectorDistanceFunction::Cosine)
     }
 
-    fn search_query_full(
+    /// Embeds the query and runs the search, returning one row per result.
+    /// Errors when the requested sample count exceeds `i64::MAX`.
+    async fn run_search<R>(
         &self,
         req: &VectorSearchRequest<PgSearchFilter>,
-    ) -> (String, Vec<serde_json::Value>) {
-        self.search_query(true, req)
-    }
-
-    fn search_query_only_ids(
-        &self,
-        req: &VectorSearchRequest<PgSearchFilter>,
-    ) -> (String, Vec<serde_json::Value>) {
-        self.search_query(false, req)
-    }
-
-    fn search_query(
-        &self,
         with_document: bool,
-        req: &VectorSearchRequest<PgSearchFilter>,
-    ) -> (String, Vec<serde_json::Value>) {
-        let document = if with_document { ", document" } else { "" };
-
-        let thresh = req
-            .threshold()
-            .map(|t| PgSearchFilter::gt("distance", t.into()));
-        let filter = match (thresh, req.filter()) {
-            (Some(thresh), Some(filt)) => Some(thresh.and(filt.clone())),
-            (Some(thresh), _) => Some(thresh),
-            (_, Some(filt)) => Some(filt.clone()),
-            _ => None,
-        };
-        let (where_clause, params) = match filter {
-            Some(f) => {
-                let (expr, params) = f.into_clause();
-                (String::from("WHERE") + &expr, params)
-            }
-            None => (Default::default(), Default::default()),
-        };
-
-        let mut counter = 3;
-        let mut buf = String::with_capacity(where_clause.len() * 2);
-
-        for c in where_clause.chars() {
-            buf.push(c);
-
-            if c == '$' {
-                buf.push_str(counter.to_string().as_str());
-                counter += 1;
-            }
+    ) -> Result<Vec<R>, VectorStoreError>
+    where
+        R: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    {
+        if req.samples() > i64::MAX as u64 {
+            return Err(VectorStoreError::SamplesOutOfRange {
+                requested: req.samples(),
+                max: i64::MAX as u64,
+            });
         }
 
-        let where_clause = buf;
+        let embedded_query: pgvector::Vector = self
+            .model
+            .embed_text(req.query())
+            .await?
+            .vec
+            .iter()
+            .map(|&x| x as f32)
+            .collect::<Vec<f32>>()
+            .into();
 
-        let query = format!(
-            "
+        let (search_query, params) = render_search_query(
+            &self.distance_function,
+            &self.documents_table,
+            with_document,
+            req,
+        );
+        let builder = sqlx::query_as(sqlx::AssertSqlSafe(search_query))
+            .bind(embedded_query)
+            .bind(req.samples() as i64);
+
+        let builder = params.iter().cloned().fold(builder, bind_value);
+
+        builder
+            .fetch_all(&self.pg_pool)
+            .await
+            .map_err(VectorStoreError::datastore)
+    }
+}
+
+/// Renders the search SQL and the values bound after `$1` (query vector) and
+/// `$2` (limit).
+///
+/// The threshold filters on a similarity expression inside the inner `SELECT`,
+/// since the `distance` alias is only visible to the outer query. Returned
+/// scores remain raw distances ordered ascending regardless of threshold.
+fn render_search_query(
+    distance_function: &PgVectorDistanceFunction,
+    documents_table: &str,
+    with_document: bool,
+    req: &VectorSearchRequest<PgSearchFilter>,
+) -> (String, Vec<serde_json::Value>) {
+    let document = if with_document { ", document" } else { "" };
+
+    // The threshold binds before filter values.
+    let mut params = Vec::new();
+    let mut conditions = Vec::new();
+
+    if let Some(threshold) = req.threshold() {
+        let score = distance_function.score_expression("embedding", "$1");
+        conditions.push(format!("({score} >= $3)"));
+        params.push(serde_json::Value::from(threshold));
+    }
+
+    if let Some(filter) = req.filter() {
+        let first = 3 + params.len();
+        let expr = filter.0.render_placeholders(|i| format!("${}", first + i));
+        conditions.push(format!("({expr})"));
+        params.extend_from_slice(filter.0.params());
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+
+    let query = format!(
+        "
             SELECT id{}, distance FROM ( \
               SELECT DISTINCT ON (id) id{}, embedding {} $1 as distance \
               FROM {} \
@@ -336,20 +353,16 @@ where
             ) as d \
             ORDER BY distance \
             LIMIT $2",
-            document, document, self.distance_function, self.documents_table
-        );
+        document, document, distance_function, documents_table
+    );
 
-        (query, params)
-    }
+    (query, params)
 }
 
-impl<Model> InsertDocuments for PostgresVectorStore<Model>
-where
-    Model: EmbeddingModel + Send + Sync,
-{
-    async fn insert_documents<Doc: Serialize + Embed + Send>(
+impl InsertDocuments for PostgresVectorStore {
+    async fn insert_documents<Doc: Serialize + Embed + WasmCompatSend>(
         &self,
-        documents: Vec<(Doc, OneOrMany<Embedding>)>,
+        documents: Vec<(Doc, Vec<Embedding>)>,
     ) -> Result<(), VectorStoreError> {
         for (document, embeddings) in documents {
             let id = Uuid::new_v4();
@@ -359,20 +372,17 @@ where
                 let embedding_text = embedding.document;
                 let embedding: Vec<f64> = embedding.vec;
 
-                sqlx::query(
-                    format!(
-                        "INSERT INTO {} (id, document, embedded_text, embedding) VALUES ($1, $2, $3, $4)",
-                        self.documents_table
-                    )
-                    .as_str(),
-                )
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO {} (id, document, embedded_text, embedding) VALUES ($1, $2, $3, $4)",
+                    self.documents_table
+                )))
                 .bind(id)
                 .bind(&json_document)
                 .bind(&embedding_text)
                 .bind(&embedding)
                 .execute(&self.pg_pool)
                 .await
-                .map_err(|e| VectorStoreError::DatastoreError(e.into()))?;
+                .map_err(VectorStoreError::datastore)?;
             }
         }
 
@@ -380,51 +390,18 @@ where
     }
 }
 
-impl<Model> VectorStoreIndex for PostgresVectorStore<Model>
-where
-    Model: EmbeddingModel,
-{
+impl VectorStoreIndex for PostgresVectorStore {
     type Filter = PgSearchFilter;
 
-    /// Get the top n documents based on the distance to the given query.
-    /// The result is a list of tuples of the form (score, id, document)
-    async fn top_n<T: for<'a> Deserialize<'a> + Send>(
+    /// Returns up to `samples` documents scored by distance, ordered by
+    /// ascending distance. Rows whose documents fail to deserialize are skipped.
+    async fn top_n<T: DeserializeOwned + WasmCompatSend>(
         &self,
         req: VectorSearchRequest<PgSearchFilter>,
-    ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
-        if req.samples() > i64::MAX as u64 {
-            return Err(VectorStoreError::DatastoreError(
-                format!(
-                    "The maximum amount of samples to return with the `rig` Postgres integration cannot be larger than {}",
-                    i64::MAX
-                )
-                .into(),
-            ));
-        }
+    ) -> Result<Vec<VectorSearchResult<T>>, VectorStoreError> {
+        let rows: Vec<SearchResult> = self.run_search(&req, true).await?;
 
-        let embedded_query: pgvector::Vector = self
-            .model
-            .embed_text(req.query())
-            .await?
-            .vec
-            .iter()
-            .map(|&x| x as f32)
-            .collect::<Vec<f32>>()
-            .into();
-
-        let (search_query, params) = self.search_query_full(&req);
-        let builder = sqlx::query_as(search_query.as_str())
-            .bind(embedded_query)
-            .bind(req.samples() as i64);
-
-        let builder = params.iter().cloned().fold(builder, bind_value);
-
-        let rows = builder
-            .fetch_all(&self.pg_pool)
-            .await
-            .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
-
-        let rows: Vec<(f64, String, T)> = rows
+        let rows: Vec<VectorSearchResult<T>> = rows
             .into_iter()
             .flat_map(SearchResult::into_result)
             .collect();
@@ -432,47 +409,24 @@ where
         Ok(rows)
     }
 
-    /// Same as `top_n` but returns the document ids only.
+    /// Like `top_n` but returns only scores and ids, without deserializing documents.
     async fn top_n_ids(
         &self,
         req: VectorSearchRequest<PgSearchFilter>,
-    ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-        if req.samples() > i64::MAX as u64 {
-            return Err(VectorStoreError::DatastoreError(
-                format!(
-                    "The maximum amount of samples to return with the `rig` Postgres integration cannot be larger than {}",
-                    i64::MAX
-                )
-                .into(),
-            ));
-        }
-        let embedded_query: pgvector::Vector = self
-            .model
-            .embed_text(req.query())
-            .await?
-            .vec
-            .iter()
-            .map(|&x| x as f32)
-            .collect::<Vec<f32>>()
-            .into();
+    ) -> Result<Vec<VectorSearchIdResult>, VectorStoreError> {
+        let rows: Vec<SearchResultOnlyId> = self.run_search(&req, false).await?;
 
-        let (search_query, params) = self.search_query_only_ids(&req);
-        let builder = sqlx::query_as(search_query.as_str())
-            .bind(embedded_query)
-            .bind(req.samples() as i64);
-
-        let builder = params.iter().cloned().fold(builder, bind_value);
-
-        let rows: Vec<SearchResultOnlyId> = builder
-            .fetch_all(&self.pg_pool)
-            .await
-            .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
-
-        let rows: Vec<(f64, String)> = rows
+        let rows: Vec<VectorSearchIdResult> = rows
             .into_iter()
-            .map(|row| (row.distance, row.id.to_string()))
+            .map(|row| VectorSearchIdResult {
+                score: row.distance,
+                id: row.id.to_string(),
+            })
             .collect();
 
         Ok(rows)
     }
 }
+
+#[cfg(test)]
+mod tests;

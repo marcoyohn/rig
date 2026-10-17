@@ -1,3093 +1,659 @@
-//! Google Gemini Interactions API integration.
-//! From <https://ai.google.dev/api/interactions-api>
+//! Wires for the [Gemini Interactions API](https://ai.google.dev/api/interactions-api).
+//! A request is built as JSON steps, and a reply, a whole interaction or a
+//! stream of step events, is read by [`InteractionsDecoder`](streaming::InteractionsDecoder).
+//!
+//! ```no_run
+//! use rig_core::providers::gemini::{Gemini, completion::GEMINI_2_5_FLASH};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let wire = Gemini::from_env()?.interactions(GEMINI_2_5_FLASH);
+//! # Ok(())
+//! # }
+//! ```
 
-use base64::{Engine, prelude::BASE64_STANDARD};
-
-use crate::OneOrMany;
-use crate::completion::{self, CompletionError, CompletionRequest, GetTokenUsage};
-use crate::http_client::HttpClientExt;
-use crate::message::{self, MimeType, Reasoning};
-use crate::telemetry::SpanCombinator;
-use serde_json::{Map, Value};
-use tracing::{Level, enabled, info_span};
-use tracing_futures::Instrument;
+use serde_json::{Map, Value, json};
 use url::form_urlencoded;
 
-use super::client::InteractionsClient;
+use crate::completion::{CompletionRequest, Media, Replay, ReplayTarget};
+use crate::error::EncodeError;
+use crate::message::{
+    AssistantContent, DocumentMediaType, DocumentSourceKind as Source, Message, MimeType,
+    ToolChoice as Choice, ToolResultContent, UserContent,
+};
+use crate::providers::internal::wire_ids::WireIds;
+use crate::telemetry::GenAiOperation;
+use crate::wire::{Descriptor, Mode};
 
 /// Streaming helpers for the Interactions API.
 pub mod streaming;
-pub use interactions_api_types::*;
 
-// =================================================================
-// Rig Implementation Types
-// =================================================================
+use super::completion::PROVIDER_NAME;
 
-/// Completion model wrapper for the Gemini Interactions API.
-#[derive(Clone, Debug)]
-pub struct InteractionsCompletionModel<T = reqwest::Client> {
-    pub(crate) client: InteractionsClient<T>,
+/// The wire format both Interactions wires speak.
+const API: crate::message::Api = crate::message::Api::from_static("gemini.interactions");
+
+/// Create interactions with `POST /v1beta/interactions`.
+/// Streaming mode sets `alt=sse` and `stream: true`; unary mode reads a whole resource.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Interactions {
+    /// The key and the API root.
+    pub provider: crate::providers::gemini::GeminiConfig,
+    /// The model to address.
     pub model: String,
 }
 
-impl<T> InteractionsCompletionModel<T> {
-    /// Create a new Interactions completion model for the given client and model name.
-    pub fn new(client: InteractionsClient<T>, model: impl Into<String>) -> Self {
+impl Interactions {
+    /// The wire for `model`.
+    pub fn new(provider: crate::providers::gemini::GeminiConfig, model: impl Into<String>) -> Self {
         Self {
-            client,
+            provider,
             model: model.into(),
         }
     }
-
-    /// Create a new Interactions completion model using a string model name.
-    pub fn with_model(client: InteractionsClient<T>, model: &str) -> Self {
-        Self {
-            client,
-            model: model.to_string(),
-        }
-    }
-
-    /// Use the GenerateContent API instead of Interactions.
-    pub fn generate_content_api(self) -> super::completion::CompletionModel<T> {
-        super::completion::CompletionModel::with_model(
-            self.client.generate_content_api(),
-            &self.model,
-        )
-    }
-
-    pub(crate) fn create_completion_request(
-        &self,
-        completion_request: CompletionRequest,
-        stream_override: Option<bool>,
-    ) -> Result<CreateInteractionRequest, CompletionError> {
-        create_request_body(self.model.clone(), completion_request, stream_override)
-    }
 }
 
-impl<T> InteractionsCompletionModel<T>
-where
-    T: HttpClientExt + Clone + std::fmt::Debug + Default + 'static,
-{
-    /// Create an interaction and return the raw response payload.
-    pub async fn create_interaction(
-        &self,
-        completion_request: CompletionRequest,
-    ) -> Result<Interaction, CompletionError> {
-        let request = self.create_completion_request(completion_request, Some(false))?;
-        self.client.create_interaction(request).await
+impl crate::wire::Wire for Interactions {
+    type Op = crate::operation::Completion;
+    type Payload = crate::wire::Encoded;
+    type Frame = crate::wire::WireFrame;
+    type Decoder<'id> = streaming::InteractionsDecoder;
+    type Reassembler = streaming::document::Interaction;
+
+    fn describe(&self) -> Descriptor<'_> {
+        Descriptor::new(PROVIDER_NAME)
+            .model(self.model.as_str())
+            .telemetry(|_| GenAiOperation::Chat)
+            .replay(self)
     }
 
-    /// Fetch an interaction by ID for polling background tasks.
-    pub async fn get_interaction(
-        &self,
-        interaction_id: impl AsRef<str>,
-    ) -> Result<Interaction, CompletionError> {
-        self.client.get_interaction(interaction_id).await
-    }
-
-    /// Start an interaction and stream raw SSE events.
-    pub async fn stream_interaction_events(
-        &self,
-        completion_request: CompletionRequest,
-    ) -> Result<streaming::InteractionEventStream, CompletionError> {
-        let request = self.create_completion_request(completion_request, Some(true))?;
-        self.client.stream_interaction_events(request).await
-    }
-
-    /// Resume an interaction stream by ID and optional last event ID.
-    pub async fn stream_interaction_events_by_id(
-        &self,
-        interaction_id: impl AsRef<str>,
-        last_event_id: Option<&str>,
-    ) -> Result<streaming::InteractionEventStream, CompletionError> {
-        self.client
-            .stream_interaction_events_by_id(interaction_id, last_event_id)
-            .await
-    }
-}
-
-impl<T> completion::CompletionModel for InteractionsCompletionModel<T>
-where
-    T: HttpClientExt + Clone + std::fmt::Debug + Default + 'static,
-{
-    type Response = Interaction;
-    type StreamingResponse = streaming::StreamingCompletionResponse;
-    type Client = InteractionsClient<T>;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self::new(client.clone(), model)
-    }
-
-    async fn completion(
-        &self,
-        completion_request: CompletionRequest,
-    ) -> Result<completion::CompletionResponse<Interaction>, CompletionError> {
-        let span = if tracing::Span::current().is_disabled() {
-            info_span!(
-                target: "rig::completions",
-                "interactions",
-                gen_ai.operation.name = "interactions",
-                gen_ai.provider.name = "gcp.gemini",
-                gen_ai.request.model = self.model,
-                gen_ai.system_instructions = &completion_request.preamble,
-                gen_ai.response.id = tracing::field::Empty,
-                gen_ai.response.model = tracing::field::Empty,
-                gen_ai.usage.output_tokens = tracing::field::Empty,
-                gen_ai.usage.input_tokens = tracing::field::Empty,
-                gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
-                gen_ai.usage.cache_creation.input_tokens = tracing::field::Empty,
-                gen_ai.usage.tool_use_prompt_tokens = tracing::field::Empty,
-                gen_ai.usage.reasoning_tokens = tracing::field::Empty,
-            )
-        } else {
-            tracing::Span::current()
-        };
-
-        let request = self.create_completion_request(completion_request, Some(false))?;
-
-        if enabled!(Level::TRACE) {
-            tracing::trace!(
-                target: "rig::completions",
-                "Gemini interactions completion request: {}",
-                serde_json::to_string_pretty(&request)?
-            );
-        }
-
-        let body = serde_json::to_vec(&request)?;
-        let request = self
-            .client
-            .post("/v1beta/interactions")?
-            .body(body)
-            .map_err(|e| CompletionError::HttpError(e.into()))?;
-
-        async move {
-            let response = self.client.send::<_, Vec<u8>>(request).await?;
-
-            if response.status().is_success() {
-                let response_body = response
-                    .into_body()
-                    .await
-                    .map_err(CompletionError::HttpError)?;
-
-                let response_text = String::from_utf8_lossy(&response_body).to_string();
-
-                let response: Interaction =
-                    serde_json::from_slice(&response_body).map_err(|err| {
-                        tracing::error!(
-                            error = %err,
-                            body = %response_text,
-                            "Failed to deserialize Gemini interactions response"
-                        );
-                        CompletionError::JsonError(err)
-                    })?;
-
-                let span = tracing::Span::current();
-                span.record_response_metadata(&response);
-                span.record_token_usage(&response);
-
-                if enabled!(Level::TRACE) {
-                    tracing::trace!(
-                        target: "rig::completions",
-                        "Gemini interactions completion response: {}",
-                        serde_json::to_string_pretty(&response)?
-                    );
-                }
-
-                response.try_into()
-            } else {
-                let text = String::from_utf8_lossy(
-                    &response
-                        .into_body()
-                        .await
-                        .map_err(CompletionError::HttpError)?,
-                )
-                .into();
-
-                Err(CompletionError::ProviderError(text))
-            }
-        }
-        .instrument(span)
-        .await
-    }
-
-    async fn stream(
+    fn encode(
         &self,
         request: CompletionRequest,
-    ) -> Result<
-        crate::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
-        CompletionError,
-    > {
-        InteractionsCompletionModel::stream(self, request).await
-    }
-}
-
-impl<T> InteractionsClient<T>
-where
-    T: HttpClientExt + Clone + std::fmt::Debug + Default + 'static,
-{
-    /// Create a new interaction and return the raw response payload.
-    pub async fn create_interaction(
-        &self,
-        request: CreateInteractionRequest,
-    ) -> Result<Interaction, CompletionError> {
-        if request.stream == Some(true) {
-            return Err(CompletionError::RequestError(Box::new(
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "stream=true requires stream_interaction_events",
-                ),
-            )));
-        }
-
-        let body = serde_json::to_vec(&request)?;
-        let request = self
-            .post("/v1beta/interactions")?
-            .body(body)
-            .map_err(|e| CompletionError::HttpError(e.into()))?;
-
-        send_interaction_request(self, request).await
-    }
-
-    /// Fetch an interaction by ID (useful for polling background tasks).
-    pub async fn get_interaction(
-        &self,
-        interaction_id: impl AsRef<str>,
-    ) -> Result<Interaction, CompletionError> {
-        let path = format!("/v1beta/interactions/{}", interaction_id.as_ref());
-        let request = self
-            .get(path)?
-            .body(Vec::new())
-            .map_err(|e| CompletionError::HttpError(e.into()))?;
-
-        send_interaction_request(self, request).await
-    }
-
-    /// Start an interaction and stream raw SSE events.
-    pub async fn stream_interaction_events(
-        &self,
-        mut request: CreateInteractionRequest,
-    ) -> Result<streaming::InteractionEventStream, CompletionError> {
-        request.stream = Some(true);
-        let body = serde_json::to_vec(&request)?;
-        let request = self
-            .post_sse("/v1beta/interactions")?
-            .header("Content-Type", "application/json")
-            .body(body)
-            .map_err(|e| CompletionError::HttpError(e.into()))?;
-
-        Ok(streaming::stream_interaction_events(self.clone(), request))
-    }
-
-    /// Resume an interaction stream by ID and optional last event ID.
-    pub async fn stream_interaction_events_by_id(
-        &self,
-        interaction_id: impl AsRef<str>,
-        last_event_id: Option<&str>,
-    ) -> Result<streaming::InteractionEventStream, CompletionError> {
-        let path = build_interaction_stream_path(interaction_id.as_ref(), last_event_id);
-        let request = self
-            .get_sse(path)?
-            .body(Vec::new())
-            .map_err(|e| CompletionError::HttpError(e.into()))?;
-
-        Ok(streaming::stream_interaction_events(self.clone(), request))
-    }
-}
-
-pub(crate) fn create_request_body(
-    model: String,
-    completion_request: CompletionRequest,
-    stream_override: Option<bool>,
-) -> Result<CreateInteractionRequest, CompletionError> {
-    let chat_history = completion_request.chat_history_with_documents();
-
-    let mut history = Vec::new();
-    history.extend(chat_history);
-    let (history_system, history) = split_system_messages_from_history(history);
-
-    let steps = history
-        .into_iter()
-        .map(Step::try_from)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| CompletionError::RequestError(Box::new(err)))?;
-
-    let input = InteractionInput::Steps(steps);
-
-    let raw_params = completion_request
-        .additional_params
-        .unwrap_or_else(|| Value::Object(Map::new()));
-
-    let mut params: AdditionalParameters = serde_json::from_value(raw_params)?;
-
-    let mut generation_config = params.generation_config.take().unwrap_or_default();
-    if let Some(temp) = completion_request.temperature {
-        generation_config.temperature = Some(temp);
-    }
-    if let Some(max_tokens) = completion_request.max_tokens {
-        generation_config.max_output_tokens = Some(max_tokens);
-    }
-    if let Some(tool_choice) = completion_request.tool_choice {
-        generation_config.tool_choice = Some(tool_choice.try_into()?);
-    }
-    let generation_config = if generation_config.is_empty() {
-        None
-    } else {
-        Some(generation_config)
-    };
-
-    let system_instruction = completion_request
-        .preamble
-        .or_else(|| {
-            if history_system.is_empty() {
-                None
-            } else {
-                Some(history_system.join("\n\n"))
-            }
-        })
-        .or(params.system_instruction.take());
-
-    let mut tools = Vec::new();
-    if !completion_request.tools.is_empty() {
-        tools.extend(
-            completion_request
-                .tools
-                .into_iter()
-                .map(Tool::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-    }
-    if let Some(mut extra_tools) = params.tools.take() {
-        tools.append(&mut extra_tools);
-    }
-    let tools = if tools.is_empty() { None } else { Some(tools) };
-
-    let stream = stream_override.or(params.stream.take());
-
-    let (agent, agent_config) = if params.agent.is_some() {
-        (params.agent.take(), params.agent_config.take())
-    } else {
-        (None, None)
-    };
-
-    let response_format = params.response_format.take();
-    let response_mime_type = params.response_mime_type.take();
-
-    if response_format.is_some() && response_mime_type.is_none() {
-        return Err(CompletionError::RequestError(Box::new(
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "response_mime_type is required when response_format is set",
+        mode: Mode,
+    ) -> Result<crate::wire::Encoded, EncodeError> {
+        use crate::providers::internal::LogTarget;
+        // `stream` is part of the request body on this wire, so the mode is
+        // in the bytes as well as in the path.
+        let streaming = matches!(mode, Mode::Streaming);
+        let body = create_request_body(self, &request, Some(streaming))?;
+        let (path, framing, target) = match streaming {
+            true => (
+                "/v1beta/interactions?alt=sse",
+                crate::wire::Framing::Sse,
+                LogTarget::Streaming,
             ),
-        )));
+            false => (
+                "/v1beta/interactions",
+                crate::wire::Framing::Whole,
+                LogTarget::Completions,
+            ),
+        };
+        crate::providers::internal::trace_json(
+            target,
+            "Gemini interactions completion request",
+            &body,
+        );
+        let request = http::Request::post(self.provider.interactions_uri(path))
+            .header("Content-Type", "application/json")
+            .header(
+                crate::providers::gemini::GeminiConfig::INTERACTIONS_KEY_HEADER,
+                self.provider.api_key.expose(),
+            )
+            .body(body.into_body())?;
+        // Gemini supplies no transport request-id response header.
+        Ok(crate::wire::Encoded::new(request, framing))
     }
 
-    Ok(CreateInteractionRequest {
-        model: if agent.is_some() { None } else { Some(model) },
-        agent,
-        input,
-        system_instruction,
-        tools,
-        response_format,
-        response_mime_type,
-        stream,
-        store: params.store.take(),
-        background: params.background.take(),
-        generation_config,
-        agent_config,
-        response_modalities: params.response_modalities.take(),
-        previous_interaction_id: params.previous_interaction_id.take(),
-        additional_params: params.additional_params.take(),
-    })
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
+        streaming::InteractionsDecoder::default()
+    }
 }
 
-fn split_system_messages_from_history(
-    history: Vec<completion::Message>,
-) -> (Vec<String>, Vec<completion::Message>) {
-    let mut system = Vec::new();
-    let mut remaining = Vec::new();
+impl ReplayTarget for Interactions {
+    /// Section 6.4 of the typed-options design, for Interactions.
+    fn map_options(
+        &self,
+        request: &CompletionRequest,
+        fields: crate::completion::options::OptionFields<'_>,
+    ) -> crate::completion::options::OptionMap {
+        let model = request.model.as_deref().unwrap_or(&self.model);
+        super::options::interactions(model, fields)
+    }
 
-    for message in history {
-        match message {
-            completion::Message::System { content } => system.push(content),
-            other => remaining.push(other),
+    fn api(&self) -> crate::message::Api {
+        API
+    }
+
+    fn provider(&self) -> &str {
+        PROVIDER_NAME
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// What the model reads, by the classifier every Gemini wire shares.
+    fn accepts(&self, model: &str) -> crate::completion::Accepts {
+        super::completion::accepts(model)
+    }
+
+    fn encodes(&self, _model: &str, media: Media<'_>) -> bool {
+        encodes(media)
+    }
+
+    /// A request naming `previous_interaction_id` continues an interaction
+    /// the API stored, which holds the calls its first results answer.
+    fn continues_stored(&self, request: &CompletionRequest) -> bool {
+        crate::completion::options::param(self, request, "previous_interaction_id")
+            .is_some_and(|id| !id.is_null())
+    }
+
+    fn normalize_tool_call_id(
+        &self,
+        id: &str,
+        _model: &str,
+        _: Option<&crate::message::Origin>,
+    ) -> String {
+        crate::providers::internal::wire_ids::legal_call_id(id, 64)
+    }
+
+    /// Gemini takes system text only in `systemInstruction`: later system
+    /// messages fold into the leading one, as pi's `collapseSystemMessages`.
+    fn later_system(&self, _model: &str) -> crate::completion::LaterSystem {
+        crate::completion::LaterSystem::Leading
+    }
+
+    fn call_id_slot(&self) -> Option<&'static str> {
+        Some("/id")
+    }
+
+    /// A step's `id` survives an edit of its block.
+    fn identity(&self, item: &Value) -> Map<String, Value> {
+        item.get("id")
+            .map(|id| Map::from_iter([("id".to_owned(), id.clone())]))
+            .unwrap_or_default()
+    }
+}
+
+/// Whether this API takes `media`: data or a URL with a media type, an
+/// image of a type Gemini reads, and a document other than a PDF only as a
+/// string, which is sent as text. A file id is never taken.
+fn encodes(media: Media<'_>) -> bool {
+    let carried = |source: &Source| {
+        matches!(
+            source,
+            Source::Url(_) | Source::Base64(_) | Source::String(_)
+        )
+    };
+    match media {
+        Media::Image(image, place) => {
+            super::completion::reads_image(image.media_type.as_ref(), place) && carried(&image.data)
+        }
+        Media::Audio(audio) => audio.media_type.is_some() && carried(&audio.data),
+        Media::Video(video) => video.media_type.is_some() && carried(&video.data),
+        Media::Document(document) => match (&document.media_type, &document.data) {
+            (None, _) => false,
+            (Some(DocumentMediaType::PDF), data) => carried(data),
+            (Some(_), data) => matches!(data, Source::String(_)),
+        },
+    }
+}
+
+/// Read an existing interaction resource or resume its event stream.
+/// Unary mode retrieves the resource once. Streaming mode resumes after
+/// `last_event_id`, or from the beginning if no event id is supplied.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct InteractionResume {
+    /// The key and the API root.
+    pub provider: crate::providers::gemini::GeminiConfig,
+    /// The interaction to read.
+    pub interaction_id: String,
+    /// The last event the consumer saw, so a resumed stream does not
+    /// redeliver it. `None` resumes from the beginning, as the API defaults.
+    pub last_event_id: Option<String>,
+}
+
+impl InteractionResume {
+    /// The wire for the interaction `interaction_id`.
+    pub fn new(
+        provider: crate::providers::gemini::GeminiConfig,
+        interaction_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider,
+            interaction_id: interaction_id.into(),
+            last_event_id: None,
         }
     }
 
-    (system, remaining)
-}
-
-async fn send_interaction_request<T>(
-    client: &InteractionsClient<T>,
-    request: crate::http_client::Request<Vec<u8>>,
-) -> Result<Interaction, CompletionError>
-where
-    T: HttpClientExt + Clone + std::fmt::Debug + Default + 'static,
-{
-    let response = client.send::<_, Vec<u8>>(request).await?;
-
-    if response.status().is_success() {
-        let response_body = response
-            .into_body()
-            .await
-            .map_err(CompletionError::HttpError)?;
-
-        let response_text = String::from_utf8_lossy(&response_body).to_string();
-
-        let response: Interaction = serde_json::from_slice(&response_body).map_err(|err| {
-            tracing::error!(
-                error = %err,
-                body = %response_text,
-                "Failed to deserialize Gemini interactions response"
-            );
-            CompletionError::JsonError(err)
-        })?;
-
-        Ok(response)
-    } else {
-        let text = String::from_utf8_lossy(
-            &response
-                .into_body()
-                .await
-                .map_err(CompletionError::HttpError)?,
-        )
-        .into();
-
-        Err(CompletionError::ProviderError(text))
+    /// Resume a streamed read after the event `last_event_id`.
+    pub fn after_event(mut self, last_event_id: impl Into<String>) -> Self {
+        self.last_event_id = Some(last_event_id.into());
+        self
     }
 }
 
-fn build_interaction_stream_path(interaction_id: &str, last_event_id: Option<&str>) -> String {
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("stream", "true");
-    if let Some(last_event_id) = last_event_id {
-        serializer.append_pair("last_event_id", last_event_id);
+impl crate::wire::Wire for InteractionResume {
+    type Op = crate::operation::Completion;
+    type Payload = crate::wire::Encoded;
+    type Frame = crate::wire::WireFrame;
+    type Decoder<'id> = streaming::InteractionsDecoder;
+    type Reassembler = streaming::document::Interaction;
+
+    /// The interaction names its own model; this wire addresses no model id.
+    /// The decoder reports the model the interaction names, which the turn's
+    /// origin takes.
+    fn describe(&self) -> Descriptor<'_> {
+        Descriptor::new(PROVIDER_NAME)
+            .telemetry(|_| GenAiOperation::Chat)
+            .replay(self)
     }
-    format!(
-        "/v1beta/interactions/{}?{}",
-        interaction_id,
-        serializer.finish()
+
+    /// Reads an existing interaction, so the request carries no body: what
+    /// to read is the wire's own data. A request that sets options,
+    /// provider options or `additional_params` is refused, since nothing
+    /// would send them.
+    fn encode(
+        &self,
+        request: CompletionRequest,
+        mode: Mode,
+    ) -> Result<crate::wire::Encoded, EncodeError> {
+        let params = crate::completion::options::request_params(
+            self,
+            &request,
+            // `request_params` takes `additional_params.tools` (provider
+            // tools included) out of the raw layer for the base to append,
+            // so the base refuses them here or they would vanish.
+            |input| {
+                if input.raw_tools()?.is_empty() {
+                    Ok(Map::new())
+                } else {
+                    Err(EncodeError::request(
+                        "a resumed interaction takes no `additional_params.tools` or provider \
+                         tools: it is read, not created",
+                    ))
+                }
+            },
+            crate::completion::options::RawAt::Top,
+            &[],
+        )?;
+        if !params.is_empty() {
+            return Err(EncodeError::request(
+                "a resumed interaction takes no provider options or `additional_params`: it is \
+                 read, not created",
+            ));
+        }
+        let id = &self.interaction_id;
+        let (path, framing) = match mode {
+            Mode::Unary => (
+                format!("/v1beta/interactions/{id}"),
+                crate::wire::Framing::Whole,
+            ),
+            Mode::Streaming => {
+                let mut query = form_urlencoded::Serializer::new(String::new());
+                query.append_pair("stream", "true");
+                if let Some(last_event_id) = &self.last_event_id {
+                    query.append_pair("last_event_id", last_event_id);
+                }
+                let path = format!("/v1beta/interactions/{id}?{}&alt=sse", query.finish());
+                (path, crate::wire::Framing::Sse)
+            }
+        };
+        let request = http::Request::get(self.provider.interactions_uri(&path))
+            .header(
+                crate::providers::gemini::GeminiConfig::INTERACTIONS_KEY_HEADER,
+                self.provider.api_key.expose(),
+            )
+            .body(crate::wire::Body::empty())?;
+        Ok(crate::wire::Encoded::new(request, framing))
+    }
+
+    fn decoder<'id>(&self) -> Self::Decoder<'id> {
+        streaming::InteractionsDecoder::default()
+    }
+}
+
+impl ReplayTarget for InteractionResume {
+    /// A resumed interaction is read, not created, so every set option is
+    /// refused.
+    fn map_options(
+        &self,
+        _request: &CompletionRequest,
+        fields: crate::completion::options::OptionFields<'_>,
+    ) -> crate::completion::options::OptionMap {
+        use crate::completion::options::{Mapping, OptionFields, OptionMap};
+        let OptionFields {
+            reasoning,
+            cache,
+            service_tier,
+            verbosity,
+            parallel_tool_calls,
+            top_p,
+            seed,
+            stop,
+        } = fields;
+        let refuse = |set: bool| match set {
+            true => Mapping::unsupported(
+                "a resumed interaction is read, not created; its options were fixed when it was \
+                 created",
+            ),
+            false => Mapping::Nothing,
+        };
+        OptionMap {
+            reasoning: refuse(reasoning.is_some()),
+            cache: refuse(cache.is_some()),
+            service_tier: refuse(service_tier.is_some()),
+            verbosity: refuse(verbosity.is_some()),
+            parallel_tool_calls: refuse(parallel_tool_calls.is_some()),
+            top_p: refuse(top_p.is_some()),
+            seed: refuse(seed.is_some()),
+            stop: refuse(!stop.is_empty()),
+        }
+    }
+
+    fn api(&self) -> crate::message::Api {
+        API
+    }
+
+    fn provider(&self) -> &str {
+        PROVIDER_NAME
+    }
+
+    fn model(&self) -> &str {
+        ""
+    }
+
+    fn accepts(&self, model: &str) -> crate::completion::Accepts {
+        super::completion::accepts(model)
+    }
+
+    fn normalize_tool_call_id(
+        &self,
+        id: &str,
+        _model: &str,
+        _: Option<&crate::message::Origin>,
+    ) -> String {
+        crate::providers::internal::wire_ids::legal_call_id(id, 64)
+    }
+
+    /// Gemini takes system text only in `systemInstruction`: later system
+    /// messages fold into the leading one, as pi's `collapseSystemMessages`.
+    fn later_system(&self, _model: &str) -> crate::completion::LaterSystem {
+        crate::completion::LaterSystem::Leading
+    }
+
+    fn call_id_slot(&self) -> Option<&'static str> {
+        Some("/id")
+    }
+}
+
+/// The create-interaction body `request` sends on `wire`: the wire's own
+/// encoding, then the mapped options, then `additional_params`, merged by
+/// [`request_params`](crate::completion::options::request_params). Its
+/// `generation_config` merges over the typed fields key by key, its `tools`
+/// add to the request's, and an `agent` takes the place of the model.
+/// System messages become the system instruction. `stream`, when set,
+/// overrides the one the parameters name.
+///
+/// # Errors
+///
+/// When an option is refused, `additional_params` is not an object, its
+/// `tools` are not an array, or it sets `response_format` without
+/// `response_mime_type`.
+pub(crate) fn create_request_body(
+    wire: &Interactions,
+    request: &CompletionRequest,
+    stream: Option<bool>,
+) -> Result<crate::completion::options::FinalBody, EncodeError> {
+    let rewrites: Vec<_> = stream
+        .map(crate::completion::options::Rewrite::Stream)
+        .into_iter()
+        .collect();
+    crate::completion::options::request_params(
+        wire,
+        request,
+        |input| create_base(wire, request, input),
+        crate::completion::options::RawAt::Top,
+        &rewrites,
     )
 }
 
-impl TryFrom<Interaction> for completion::CompletionResponse<Interaction> {
-    type Error = CompletionError;
-
-    fn try_from(response: Interaction) -> Result<Self, Self::Error> {
-        let output_contents = response.output_contents();
-        if output_contents.is_empty() {
-            let message = match response.status.as_ref() {
-                Some(InteractionStatus::InProgress) => {
-                    "Interaction contained no outputs yet (status: InProgress). Use get_interaction for background tasks.".to_string()
-                }
-                Some(status) => format!("Interaction contained no outputs (status: {status:?})."),
-                None => "Interaction contained no outputs".to_string(),
-            };
-            return Err(CompletionError::ResponseError(message));
-        }
-
-        let content = output_contents
-            .into_iter()
-            .filter_map(|output| match assistant_content_from_output(output) {
-                Ok(Some(content)) => Some(Ok(content)),
-                Ok(None) => None,
-                Err(err) => Some(Err(err)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let choice = OneOrMany::many(content).map_err(|_| {
-            CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".to_owned(),
-            )
-        })?;
-
-        let usage = response
-            .usage
-            .as_ref()
-            .map(|usage| usage.token_usage())
-            .unwrap_or_default();
-
-        Ok(completion::CompletionResponse {
-            choice,
-            usage,
-            raw_response: response,
-            message_id: None,
-        })
+/// The wire's own encoding of `request`: model, input steps, system
+/// instruction, tools and the typed fields in `generation_config`.
+fn create_base(
+    wire: &Interactions,
+    request: &CompletionRequest,
+    input: &mut crate::completion::options::BaseInput<'_>,
+) -> Result<Map<String, Value>, EncodeError> {
+    let model = request.model.clone().unwrap_or_else(|| wire.model.clone());
+    let set = |key: &str| input.param(key).is_some_and(|value| !value.is_null());
+    let agent = set("agent");
+    if set("response_format") && !set("response_mime_type") {
+        return Err(EncodeError::request(
+            "response_mime_type is required when response_format is set",
+        ));
     }
+    let choice = request.tool_choice.clone().map(|choice| match choice {
+        Choice::Auto => json!("auto"),
+        Choice::None => json!("none"),
+        Choice::Required => json!("any"),
+        Choice::Specific { function_names } => {
+            json!({ "allowed_tools": { "mode": "validated", "tools": function_names } })
+        }
+    });
+    let config: Map<String, Value> = [
+        ("temperature", request.temperature.map(Value::from)),
+        ("max_output_tokens", request.max_tokens.map(Value::from)),
+        ("tool_choice", choice),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key.to_owned(), value?)))
+    .collect();
+    let mut tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|tool| json!({ "type": "function", "name": tool.name, "description": tool.description, "parameters": tool.parameters }))
+        .collect();
+    tools.extend(input.raw_tools()?);
+    let (mut system, mut history) = (Vec::new(), Vec::new());
+    for message in &request.chat_history {
+        match message {
+            Message::System { content } => system.push(content.clone()),
+            message => history.push(message.clone()),
+        }
+    }
+    let mut body = Map::new();
+    if !config.is_empty() {
+        body.insert("generation_config".to_owned(), Value::Object(config));
+    }
+    if !tools.is_empty() {
+        body.insert("tools".to_owned(), Value::Array(tools));
+    }
+    if !system.is_empty() {
+        body.insert("system_instruction".to_owned(), json!(system.join("\n\n")));
+    }
+    if !agent {
+        body.insert("model".to_owned(), json!(model));
+    }
+    body.insert(
+        "input".to_owned(),
+        Value::Array(steps(history, wire, &model)?),
+    );
+    Ok(body)
 }
 
-fn assistant_content_from_output(
-    output: Content,
-) -> Result<Option<completion::AssistantContent>, CompletionError> {
-    match output {
-        Content::Text(TextContent { text, .. }) => {
-            Ok(Some(completion::AssistantContent::text(text)))
-        }
-        Content::FunctionCall(FunctionCallContent {
-            name,
-            arguments,
-            id,
-            ..
-        }) => {
-            let Some(name) = name else {
-                return Ok(None);
-            };
-            let call_id = id.unwrap_or_else(|| name.clone());
-            Ok(Some(completion::AssistantContent::tool_call_with_call_id(
-                name.clone(),
-                call_id,
-                name,
-                arguments.unwrap_or(Value::Object(Map::new())),
-            )))
-        }
-        Content::Thought(ThoughtContent {
-            summary, signature, ..
-        }) => {
-            let mut reasoning_content = summary
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|content| match content {
-                    ThoughtSummaryContent::Text(text) => Some(message::ReasoningContent::Text {
-                        text: text.text,
-                        signature: None,
-                    }),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-
-            if reasoning_content.is_empty() {
-                return Ok(None);
+/// The steps `history` sends: a user message's content grouped into
+/// `user_input` steps around its function results, each a step of its own,
+/// and one step per assistant block.
+fn steps(
+    history: Vec<Message>,
+    target: &dyn ReplayTarget,
+    model: &str,
+) -> Result<Vec<Value>, EncodeError> {
+    let ids = WireIds::for_target(&history, target, model);
+    let mut steps = Vec::new();
+    for message in history {
+        match message {
+            Message::System { content } => {
+                steps.push(json!({ "type": "user_input", "content": [{ "type": "text", "text": content }] }));
             }
-
-            if let Some(signature) = signature
-                && let Some(message::ReasoningContent::Text {
-                    signature: first_signature,
-                    ..
-                }) = reasoning_content
-                    .iter_mut()
-                    .find(|content| matches!(content, message::ReasoningContent::Text { .. }))
-            {
-                *first_signature = Some(signature);
-            }
-
-            Ok(Some(completion::AssistantContent::Reasoning(Reasoning {
-                id: None,
-                content: reasoning_content,
-            })))
-        }
-        Content::Image(ImageContent {
-            data,
-            uri,
-            mime_type,
-            ..
-        }) => {
-            let Some(mime_type) = mime_type else {
-                return Err(CompletionError::ResponseError(
-                    "Image output missing mime_type".to_owned(),
-                ));
-            };
-
-            let media_type =
-                message::ImageMediaType::from_mime_type(&mime_type).ok_or_else(|| {
-                    CompletionError::ResponseError(format!(
-                        "Unsupported image output mime type {mime_type}"
-                    ))
-                })?;
-
-            let image = if let Some(data) = data {
-                message::AssistantContent::image_base64(
-                    data,
-                    Some(media_type),
-                    Some(message::ImageDetail::default()),
-                )
-            } else if let Some(uri) = uri {
-                completion::AssistantContent::Image(message::Image {
-                    data: message::DocumentSourceKind::Url(uri),
-                    media_type: Some(media_type),
-                    detail: Some(message::ImageDetail::default()),
-                    additional_params: None,
-                })
-            } else {
-                return Err(CompletionError::ResponseError(
-                    "Image output missing data or uri".to_owned(),
-                ));
-            };
-
-            Ok(Some(image))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn split_data_uri(
-    src: message::DocumentSourceKind,
-) -> Result<(Option<String>, Option<String>), message::MessageError> {
-    match src {
-        message::DocumentSourceKind::Url(uri) => Ok((None, Some(uri))),
-        message::DocumentSourceKind::Base64(data) => Ok((Some(data), None)),
-        message::DocumentSourceKind::String(data) => {
-            Ok((Some(BASE64_STANDARD.encode(data.as_bytes())), None))
-        }
-        message::DocumentSourceKind::Raw(data) => Ok((Some(BASE64_STANDARD.encode(data)), None)),
-        message::DocumentSourceKind::FileId(_) => Err(message::MessageError::ConversionError(
-            "Provider file IDs are not supported for Gemini Interactions inputs".to_string(),
-        )),
-        message::DocumentSourceKind::Unknown => Err(message::MessageError::ConversionError(
-            "Unknown content source".to_string(),
-        )),
-    }
-}
-
-/// Raw request/response types and convenience helpers for the Gemini Interactions API.
-pub mod interactions_api_types {
-    use super::split_data_uri;
-    use crate::completion::{CompletionError, GetTokenUsage, Usage};
-    use crate::message::{self, MimeType};
-    use crate::telemetry::ProviderResponseExt;
-    use base64::{Engine, prelude::BASE64_STANDARD};
-    use serde::{Deserialize, Serialize};
-    use serde_json::{Value, json};
-
-    // =================================================================
-    // Request / Response Types
-    // =================================================================
-
-    /// Optional parameters for creating an interaction.
-    #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-    #[serde(rename_all = "snake_case")]
-    pub struct AdditionalParameters {
-        pub agent: Option<String>,
-        pub agent_config: Option<AgentConfig>,
-        pub background: Option<bool>,
-        pub generation_config: Option<GenerationConfig>,
-        pub previous_interaction_id: Option<String>,
-        pub response_modalities: Option<Vec<ResponseModality>>,
-        pub response_format: Option<Value>,
-        pub response_mime_type: Option<String>,
-        pub store: Option<bool>,
-        pub stream: Option<bool>,
-        pub system_instruction: Option<String>,
-        pub tools: Option<Vec<Tool>>,
-        #[serde(flatten, skip_serializing_if = "Option::is_none")]
-        pub additional_params: Option<Value>,
-    }
-
-    /// Request body for the create interaction endpoint.
-    #[derive(Debug, Deserialize, Serialize, Clone)]
-    #[serde(rename_all = "snake_case")]
-    pub struct CreateInteractionRequest {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub model: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub agent: Option<String>,
-        pub input: InteractionInput,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub system_instruction: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tools: Option<Vec<Tool>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub response_format: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub response_mime_type: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub stream: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub store: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub background: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub generation_config: Option<GenerationConfig>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub agent_config: Option<AgentConfig>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub response_modalities: Option<Vec<ResponseModality>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub previous_interaction_id: Option<String>,
-        #[serde(flatten, skip_serializing_if = "Option::is_none")]
-        pub additional_params: Option<Value>,
-    }
-
-    /// Interaction response payload.
-    #[derive(Clone, Debug, Deserialize, Serialize, Default)]
-    #[serde(rename_all = "snake_case")]
-    pub struct Interaction {
-        #[serde(default)]
-        pub id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub model: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub agent: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub status: Option<InteractionStatus>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub object: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub created: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub updated: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub role: Option<String>,
-        #[serde(default)]
-        pub steps: Vec<Step>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub usage: Option<InteractionUsage>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub system_instruction: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tools: Option<Vec<Tool>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub background: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub response_modalities: Option<Vec<ResponseModality>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub response_format: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub response_mime_type: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub previous_interaction_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub input: Option<InteractionInput>,
-    }
-
-    impl GetTokenUsage for Interaction {
-        fn token_usage(&self) -> Usage {
-            self.usage
-                .as_ref()
-                .map(|usage| usage.token_usage())
-                .unwrap_or_default()
-        }
-    }
-
-    impl ProviderResponseExt for Interaction {
-        type OutputMessage = Content;
-        type Usage = InteractionUsage;
-
-        fn get_response_id(&self) -> Option<String> {
-            if self.id.is_empty() {
-                None
-            } else {
-                Some(self.id.clone())
-            }
-        }
-
-        fn get_response_model_name(&self) -> Option<String> {
-            self.model.clone()
-        }
-
-        fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
-            self.output_contents()
-        }
-
-        fn get_text_response(&self) -> Option<String> {
-            let text = self
-                .output_contents()
-                .iter()
-                .filter_map(|content| match content {
-                    Content::Text(text) => Some(text.text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            if text.is_empty() { None } else { Some(text) }
-        }
-
-        fn get_usage(&self) -> Option<Self::Usage> {
-            self.usage.clone()
-        }
-    }
-
-    /// Groups Google Search tool calls and results for a single interaction.
-    #[derive(Clone, Debug, Default)]
-    pub struct GoogleSearchExchange {
-        /// Call identifier used to match calls to results.
-        pub call_id: Option<String>,
-        /// One or more Google Search tool calls.
-        pub calls: Vec<GoogleSearchCallContent>,
-        /// One or more Google Search tool results.
-        pub results: Vec<GoogleSearchResultContent>,
-    }
-
-    impl GoogleSearchExchange {
-        /// Collects all queries from the stored Google Search tool calls.
-        pub fn queries(&self) -> Vec<String> {
-            let mut queries = Vec::new();
-            for call in &self.calls {
-                if let Some(args) = &call.arguments
-                    && let Some(call_queries) = &args.queries
-                {
-                    queries.extend(call_queries.clone());
-                }
-            }
-            queries
-        }
-
-        /// Collects all Google Search result entries from tool results.
-        pub fn result_items(&self) -> Vec<GoogleSearchResult> {
-            let mut items = Vec::new();
-            for result in &self.results {
-                if let Some(entries) = &result.result {
-                    items.extend(entries.clone());
-                }
-            }
-            items
-        }
-    }
-
-    /// Groups URL context tool calls and results for a single interaction.
-    #[derive(Clone, Debug, Default)]
-    pub struct UrlContextExchange {
-        /// Call identifier used to match calls to results.
-        pub call_id: Option<String>,
-        /// One or more URL context tool calls.
-        pub calls: Vec<UrlContextCallContent>,
-        /// One or more URL context tool results.
-        pub results: Vec<UrlContextResultContent>,
-    }
-
-    impl UrlContextExchange {
-        /// Collects all URLs from the stored URL context tool calls.
-        pub fn urls(&self) -> Vec<String> {
-            let mut urls = Vec::new();
-            for call in &self.calls {
-                if let Some(args) = &call.arguments
-                    && let Some(call_urls) = &args.urls
-                {
-                    urls.extend(call_urls.clone());
-                }
-            }
-            urls
-        }
-
-        /// Collects all URL context result entries from tool results.
-        pub fn result_items(&self) -> Vec<UrlContextResult> {
-            let mut items = Vec::new();
-            for result in &self.results {
-                if let Some(entries) = &result.result {
-                    items.extend(entries.clone());
-                }
-            }
-            items
-        }
-    }
-
-    /// Groups code execution tool calls and results for a single interaction.
-    #[derive(Clone, Debug, Default)]
-    pub struct CodeExecutionExchange {
-        /// Call identifier used to match calls to results.
-        pub call_id: Option<String>,
-        /// One or more code execution tool calls.
-        pub calls: Vec<CodeExecutionCallContent>,
-        /// One or more code execution tool results.
-        pub results: Vec<CodeExecutionResultContent>,
-    }
-
-    impl CodeExecutionExchange {
-        /// Collects all code snippets from the stored code execution tool calls.
-        pub fn code_snippets(&self) -> Vec<String> {
-            let mut snippets = Vec::new();
-            for call in &self.calls {
-                if let Some(args) = &call.arguments
-                    && let Some(code) = &args.code
-                {
-                    snippets.push(code.clone());
-                }
-            }
-            snippets
-        }
-
-        /// Collects all code execution outputs from tool results.
-        pub fn outputs(&self) -> Vec<String> {
-            let mut outputs = Vec::new();
-            for result in &self.results {
-                if let Some(output) = &result.result {
-                    outputs.push(output.clone());
-                }
-            }
-            outputs
-        }
-    }
-
-    impl Interaction {
-        pub(crate) fn output_contents(&self) -> Vec<Content> {
-            self.steps.iter().flat_map(Step::output_contents).collect()
-        }
-
-        /// Groups Google Search tool calls and results by call_id.
-        ///
-        /// When a call_id is missing, results are grouped with the most recent
-        /// call (identified or not) as a best-effort fallback.
-        pub fn google_search_exchanges(&self) -> Vec<GoogleSearchExchange> {
-            let mut exchanges: Vec<GoogleSearchExchange> = Vec::new();
-            let mut last_call_index: Option<usize> = None;
-            let output_contents = self.output_contents();
-
-            for content in &output_contents {
-                match content {
-                    Content::GoogleSearchCall(call) => {
-                        let index = if let Some(call_id) = call.id.as_ref() {
-                            if let Some(index) = exchanges
-                                .iter()
-                                .position(|exchange| exchange.call_id.as_deref() == Some(call_id))
-                            {
-                                if let Some(exchange) = exchanges.get_mut(index) {
-                                    exchange.calls.push(call.clone());
-                                }
-                                index
-                            } else {
-                                exchanges.push(GoogleSearchExchange {
-                                    call_id: Some(call_id.clone()),
-                                    calls: vec![call.clone()],
-                                    results: Vec::new(),
-                                });
-                                exchanges.len() - 1
-                            }
-                        } else {
-                            exchanges.push(GoogleSearchExchange {
-                                call_id: None,
-                                calls: vec![call.clone()],
-                                results: Vec::new(),
-                            });
-                            exchanges.len() - 1
-                        };
-                        last_call_index = Some(index);
-                    }
-                    Content::GoogleSearchResult(result) => {
-                        if let Some(call_id) = result.call_id.as_ref() {
-                            if let Some(index) = exchanges
-                                .iter()
-                                .position(|exchange| exchange.call_id.as_deref() == Some(call_id))
-                            {
-                                if let Some(exchange) = exchanges.get_mut(index) {
-                                    exchange.results.push(result.clone());
-                                }
-                            } else {
-                                exchanges.push(GoogleSearchExchange {
-                                    call_id: Some(call_id.clone()),
-                                    calls: Vec::new(),
-                                    results: vec![result.clone()],
-                                });
-                            }
-                        } else if let Some(index) = last_call_index {
-                            if let Some(exchange) = exchanges.get_mut(index) {
-                                exchange.results.push(result.clone());
-                            }
-                        } else {
-                            exchanges.push(GoogleSearchExchange {
-                                call_id: None,
-                                calls: Vec::new(),
-                                results: vec![result.clone()],
-                            });
-                            last_call_index = Some(exchanges.len() - 1);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            exchanges
-        }
-
-        /// Collects Google Search tool call contents from the interaction outputs.
-        pub fn google_search_call_contents(&self) -> Vec<GoogleSearchCallContent> {
-            self.google_search_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.calls)
-                .collect()
-        }
-
-        /// Collects Google Search result contents from the interaction outputs.
-        pub fn google_search_result_contents(&self) -> Vec<GoogleSearchResultContent> {
-            self.google_search_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.results)
-                .collect()
-        }
-
-        /// Collects all Google Search queries from tool calls in the outputs.
-        pub fn google_search_queries(&self) -> Vec<String> {
-            self.google_search_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.queries())
-                .collect()
-        }
-
-        /// Collects all Google Search result entries from tool results in the outputs.
-        pub fn google_search_results(&self) -> Vec<GoogleSearchResult> {
-            self.google_search_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.result_items())
-                .collect()
-        }
-
-        /// Groups URL context tool calls and results by call_id.
-        ///
-        /// When a call_id is missing, results are grouped with the most recent
-        /// call (identified or not) as a best-effort fallback.
-        pub fn url_context_exchanges(&self) -> Vec<UrlContextExchange> {
-            let mut exchanges: Vec<UrlContextExchange> = Vec::new();
-            let mut last_call_index: Option<usize> = None;
-            let output_contents = self.output_contents();
-
-            for content in &output_contents {
-                match content {
-                    Content::UrlContextCall(call) => {
-                        let index = if let Some(call_id) = call.id.as_ref() {
-                            if let Some(index) = exchanges
-                                .iter()
-                                .position(|exchange| exchange.call_id.as_deref() == Some(call_id))
-                            {
-                                if let Some(exchange) = exchanges.get_mut(index) {
-                                    exchange.calls.push(call.clone());
-                                }
-                                index
-                            } else {
-                                exchanges.push(UrlContextExchange {
-                                    call_id: Some(call_id.clone()),
-                                    calls: vec![call.clone()],
-                                    results: Vec::new(),
-                                });
-                                exchanges.len() - 1
-                            }
-                        } else {
-                            exchanges.push(UrlContextExchange {
-                                call_id: None,
-                                calls: vec![call.clone()],
-                                results: Vec::new(),
-                            });
-                            exchanges.len() - 1
-                        };
-                        last_call_index = Some(index);
-                    }
-                    Content::UrlContextResult(result) => {
-                        if let Some(call_id) = result.call_id.as_ref() {
-                            if let Some(index) = exchanges
-                                .iter()
-                                .position(|exchange| exchange.call_id.as_deref() == Some(call_id))
-                            {
-                                if let Some(exchange) = exchanges.get_mut(index) {
-                                    exchange.results.push(result.clone());
-                                }
-                            } else {
-                                exchanges.push(UrlContextExchange {
-                                    call_id: Some(call_id.clone()),
-                                    calls: Vec::new(),
-                                    results: vec![result.clone()],
-                                });
-                            }
-                        } else if let Some(index) = last_call_index {
-                            if let Some(exchange) = exchanges.get_mut(index) {
-                                exchange.results.push(result.clone());
-                            }
-                        } else {
-                            exchanges.push(UrlContextExchange {
-                                call_id: None,
-                                calls: Vec::new(),
-                                results: vec![result.clone()],
-                            });
-                            last_call_index = Some(exchanges.len() - 1);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            exchanges
-        }
-
-        /// Collects URL context tool call contents from the interaction outputs.
-        pub fn url_context_call_contents(&self) -> Vec<UrlContextCallContent> {
-            self.url_context_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.calls)
-                .collect()
-        }
-
-        /// Collects URL context result contents from the interaction outputs.
-        pub fn url_context_result_contents(&self) -> Vec<UrlContextResultContent> {
-            self.url_context_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.results)
-                .collect()
-        }
-
-        /// Collects all URLs from URL context tool calls in the outputs.
-        pub fn url_context_urls(&self) -> Vec<String> {
-            self.url_context_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.urls())
-                .collect()
-        }
-
-        /// Collects all URL context result entries from tool results in the outputs.
-        pub fn url_context_results(&self) -> Vec<UrlContextResult> {
-            self.url_context_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.result_items())
-                .collect()
-        }
-
-        /// Groups code execution tool calls and results by call_id.
-        ///
-        /// When a call_id is missing, results are grouped with the most recent
-        /// call (identified or not) as a best-effort fallback.
-        pub fn code_execution_exchanges(&self) -> Vec<CodeExecutionExchange> {
-            let mut exchanges: Vec<CodeExecutionExchange> = Vec::new();
-            let mut last_call_index: Option<usize> = None;
-            let output_contents = self.output_contents();
-
-            for content in &output_contents {
-                match content {
-                    Content::CodeExecutionCall(call) => {
-                        let index = if let Some(call_id) = call.id.as_ref() {
-                            if let Some(index) = exchanges
-                                .iter()
-                                .position(|exchange| exchange.call_id.as_deref() == Some(call_id))
-                            {
-                                if let Some(exchange) = exchanges.get_mut(index) {
-                                    exchange.calls.push(call.clone());
-                                }
-                                index
-                            } else {
-                                exchanges.push(CodeExecutionExchange {
-                                    call_id: Some(call_id.clone()),
-                                    calls: vec![call.clone()],
-                                    results: Vec::new(),
-                                });
-                                exchanges.len() - 1
-                            }
-                        } else {
-                            exchanges.push(CodeExecutionExchange {
-                                call_id: None,
-                                calls: vec![call.clone()],
-                                results: Vec::new(),
-                            });
-                            exchanges.len() - 1
-                        };
-                        last_call_index = Some(index);
-                    }
-                    Content::CodeExecutionResult(result) => {
-                        if let Some(call_id) = result.call_id.as_ref() {
-                            if let Some(index) = exchanges
-                                .iter()
-                                .position(|exchange| exchange.call_id.as_deref() == Some(call_id))
-                            {
-                                if let Some(exchange) = exchanges.get_mut(index) {
-                                    exchange.results.push(result.clone());
-                                }
-                            } else {
-                                exchanges.push(CodeExecutionExchange {
-                                    call_id: Some(call_id.clone()),
-                                    calls: Vec::new(),
-                                    results: vec![result.clone()],
-                                });
-                            }
-                        } else if let Some(index) = last_call_index {
-                            if let Some(exchange) = exchanges.get_mut(index) {
-                                exchange.results.push(result.clone());
-                            }
-                        } else {
-                            exchanges.push(CodeExecutionExchange {
-                                call_id: None,
-                                calls: Vec::new(),
-                                results: vec![result.clone()],
-                            });
-                            last_call_index = Some(exchanges.len() - 1);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            exchanges
-        }
-
-        /// Collects code execution tool call contents from the interaction outputs.
-        pub fn code_execution_call_contents(&self) -> Vec<CodeExecutionCallContent> {
-            self.code_execution_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.calls)
-                .collect()
-        }
-
-        /// Collects code execution result contents from the interaction outputs.
-        pub fn code_execution_result_contents(&self) -> Vec<CodeExecutionResultContent> {
-            self.code_execution_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.results)
-                .collect()
-        }
-
-        /// Collects all code snippets from code execution calls in the outputs.
-        pub fn code_execution_snippets(&self) -> Vec<String> {
-            self.code_execution_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.code_snippets())
-                .collect()
-        }
-
-        /// Collects all code execution outputs from tool results in the outputs.
-        pub fn code_execution_outputs(&self) -> Vec<String> {
-            self.code_execution_exchanges()
-                .into_iter()
-                .flat_map(|exchange| exchange.outputs())
-                .collect()
-        }
-
-        /// Returns concatenated text outputs with inline citations appended.
-        pub fn text_with_inline_citations(&self) -> Option<String> {
-            let text = self
-                .output_contents()
-                .iter()
-                .filter_map(|content| match content {
-                    Content::Text(text) => Some(text.with_inline_citations()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            if text.is_empty() { None } else { Some(text) }
-        }
-
-        /// Returns true when the interaction is in a terminal state.
-        pub fn is_terminal(&self) -> bool {
-            self.status
-                .as_ref()
-                .is_some_and(InteractionStatus::is_terminal)
-        }
-
-        /// Returns true when the interaction completed successfully.
-        pub fn is_completed(&self) -> bool {
-            matches!(self.status, Some(InteractionStatus::Completed))
-        }
-    }
-
-    /// Lifecycle status of an interaction.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum InteractionStatus {
-        InProgress,
-        RequiresAction,
-        Incomplete,
-        BudgetExceeded,
-        Completed,
-        Failed,
-        Cancelled,
-    }
-
-    impl InteractionStatus {
-        /// Returns true if the status is terminal.
-        pub fn is_terminal(&self) -> bool {
-            matches!(
-                self,
-                InteractionStatus::Completed
-                    | InteractionStatus::Incomplete
-                    | InteractionStatus::BudgetExceeded
-                    | InteractionStatus::Failed
-                    | InteractionStatus::Cancelled
-            )
-        }
-    }
-
-    /// Token usage metadata for an interaction.
-    #[derive(Clone, Debug, Deserialize, Serialize, Default)]
-    #[serde(rename_all = "snake_case")]
-    pub struct InteractionUsage {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub total_input_tokens: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub total_output_tokens: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub total_tokens: Option<u64>,
-    }
-
-    impl GetTokenUsage for InteractionUsage {
-        fn token_usage(&self) -> Usage {
-            let mut usage = Usage::new();
-            usage.input_tokens = self.total_input_tokens.unwrap_or_default();
-            usage.output_tokens = self.total_output_tokens.unwrap_or_default();
-            usage.total_tokens = self
-                .total_tokens
-                .unwrap_or(usage.input_tokens + usage.output_tokens);
-            usage
-        }
-    }
-
-    /// Input payload accepted by the Interactions API.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(untagged)]
-    pub enum InteractionInput {
-        Text(String),
-        Content(Content),
-        Steps(Vec<Step>),
-        Contents(Vec<Content>),
-    }
-
-    /// Single interaction step.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(tag = "type", rename_all = "snake_case")]
-    pub enum Step {
-        UserInput { content: Vec<Content> },
-        ModelOutput { content: Vec<Content> },
-        Thought(ThoughtContent),
-        FunctionCall(FunctionCallContent),
-        FunctionResult(FunctionResultContent),
-        CodeExecutionCall(CodeExecutionCallContent),
-        CodeExecutionResult(CodeExecutionResultContent),
-        UrlContextCall(UrlContextCallContent),
-        UrlContextResult(UrlContextResultContent),
-        GoogleSearchCall(GoogleSearchCallContent),
-        GoogleSearchResult(GoogleSearchResultContent),
-        McpServerToolCall(McpServerToolCallContent),
-        McpServerToolResult(McpServerToolResultContent),
-        FileSearchResult(FileSearchResultContent),
-    }
-
-    impl Step {
-        fn output_contents(&self) -> Vec<Content> {
-            match self {
-                Step::UserInput { .. } => Vec::new(),
-                Step::ModelOutput { content } => content.clone(),
-                Step::Thought(content) => vec![Content::Thought(content.clone())],
-                Step::FunctionCall(content) => vec![Content::FunctionCall(content.clone())],
-                Step::FunctionResult(content) => vec![Content::FunctionResult(content.clone())],
-                Step::CodeExecutionCall(content) => {
-                    vec![Content::CodeExecutionCall(content.clone())]
-                }
-                Step::CodeExecutionResult(content) => {
-                    vec![Content::CodeExecutionResult(content.clone())]
-                }
-                Step::UrlContextCall(content) => vec![Content::UrlContextCall(content.clone())],
-                Step::UrlContextResult(content) => {
-                    vec![Content::UrlContextResult(content.clone())]
-                }
-                Step::GoogleSearchCall(content) => {
-                    vec![Content::GoogleSearchCall(content.clone())]
-                }
-                Step::GoogleSearchResult(content) => {
-                    vec![Content::GoogleSearchResult(content.clone())]
-                }
-                Step::McpServerToolCall(content) => {
-                    vec![Content::McpServerToolCall(content.clone())]
-                }
-                Step::McpServerToolResult(content) => {
-                    vec![Content::McpServerToolResult(content.clone())]
-                }
-                Step::FileSearchResult(content) => {
-                    vec![Content::FileSearchResult(content.clone())]
-                }
-            }
-        }
-    }
-
-    impl TryFrom<crate::completion::Message> for Step {
-        type Error = message::MessageError;
-
-        fn try_from(message: crate::completion::Message) -> Result<Self, Self::Error> {
-            match message {
-                crate::completion::Message::System { content } => Ok(Self::UserInput {
-                    content: vec![Content::Text(TextContent {
-                        text: content,
-                        annotations: None,
-                    })],
-                }),
-                crate::completion::Message::User { content } => {
-                    let content = content
-                        .into_iter()
-                        .map(Content::try_from)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(Self::UserInput { content })
-                }
-                crate::completion::Message::Assistant { content, .. } => {
-                    let content = content
-                        .into_iter()
-                        .map(Content::try_from)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(Self::ModelOutput { content })
-                }
-            }
-        }
-    }
-
-    // =================================================================
-    // Content
-    // =================================================================
-
-    /// Text annotation metadata for citations.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct Annotation {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub start_index: Option<i64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub end_index: Option<i64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub source: Option<String>,
-    }
-
-    /// Normalized citation extracted from an annotation.
-    #[derive(Clone, Debug)]
-    pub struct Citation {
-        pub start_index: usize,
-        pub end_index: usize,
-        pub source: String,
-    }
-
-    /// Text content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct TextContent {
-        pub text: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub annotations: Option<Vec<Annotation>>,
-    }
-
-    impl TextContent {
-        /// Collects citations extracted from annotations.
-        pub fn citations(&self) -> Vec<Citation> {
-            let mut citations = Vec::new();
-            let Some(annotations) = self.annotations.as_ref() else {
-                return citations;
-            };
-
-            for annotation in annotations {
-                let (Some(start), Some(end), Some(source)) = (
-                    annotation.start_index,
-                    annotation.end_index,
-                    annotation.source.as_ref(),
-                ) else {
-                    continue;
-                };
-
-                if start < 0 || end < 0 {
-                    continue;
-                }
-                let start = start as usize;
-                let end = end as usize;
-                if end <= start || end > self.text.len() {
-                    continue;
-                }
-                if !self.text.is_char_boundary(start) || !self.text.is_char_boundary(end) {
-                    continue;
-                }
-
-                citations.push(Citation {
-                    start_index: start,
-                    end_index: end,
-                    source: source.clone(),
-                });
-            }
-
-            citations.sort_by(|a, b| {
-                a.start_index
-                    .cmp(&b.start_index)
-                    .then_with(|| a.end_index.cmp(&b.end_index))
-            });
-
-            citations
-        }
-
-        /// Returns the text with inline citations appended after annotated spans.
-        pub fn with_inline_citations(&self) -> String {
-            let citations = self.citations();
-            if citations.is_empty() {
-                return self.text.clone();
-            }
-
-            let mut source_order = Vec::new();
-            for citation in &citations {
-                if !source_order.contains(&citation.source) {
-                    source_order.push(citation.source.clone());
-                }
-            }
-
-            let mut inserts = citations
-                .iter()
-                .map(|citation| {
-                    let index = source_order
-                        .iter()
-                        .position(|source| source == &citation.source)
-                        .map(|idx| idx + 1)
-                        .unwrap_or(0);
-                    (
-                        citation.start_index,
-                        citation.end_index,
-                        index,
-                        &citation.source,
-                    )
-                })
-                .collect::<Vec<_>>();
-
-            inserts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
-
-            let mut text = self.text.clone();
-            for (_, end, index, source) in inserts {
-                if index == 0 {
-                    continue;
-                }
-                let citation = format!("[{}]({})", index, source);
-                text.insert_str(end, &citation);
-            }
-
-            text
-        }
-    }
-
-    /// Image content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct ImageContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub resolution: Option<MediaResolution>,
-    }
-
-    /// Audio content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct AudioContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-    }
-
-    /// Document content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct DocumentContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-    }
-
-    /// Video content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct VideoContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub resolution: Option<MediaResolution>,
-    }
-
-    /// Thought summary content.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct ThoughtContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub signature: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub summary: Option<Vec<ThoughtSummaryContent>>,
-    }
-
-    /// Thought summary item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(untagged)]
-    pub enum ThoughtSummaryContent {
-        Text(TextContent),
-        Image(ImageContent),
-    }
-
-    /// Function call content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FunctionCallContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Function result content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FunctionResultContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Arguments for a code execution call.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct CodeExecutionCallArguments {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub language: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub code: Option<String>,
-    }
-
-    /// Code execution call content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct CodeExecutionCallContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<CodeExecutionCallArguments>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Code execution result content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct CodeExecutionResultContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub signature: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Arguments for a URL context call.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct UrlContextCallArguments {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub urls: Option<Vec<String>>,
-    }
-
-    /// URL context call content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct UrlContextCallContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<UrlContextCallArguments>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// URL context result entry.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct UrlContextResult {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub url: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub status: Option<String>,
-    }
-
-    /// URL context result content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct UrlContextResultContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub signature: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Vec<UrlContextResult>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Arguments for a Google Search call.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct GoogleSearchCallArguments {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub queries: Option<Vec<String>>,
-    }
-
-    /// Google Search call content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct GoogleSearchCallContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<GoogleSearchCallArguments>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Google Search result entry.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct GoogleSearchResult {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub url: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub title: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub rendered_content: Option<String>,
-    }
-
-    /// Google Search result content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct GoogleSearchResultContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub signature: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Vec<GoogleSearchResult>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// MCP server tool call content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct McpServerToolCallContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub server_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// MCP server tool result content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct McpServerToolResultContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub server_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// File search result entry.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FileSearchResult {
-        pub title: String,
-        pub text: String,
-        pub file_search_store: String,
-    }
-
-    /// File search result content item.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FileSearchResultContent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Vec<FileSearchResult>>,
-    }
-
-    /// Content item produced or consumed by the Interactions API.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(tag = "type", rename_all = "snake_case")]
-    pub enum Content {
-        Text(TextContent),
-        Image(ImageContent),
-        Audio(AudioContent),
-        Document(DocumentContent),
-        Video(VideoContent),
-        Thought(ThoughtContent),
-        FunctionCall(FunctionCallContent),
-        FunctionResult(FunctionResultContent),
-        CodeExecutionCall(CodeExecutionCallContent),
-        CodeExecutionResult(CodeExecutionResultContent),
-        UrlContextCall(UrlContextCallContent),
-        UrlContextResult(UrlContextResultContent),
-        GoogleSearchCall(GoogleSearchCallContent),
-        GoogleSearchResult(GoogleSearchResultContent),
-        McpServerToolCall(McpServerToolCallContent),
-        McpServerToolResult(McpServerToolResultContent),
-        FileSearchResult(FileSearchResultContent),
-    }
-
-    impl TryFrom<message::UserContent> for Content {
-        type Error = message::MessageError;
-
-        fn try_from(content: message::UserContent) -> Result<Self, Self::Error> {
-            match content {
-                message::UserContent::Text(message::Text { text, .. }) => {
-                    Ok(Self::Text(TextContent {
-                        text,
-                        annotations: None,
-                    }))
-                }
-                message::UserContent::ToolResult(message::ToolResult {
-                    id,
-                    call_id,
-                    content,
-                }) => {
-                    let Some(call_id) = call_id else {
-                        return Err(message::MessageError::ConversionError(
-                            "Tool results require call_id for Gemini Interactions API".to_string(),
-                        ));
+            Message::User { content } => {
+                let mut run = Vec::new();
+                for part in content {
+                    let UserContent::ToolResult(result) = part else {
+                        run.push(user_content(part)?);
+                        continue;
                     };
-
-                    let content = content.first();
-
-                    let message::ToolResultContent::Text(text) = content else {
-                        return Err(message::MessageError::ConversionError(
-                            "Tool result content must be text".to_string(),
-                        ));
+                    if !run.is_empty() {
+                        steps.push(
+                            json!({ "type": "user_input", "content": std::mem::take(&mut run) }),
+                        );
+                    }
+                    let mut contents = result.content;
+                    let value = match (contents.len(), contents.pop()) {
+                        (1, Some(ToolResultContent::Text(text))) => Value::String(text.text),
+                        // A scalar or array JSON result is wrapped as the
+                        // generate wire wraps it: sent as a text block it is a
+                        // multimodal response, which the models refuse.
+                        (
+                            1,
+                            Some(ToolResultContent::Json {
+                                value: value @ (Value::String(_) | Value::Object(_)),
+                            }),
+                        ) => value,
+                        (1, Some(ToolResultContent::Json { value })) => json!({ "result": value }),
+                        (_, last) => {
+                            contents.extend(last);
+                            Value::Array(
+                                contents
+                                    .into_iter()
+                                    .map(result_content)
+                                    .collect::<Result<_, _>>()?,
+                            )
+                        }
                     };
-
-                    let result: Value = serde_json::from_str(&text.text).unwrap_or_else(|error| {
-                        tracing::trace!(?error, "Tool result is not valid JSON; sending as string");
-                        json!(text.text)
+                    let mut step = json!({
+                        "type": "function_result",
+                        "name": result.name,
+                        "call_id": ids.of(&result.call),
+                        "result": value,
                     });
-
-                    Ok(Self::FunctionResult(FunctionResultContent {
-                        name: Some(id),
-                        is_error: None,
-                        result: Some(result),
-                        call_id: Some(call_id),
-                    }))
-                }
-                message::UserContent::Image(message::Image {
-                    data, media_type, ..
-                }) => {
-                    let media_type = media_type.ok_or_else(|| {
-                        message::MessageError::ConversionError(
-                            "Media type for image is required for Gemini".to_string(),
-                        )
-                    })?;
-                    let mime_type = media_type.to_mime_type().to_string();
-                    let (data, uri) = split_data_uri(data)?;
-                    Ok(Self::Image(ImageContent {
-                        data,
-                        uri,
-                        mime_type: Some(mime_type),
-                        resolution: None,
-                    }))
-                }
-                message::UserContent::Audio(message::Audio {
-                    data, media_type, ..
-                }) => {
-                    let media_type = media_type.ok_or_else(|| {
-                        message::MessageError::ConversionError(
-                            "Media type for audio is required for Gemini".to_string(),
-                        )
-                    })?;
-                    let mime_type = media_type.to_mime_type().to_string();
-                    let (data, uri) = split_data_uri(data)?;
-                    Ok(Self::Audio(AudioContent {
-                        data,
-                        uri,
-                        mime_type: Some(mime_type),
-                    }))
-                }
-                message::UserContent::Video(message::Video {
-                    data, media_type, ..
-                }) => {
-                    let media_type = media_type.ok_or_else(|| {
-                        message::MessageError::ConversionError(
-                            "Media type for video is required for Gemini".to_string(),
-                        )
-                    })?;
-                    let mime_type = media_type.to_mime_type().to_string();
-                    let (data, uri) = split_data_uri(data)?;
-                    Ok(Self::Video(VideoContent {
-                        data,
-                        uri,
-                        mime_type: Some(mime_type),
-                        resolution: None,
-                    }))
-                }
-                message::UserContent::Document(message::Document {
-                    data, media_type, ..
-                }) => {
-                    let media_type = media_type.ok_or_else(|| {
-                        message::MessageError::ConversionError(
-                            "Media type for document is required for Gemini".to_string(),
-                        )
-                    })?;
-                    if matches!(media_type, message::DocumentMediaType::TXT) {
-                        let text = match data {
-                            message::DocumentSourceKind::String(text) => text,
-                            message::DocumentSourceKind::Base64(data) => {
-                                let decoded = BASE64_STANDARD.decode(data).map_err(|error| {
-                                    message::MessageError::ConversionError(format!(
-                                        "Failed to decode text document base64 data: {error}"
-                                    ))
-                                })?;
-                                String::from_utf8(decoded).map_err(|error| {
-                                    message::MessageError::ConversionError(format!(
-                                        "Text document data must be UTF-8: {error}"
-                                    ))
-                                })?
-                            }
-                            message::DocumentSourceKind::Raw(data) => String::from_utf8(data)
-                                .map_err(|error| {
-                                    message::MessageError::ConversionError(format!(
-                                        "Text document data must be UTF-8: {error}"
-                                    ))
-                                })?,
-                            message::DocumentSourceKind::Url(_) => {
-                                return Err(message::MessageError::ConversionError(
-                                    "Text document URLs are not supported for Gemini Interactions inputs"
-                                        .to_string(),
-                                ));
-                            }
-                            message::DocumentSourceKind::FileId(_) => {
-                                return Err(message::MessageError::ConversionError(
-                                    "Provider file IDs are not supported for Gemini Interactions inputs"
-                                        .to_string(),
-                                ));
-                            }
-                            message::DocumentSourceKind::Unknown => {
-                                return Err(message::MessageError::ConversionError(
-                                    "Unknown content source".to_string(),
-                                ));
-                            }
-                        };
-                        return Ok(Self::Text(TextContent {
-                            text,
-                            annotations: None,
-                        }));
+                    if let (true, Some(step)) = (result.is_error, step.as_object_mut()) {
+                        step.insert("is_error".to_owned(), Value::Bool(true));
                     }
-                    let mime_type = media_type.to_mime_type().to_string();
-                    let (data, uri) = split_data_uri(data)?;
-                    Ok(Self::Document(DocumentContent {
-                        data,
-                        uri,
-                        mime_type: Some(mime_type),
-                    }))
+                    steps.push(step);
+                }
+                if !run.is_empty() {
+                    steps.push(json!({ "type": "user_input", "content": run }));
+                }
+            }
+            Message::Assistant(turn) => {
+                for block in &turn.content {
+                    steps.extend(assistant_step(block, target, &ids)?);
                 }
             }
         }
     }
+    Ok(steps)
+}
 
-    impl TryFrom<message::AssistantContent> for Content {
-        type Error = message::MessageError;
+/// A block of a tool result as a content item.
+fn result_content(content: ToolResultContent) -> Result<Value, EncodeError> {
+    Ok(match content {
+        ToolResultContent::Text(text) => json!({ "type": "text", "text": text.text }),
+        ToolResultContent::Json { value } => json!({ "type": "text", "text": value.to_string() }),
+        ToolResultContent::Image(image) => media("image", image.media_type, image.data)?,
+    })
+}
 
-        fn try_from(content: message::AssistantContent) -> Result<Self, Self::Error> {
-            match content {
-                message::AssistantContent::Text(message::Text { text, .. }) => {
-                    Ok(Self::Text(TextContent {
-                        text,
-                        annotations: None,
-                    }))
-                }
-                message::AssistantContent::ToolCall(tool_call) => {
-                    let call_id = tool_call.call_id.unwrap_or_else(|| tool_call.id.clone());
-                    Ok(Self::FunctionCall(FunctionCallContent {
-                        name: Some(tool_call.function.name),
-                        arguments: Some(tool_call.function.arguments),
-                        id: Some(call_id),
-                    }))
-                }
-                message::AssistantContent::Reasoning(message::Reasoning { content, .. }) => {
-                    let mut signature = None;
-                    let summary = content
-                        .into_iter()
-                        .map(|reasoning_content| {
-                            let text = match reasoning_content {
-                                message::ReasoningContent::Text {
-                                    text,
-                                    signature: content_signature,
-                                } => {
-                                    if signature.is_none() {
-                                        signature = content_signature;
-                                    }
-                                    text
-                                }
-                                message::ReasoningContent::Summary(text)
-                                | message::ReasoningContent::Encrypted(text) => text,
-                                message::ReasoningContent::Redacted { data } => data,
-                            };
-
-                            ThoughtSummaryContent::Text(TextContent {
-                                text,
-                                annotations: None,
-                            })
-                        })
-                        .collect();
-
-                    Ok(Self::Thought(ThoughtContent {
-                        signature,
-                        summary: Some(summary),
-                    }))
-                }
-                message::AssistantContent::Image(message::Image {
-                    data, media_type, ..
-                }) => {
-                    let media_type = media_type.ok_or_else(|| {
-                        message::MessageError::ConversionError(
-                            "Media type for image is required for Gemini".to_string(),
-                        )
-                    })?;
-                    let mime_type = media_type.to_mime_type().to_string();
-                    let (data, uri) = split_data_uri(data)?;
-                    Ok(Self::Image(ImageContent {
-                        data,
-                        uri,
-                        mime_type: Some(mime_type),
-                        resolution: None,
-                    }))
-                }
+/// A user part as a content item. A text document goes as text, so that RAG
+/// context reads as prose.
+fn user_content(part: UserContent) -> Result<Value, EncodeError> {
+    match part {
+        UserContent::Text(text) => Ok(json!({ "type": "text", "text": text.text })),
+        UserContent::Image(image) => media("image", image.media_type, image.data),
+        UserContent::Audio(audio) => media("audio", audio.media_type, audio.data),
+        UserContent::Video(video) => media("video", video.media_type, video.data),
+        UserContent::Document(document) => match (document.media_type, document.data) {
+            (Some(media_type), Source::String(text)) if media_type != DocumentMediaType::PDF => {
+                Ok(json!({ "type": "text", "text": text }))
             }
+            (media_type, data) => media("document", media_type, data),
+        },
+        UserContent::ToolResult(_) => {
+            Err(EncodeError::request("a tool result is a step of its own"))
         }
     }
+}
 
-    // =================================================================
-    // Tools / Config
-    // =================================================================
+/// A media content item of `kind`: a URL as its `uri`, and base64 data, or a
+/// string's bytes in base64, as its `data`. [`encodes`] refuses every other
+/// form, so the adapter passes none.
+fn media<M: MimeType>(
+    kind: &str,
+    media_type: Option<M>,
+    source: Source,
+) -> Result<Value, EncodeError> {
+    let unsendable = || {
+        EncodeError::request(format!(
+            "Gemini Interactions cannot receive this {kind} in its form"
+        ))
+    };
+    let mime_type = media_type.ok_or_else(unsendable)?.to_mime_type().to_owned();
+    let key = match super::completion::carried(source, false)? {
+        (true, uri) => ("uri", uri),
+        (false, data) => ("data", data),
+    };
+    Ok(json!({ "type": kind, key.0: key.1, "mime_type": mime_type }))
+}
 
-    /// Response modalities supported by the model.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum ResponseModality {
-        Text,
-        Image,
-        Audio,
-    }
-
-    /// Thinking depth hint for generation.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum ThinkingLevel {
-        Minimal,
-        Low,
-        Medium,
-        High,
-    }
-
-    /// Thinking summary behavior.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum ThinkingSummaries {
-        Auto,
-        None,
-    }
-
-    /// Speech synthesis configuration.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub struct SpeechConfig {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub voice: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub language: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub speaker: Option<String>,
-    }
-
-    /// Generation configuration for the Interactions API.
-    #[derive(Clone, Debug, Deserialize, Serialize, Default)]
-    #[serde(rename_all = "snake_case")]
-    pub struct GenerationConfig {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub temperature: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub top_p: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub seed: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub stop_sequences: Option<Vec<String>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tool_choice: Option<ToolChoice>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub thinking_level: Option<ThinkingLevel>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub thinking_summaries: Option<ThinkingSummaries>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub max_output_tokens: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub speech_config: Option<Vec<SpeechConfig>>,
-    }
-
-    impl GenerationConfig {
-        /// Returns true when no generation fields are set.
-        pub fn is_empty(&self) -> bool {
-            self.temperature.is_none()
-                && self.top_p.is_none()
-                && self.seed.is_none()
-                && self.stop_sequences.is_none()
-                && self.tool_choice.is_none()
-                && self.thinking_level.is_none()
-                && self.thinking_summaries.is_none()
-                && self.max_output_tokens.is_none()
-                && self.speech_config.is_none()
+/// An assistant block as its step: the provider's step while the block is
+/// current, else one rebuilt from its canonical fields, keeping the keys
+/// its edited step names; `None` for reasoning with nothing to send.
+fn assistant_step(
+    block: &AssistantContent,
+    target: &dyn ReplayTarget,
+    ids: &WireIds,
+) -> Result<Option<Value>, EncodeError> {
+    let identity = match block.replay(target, ids) {
+        Replay::Item(item) => return Ok(Some(item.into_owned())),
+        Replay::Identity(identity) => identity,
+        Replay::Rebuild => Map::new(),
+    };
+    let output = |content: Value| json!({ "type": "model_output", "content": [content] });
+    let mut step = match block {
+        AssistantContent::Text(text) => output(json!({ "type": "text", "text": text.text })),
+        AssistantContent::Reasoning(reasoning)
+            if reasoning.redacted || reasoning.text.trim().is_empty() =>
+        {
+            return Ok(None);
+        }
+        AssistantContent::Reasoning(reasoning) => {
+            json!({ "type": "thought", "summary": [{ "type": "text", "text": reasoning.text }] })
+        }
+        AssistantContent::ToolCall(call) => json!({
+            "type": "function_call",
+            "name": call.function.name,
+            "arguments": call.function.arguments_value(),
+        }),
+        AssistantContent::Image(image) => output(media(
+            "image",
+            image.media_type.clone(),
+            image.data.clone(),
+        )?),
+        AssistantContent::Opaque(opaque) => return Ok(Some(opaque.item.clone())),
+    };
+    if let Some(fields) = step.as_object_mut() {
+        fields.extend(identity);
+        if let AssistantContent::ToolCall(call) = block {
+            fields.insert("id".to_owned(), json!(ids.of(&call.id)));
         }
     }
-
-    /// Tool selection strategy.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(untagged)]
-    pub enum ToolChoice {
-        Type(ToolChoiceType),
-        Config(ToolChoiceConfig),
-    }
-
-    /// Tool selection mode.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum ToolChoiceType {
-        Auto,
-        Any,
-        None,
-        Validated,
-    }
-
-    /// Tool selection configuration.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct ToolChoiceConfig {
-        pub allowed_tools: AllowedTools,
-    }
-
-    /// Allowed tools for tool selection.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct AllowedTools {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mode: Option<ToolChoiceType>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tools: Option<Vec<String>>,
-    }
-
-    /// Tool definition for Interactions API.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(tag = "type", rename_all = "snake_case")]
-    pub enum Tool {
-        Function(FunctionTool),
-        GoogleSearch,
-        CodeExecution,
-        UrlContext,
-        ComputerUse(ComputerUseTool),
-        McpServer(McpServerTool),
-        FileSearch(FileSearchTool),
-    }
-
-    /// Function tool definition.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FunctionTool {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub description: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub parameters: Option<Value>,
-    }
-
-    /// Computer use tool configuration.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct ComputerUseTool {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub environment: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub excluded_predefined_functions: Option<Vec<String>>,
-    }
-
-    /// MCP server tool configuration.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct McpServerTool {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub url: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub headers: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub allowed_tools: Option<AllowedTools>,
-    }
-
-    /// File search tool configuration.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FileSearchTool {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub file_search_store_names: Option<Vec<String>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub top_k: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub metadata_filter: Option<String>,
-    }
-
-    impl TryFrom<crate::completion::ToolDefinition> for Tool {
-        type Error = CompletionError;
-
-        fn try_from(tool: crate::completion::ToolDefinition) -> Result<Self, Self::Error> {
-            Ok(Tool::Function(FunctionTool {
-                name: Some(tool.name),
-                description: Some(tool.description),
-                parameters: Some(tool.parameters),
-            }))
-        }
-    }
-
-    impl TryFrom<message::ToolChoice> for ToolChoice {
-        type Error = CompletionError;
-
-        fn try_from(tool_choice: message::ToolChoice) -> Result<Self, Self::Error> {
-            match tool_choice {
-                message::ToolChoice::Auto => Ok(ToolChoice::Type(ToolChoiceType::Auto)),
-                message::ToolChoice::None => Ok(ToolChoice::Type(ToolChoiceType::None)),
-                message::ToolChoice::Required => Ok(ToolChoice::Type(ToolChoiceType::Any)),
-                message::ToolChoice::Specific { function_names } => {
-                    Ok(ToolChoice::Config(ToolChoiceConfig {
-                        allowed_tools: AllowedTools {
-                            mode: Some(ToolChoiceType::Validated),
-                            tools: Some(function_names),
-                        },
-                    }))
-                }
-            }
-        }
-    }
-
-    /// Agent configuration for Interactions API.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(tag = "type", rename_all = "kebab-case")]
-    pub enum AgentConfig {
-        Dynamic,
-        DeepResearch {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            thinking_summaries: Option<ThinkingSummaries>,
-        },
-    }
-
-    /// Media resolution hint for multimodal content.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum MediaResolution {
-        Low,
-        Medium,
-        High,
-        UltraHigh,
-    }
-
-    // =================================================================
-    // Streaming Events
-    // =================================================================
-
-    /// Server-sent event payloads for streaming interactions.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(tag = "event_type")]
-    pub enum InteractionSseEvent {
-        #[serde(rename = "interaction.created")]
-        InteractionCreated {
-            interaction: Interaction,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            event_id: Option<String>,
-        },
-        #[serde(rename = "interaction.completed")]
-        InteractionCompleted {
-            interaction: Interaction,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            event_id: Option<String>,
-        },
-        #[serde(rename = "interaction.status_update")]
-        InteractionStatusUpdate {
-            interaction_id: String,
-            status: InteractionStatus,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            event_id: Option<String>,
-        },
-        #[serde(rename = "step.start")]
-        StepStart {
-            index: i32,
-            step: Step,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            event_id: Option<String>,
-        },
-        #[serde(rename = "step.delta")]
-        StepDelta {
-            index: i32,
-            delta: ContentDelta,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            event_id: Option<String>,
-        },
-        #[serde(rename = "step.stop")]
-        StepStop {
-            index: i32,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            event_id: Option<String>,
-        },
-        #[serde(rename = "error")]
-        Error {
-            error: ErrorEvent,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            event_id: Option<String>,
-        },
-    }
-
-    /// Error payload for streaming events.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct ErrorEvent {
-        pub code: String,
-        pub message: String,
-    }
-
-    /// Content delta item in streaming events.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    #[serde(tag = "type", rename_all = "snake_case")]
-    pub enum ContentDelta {
-        Text(TextDelta),
-        Image(ImageDelta),
-        Audio(AudioDelta),
-        Document(DocumentDelta),
-        Video(VideoDelta),
-        ThoughtSummary(ThoughtSummaryDelta),
-        ThoughtSignature(ThoughtSignatureDelta),
-        FunctionCall(FunctionCallDelta),
-        FunctionResult(FunctionResultDelta),
-        CodeExecutionCall(CodeExecutionCallDelta),
-        CodeExecutionResult(CodeExecutionResultDelta),
-        UrlContextCall(UrlContextCallDelta),
-        UrlContextResult(UrlContextResultDelta),
-        GoogleSearchCall(GoogleSearchCallDelta),
-        GoogleSearchResult(GoogleSearchResultDelta),
-        McpServerToolCall(McpServerToolCallDelta),
-        McpServerToolResult(McpServerToolResultDelta),
-        FileSearchResult(FileSearchResultDelta),
-    }
-
-    /// Streaming text delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct TextDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub text: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub annotations: Option<Vec<Annotation>>,
-    }
-
-    /// Streaming image delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct ImageDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub resolution: Option<MediaResolution>,
-    }
-
-    /// Streaming audio delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct AudioDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-    }
-
-    /// Streaming document delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct DocumentDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-    }
-
-    /// Streaming video delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct VideoDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub uri: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub mime_type: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub resolution: Option<MediaResolution>,
-    }
-
-    /// Streaming thought summary delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct ThoughtSummaryDelta {
-        pub content: ThoughtSummaryContent,
-    }
-
-    /// Streaming thought signature delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct ThoughtSignatureDelta {
-        pub signature: String,
-    }
-
-    /// Streaming function call delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FunctionCallDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Streaming function result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FunctionResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-    }
-
-    /// Streaming code execution call delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct CodeExecutionCallDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<CodeExecutionCallArguments>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Streaming code execution result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct CodeExecutionResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub signature: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Streaming URL context call delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct UrlContextCallDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<UrlContextCallArguments>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Streaming URL context result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct UrlContextResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Vec<UrlContextResult>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub signature: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Streaming Google Search call delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct GoogleSearchCallDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<GoogleSearchCallArguments>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Streaming Google Search result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct GoogleSearchResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Vec<GoogleSearchResult>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub signature: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Streaming MCP server tool call delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct McpServerToolCallDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub server_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub arguments: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-    }
-
-    /// Streaming MCP server tool result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct McpServerToolResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub server_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub call_id: Option<String>,
-    }
-
-    /// Streaming file search result delta.
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    pub struct FileSearchResultDelta {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub result: Option<Vec<FileSearchResult>>,
-    }
+    Ok(Some(step))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::OneOrMany;
-    use crate::completion::{CompletionRequest, Message};
-    use crate::message::{self, ToolChoice as MessageToolChoice};
-    use serde_json::json;
+mod tests;
 
-    #[test]
-    fn test_create_request_body_simple() {
-        let prompt = Message::User {
-            content: OneOrMany::one(message::UserContent::text("Hello")),
-        };
-
-        let request = CompletionRequest {
-            model: None,
-            preamble: Some("Be precise.".to_string()),
-            chat_history: OneOrMany::one(prompt),
-            documents: vec![],
-            tools: vec![],
-            temperature: Some(0.7),
-            max_tokens: Some(128),
-            tool_choice: Some(MessageToolChoice::Required),
-            additional_params: None,
-            output_schema: None,
-        };
-
-        let result = create_request_body("gemini-2.5-flash".to_string(), request, Some(false))
-            .expect("request should build");
-
-        assert_eq!(result.model.as_deref(), Some("gemini-2.5-flash"));
-        assert!(result.agent.is_none());
-        assert_eq!(result.stream, Some(false));
-        assert_eq!(result.system_instruction.as_deref(), Some("Be precise."));
-
-        let config = result.generation_config.expect("generation config missing");
-        assert_eq!(config.temperature, Some(0.7));
-        assert_eq!(config.max_output_tokens, Some(128));
-        assert!(matches!(
-            config.tool_choice,
-            Some(ToolChoice::Type(ToolChoiceType::Any))
-        ));
-
-        let InteractionInput::Steps(steps) = result.input else {
-            panic!("expected steps input");
-        };
-        assert_eq!(steps.len(), 1);
-        let Step::UserInput { content: contents } = &steps[0] else {
-            panic!("expected user input step");
-        };
-        assert_eq!(contents.len(), 1);
-        match &contents[0] {
-            Content::Text(TextContent { text, .. }) => assert_eq!(text, "Hello"),
-            other => panic!("unexpected content: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_tool_result_requires_call_id() {
-        let content = message::UserContent::ToolResult(message::ToolResult {
-            id: "get_weather".to_string(),
-            call_id: None,
-            content: OneOrMany::one(message::ToolResultContent::text("ok")),
-        });
-
-        let err = Content::try_from(content).expect_err("should require call_id");
-        assert!(format!("{err}").contains("call_id"));
-    }
-
-    #[test]
-    fn test_response_function_call_mapping() {
-        let interaction = Interaction {
-            id: "interaction-1".to_string(),
-            steps: vec![Step::FunctionCall(FunctionCallContent {
-                name: Some("get_weather".to_string()),
-                arguments: Some(json!({"location": "Paris"})),
-                id: Some("call-123".to_string()),
-            })],
-            usage: Some(InteractionUsage {
-                total_input_tokens: Some(5),
-                total_output_tokens: Some(7),
-                total_tokens: Some(12),
-            }),
-            ..Default::default()
-        };
-
-        let response: completion::CompletionResponse<Interaction> =
-            interaction.try_into().expect("conversion should succeed");
-
-        let choice = response.choice.first();
-        match choice {
-            completion::AssistantContent::ToolCall(tool_call) => {
-                assert_eq!(tool_call.function.name, "get_weather");
-                assert_eq!(tool_call.call_id.as_deref(), Some("call-123"));
-            }
-            other => panic!("unexpected content: {other:?}"),
-        }
-
-        assert_eq!(response.usage.input_tokens, 5);
-        assert_eq!(response.usage.output_tokens, 7);
-        assert_eq!(response.usage.total_tokens, 12);
-    }
-
-    #[test]
-    fn test_google_search_tool_serialization() {
-        let tool = Tool::GoogleSearch;
-        let value = serde_json::to_value(tool).expect("tool should serialize");
-        assert_eq!(value, json!({ "type": "google_search" }));
-    }
-
-    #[test]
-    fn test_url_context_tool_serialization() {
-        let tool = Tool::UrlContext;
-        let value = serde_json::to_value(tool).expect("tool should serialize");
-        assert_eq!(value, json!({ "type": "url_context" }));
-    }
-
-    #[test]
-    fn test_code_execution_tool_serialization() {
-        let tool = Tool::CodeExecution;
-        let value = serde_json::to_value(tool).expect("tool should serialize");
-        assert_eq!(value, json!({ "type": "code_execution" }));
-    }
-
-    #[test]
-    fn test_google_search_helpers() {
-        let interaction = Interaction {
-            steps: vec![
-                Step::GoogleSearchCall(GoogleSearchCallContent {
-                    arguments: Some(GoogleSearchCallArguments {
-                        queries: Some(vec!["query-one".to_string(), "query-two".to_string()]),
-                    }),
-                    id: Some("call-1".to_string()),
-                }),
-                Step::GoogleSearchResult(GoogleSearchResultContent {
-                    result: Some(vec![GoogleSearchResult {
-                        url: Some("https://example.com".to_string()),
-                        title: Some("Example One".to_string()),
-                        rendered_content: None,
-                    }]),
-                    signature: None,
-                    is_error: None,
-                    call_id: Some("call-1".to_string()),
-                }),
-                Step::GoogleSearchCall(GoogleSearchCallContent {
-                    arguments: Some(GoogleSearchCallArguments {
-                        queries: Some(vec!["query-three".to_string()]),
-                    }),
-                    id: Some("call-2".to_string()),
-                }),
-                Step::GoogleSearchResult(GoogleSearchResultContent {
-                    result: Some(vec![GoogleSearchResult {
-                        url: Some("https://example.org".to_string()),
-                        title: Some("Example Two".to_string()),
-                        rendered_content: None,
-                    }]),
-                    signature: None,
-                    is_error: None,
-                    call_id: Some("call-2".to_string()),
-                }),
-            ],
-            ..Default::default()
-        };
-
-        let exchanges = interaction.google_search_exchanges();
-        assert_eq!(exchanges.len(), 2);
-        assert_eq!(exchanges[0].call_id.as_deref(), Some("call-1"));
-        assert_eq!(
-            exchanges[0].queries(),
-            vec!["query-one".to_string(), "query-two".to_string()]
-        );
-        let exchange_results = exchanges[0].result_items();
-        assert_eq!(exchange_results.len(), 1);
-        assert_eq!(exchange_results[0].title.as_deref(), Some("Example One"));
-
-        assert_eq!(exchanges[1].call_id.as_deref(), Some("call-2"));
-        assert_eq!(exchanges[1].queries(), vec!["query-three".to_string()]);
-        let exchange_results = exchanges[1].result_items();
-        assert_eq!(exchange_results.len(), 1);
-        assert_eq!(exchange_results[0].title.as_deref(), Some("Example Two"));
-
-        let queries = interaction.google_search_queries();
-        assert_eq!(queries, vec!["query-one", "query-two", "query-three"]);
-
-        let results = interaction.google_search_results();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].title.as_deref(), Some("Example One"));
-        assert_eq!(results[1].title.as_deref(), Some("Example Two"));
-
-        let call_contents = interaction.google_search_call_contents();
-        assert_eq!(call_contents.len(), 2);
-        assert_eq!(call_contents[0].id.as_deref(), Some("call-1"));
-        assert_eq!(call_contents[1].id.as_deref(), Some("call-2"));
-
-        let result_contents = interaction.google_search_result_contents();
-        assert_eq!(result_contents.len(), 2);
-        assert_eq!(result_contents[0].call_id.as_deref(), Some("call-1"));
-        assert_eq!(result_contents[1].call_id.as_deref(), Some("call-2"));
-    }
-
-    #[test]
-    fn test_google_search_helpers_without_call_id() {
-        let interaction = Interaction {
-            steps: vec![
-                Step::GoogleSearchCall(GoogleSearchCallContent {
-                    arguments: Some(GoogleSearchCallArguments {
-                        queries: Some(vec!["query-one".to_string()]),
-                    }),
-                    id: None,
-                }),
-                Step::GoogleSearchResult(GoogleSearchResultContent {
-                    result: Some(vec![GoogleSearchResult {
-                        url: Some("https://example.com".to_string()),
-                        title: Some("Example One".to_string()),
-                        rendered_content: None,
-                    }]),
-                    signature: None,
-                    is_error: None,
-                    call_id: None,
-                }),
-                Step::GoogleSearchCall(GoogleSearchCallContent {
-                    arguments: Some(GoogleSearchCallArguments {
-                        queries: Some(vec!["query-two".to_string()]),
-                    }),
-                    id: Some("call-2".to_string()),
-                }),
-                Step::GoogleSearchResult(GoogleSearchResultContent {
-                    result: Some(vec![GoogleSearchResult {
-                        url: Some("https://example.org".to_string()),
-                        title: Some("Example Two".to_string()),
-                        rendered_content: None,
-                    }]),
-                    signature: None,
-                    is_error: None,
-                    call_id: None,
-                }),
-            ],
-            ..Default::default()
-        };
-
-        let exchanges = interaction.google_search_exchanges();
-        assert_eq!(exchanges.len(), 2);
-
-        let no_id = exchanges
-            .iter()
-            .find(|exchange| exchange.call_id.is_none())
-            .expect("expected no-id exchange");
-        assert_eq!(no_id.calls.len(), 1);
-        assert_eq!(no_id.results.len(), 1);
-
-        let with_id = exchanges
-            .iter()
-            .find(|exchange| exchange.call_id.as_deref() == Some("call-2"))
-            .expect("expected call-2 exchange");
-        assert_eq!(with_id.calls.len(), 1);
-        assert_eq!(with_id.results.len(), 1);
-    }
-
-    #[test]
-    fn test_url_context_helpers() {
-        let interaction = Interaction {
-            steps: vec![
-                Step::UrlContextCall(UrlContextCallContent {
-                    arguments: Some(UrlContextCallArguments {
-                        urls: Some(vec![
-                            "https://example.com".to_string(),
-                            "https://example.org".to_string(),
-                        ]),
-                    }),
-                    id: Some("call-1".to_string()),
-                }),
-                Step::UrlContextResult(UrlContextResultContent {
-                    result: Some(vec![UrlContextResult {
-                        url: Some("https://example.com".to_string()),
-                        status: Some("success".to_string()),
-                    }]),
-                    signature: None,
-                    is_error: None,
-                    call_id: Some("call-1".to_string()),
-                }),
-            ],
-            ..Default::default()
-        };
-
-        let exchanges = interaction.url_context_exchanges();
-        assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0].call_id.as_deref(), Some("call-1"));
-        assert_eq!(
-            exchanges[0].urls(),
-            vec!["https://example.com", "https://example.org"]
-        );
-        let results = exchanges[0].result_items();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status.as_deref(), Some("success"));
-
-        let urls = interaction.url_context_urls();
-        assert_eq!(urls, vec!["https://example.com", "https://example.org"]);
-
-        let results = interaction.url_context_results();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].url.as_deref(), Some("https://example.com"));
-
-        let call_contents = interaction.url_context_call_contents();
-        assert_eq!(call_contents.len(), 1);
-        assert_eq!(call_contents[0].id.as_deref(), Some("call-1"));
-
-        let result_contents = interaction.url_context_result_contents();
-        assert_eq!(result_contents.len(), 1);
-        assert_eq!(result_contents[0].call_id.as_deref(), Some("call-1"));
-    }
-
-    #[test]
-    fn test_url_context_helpers_without_call_id() {
-        let interaction = Interaction {
-            steps: vec![
-                Step::UrlContextCall(UrlContextCallContent {
-                    arguments: Some(UrlContextCallArguments {
-                        urls: Some(vec!["https://example.com".to_string()]),
-                    }),
-                    id: None,
-                }),
-                Step::UrlContextResult(UrlContextResultContent {
-                    result: Some(vec![UrlContextResult {
-                        url: Some("https://example.com".to_string()),
-                        status: Some("success".to_string()),
-                    }]),
-                    signature: None,
-                    is_error: None,
-                    call_id: None,
-                }),
-                Step::UrlContextCall(UrlContextCallContent {
-                    arguments: Some(UrlContextCallArguments {
-                        urls: Some(vec!["https://example.org".to_string()]),
-                    }),
-                    id: Some("call-2".to_string()),
-                }),
-                Step::UrlContextResult(UrlContextResultContent {
-                    result: Some(vec![UrlContextResult {
-                        url: Some("https://example.org".to_string()),
-                        status: Some("success".to_string()),
-                    }]),
-                    signature: None,
-                    is_error: None,
-                    call_id: None,
-                }),
-            ],
-            ..Default::default()
-        };
-
-        let exchanges = interaction.url_context_exchanges();
-        assert_eq!(exchanges.len(), 2);
-
-        let no_id = exchanges
-            .iter()
-            .find(|exchange| exchange.call_id.is_none())
-            .expect("expected no-id exchange");
-        assert_eq!(no_id.calls.len(), 1);
-        assert_eq!(no_id.results.len(), 1);
-
-        let with_id = exchanges
-            .iter()
-            .find(|exchange| exchange.call_id.as_deref() == Some("call-2"))
-            .expect("expected call-2 exchange");
-        assert_eq!(with_id.calls.len(), 1);
-        assert_eq!(with_id.results.len(), 1);
-    }
-
-    #[test]
-    fn test_code_execution_helpers() {
-        let interaction = Interaction {
-            steps: vec![
-                Step::CodeExecutionCall(CodeExecutionCallContent {
-                    arguments: Some(CodeExecutionCallArguments {
-                        language: Some("python".to_string()),
-                        code: Some("print(2 + 2)".to_string()),
-                    }),
-                    id: Some("call-1".to_string()),
-                }),
-                Step::CodeExecutionResult(CodeExecutionResultContent {
-                    result: Some("4\n".to_string()),
-                    signature: None,
-                    is_error: None,
-                    call_id: Some("call-1".to_string()),
-                }),
-            ],
-            ..Default::default()
-        };
-
-        let exchanges = interaction.code_execution_exchanges();
-        assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0].call_id.as_deref(), Some("call-1"));
-        assert_eq!(exchanges[0].code_snippets(), vec!["print(2 + 2)"]);
-        assert_eq!(exchanges[0].outputs(), vec!["4\n"]);
-
-        let calls = interaction.code_execution_call_contents();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id.as_deref(), Some("call-1"));
-
-        let results = interaction.code_execution_result_contents();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].call_id.as_deref(), Some("call-1"));
-
-        let snippets = interaction.code_execution_snippets();
-        assert_eq!(snippets, vec!["print(2 + 2)"]);
-
-        let outputs = interaction.code_execution_outputs();
-        assert_eq!(outputs, vec!["4\n"]);
-    }
-
-    #[test]
-    fn test_code_execution_helpers_without_call_id() {
-        let interaction = Interaction {
-            steps: vec![
-                Step::CodeExecutionCall(CodeExecutionCallContent {
-                    arguments: Some(CodeExecutionCallArguments {
-                        language: Some("python".to_string()),
-                        code: Some("print(1 + 1)".to_string()),
-                    }),
-                    id: None,
-                }),
-                Step::CodeExecutionResult(CodeExecutionResultContent {
-                    result: Some("2\n".to_string()),
-                    signature: None,
-                    is_error: None,
-                    call_id: None,
-                }),
-                Step::CodeExecutionCall(CodeExecutionCallContent {
-                    arguments: Some(CodeExecutionCallArguments {
-                        language: Some("python".to_string()),
-                        code: Some("print(2 + 2)".to_string()),
-                    }),
-                    id: Some("call-2".to_string()),
-                }),
-                Step::CodeExecutionResult(CodeExecutionResultContent {
-                    result: Some("4\n".to_string()),
-                    signature: None,
-                    is_error: None,
-                    call_id: None,
-                }),
-            ],
-            ..Default::default()
-        };
-
-        let exchanges = interaction.code_execution_exchanges();
-        assert_eq!(exchanges.len(), 2);
-
-        let no_id = exchanges
-            .iter()
-            .find(|exchange| exchange.call_id.is_none())
-            .expect("expected no-id exchange");
-        assert_eq!(no_id.calls.len(), 1);
-        assert_eq!(no_id.results.len(), 1);
-
-        let with_id = exchanges
-            .iter()
-            .find(|exchange| exchange.call_id.as_deref() == Some("call-2"))
-            .expect("expected call-2 exchange");
-        assert_eq!(with_id.calls.len(), 1);
-        assert_eq!(with_id.results.len(), 1);
-    }
-
-    #[test]
-    fn test_interaction_status_helpers() {
-        let mut interaction = Interaction {
-            status: Some(InteractionStatus::InProgress),
-            ..Default::default()
-        };
-        assert!(!interaction.is_terminal());
-        assert!(!interaction.is_completed());
-
-        interaction.status = Some(InteractionStatus::Completed);
-        assert!(interaction.is_terminal());
-        assert!(interaction.is_completed());
-
-        interaction.status = Some(InteractionStatus::Failed);
-        assert!(interaction.is_terminal());
-        assert!(!interaction.is_completed());
-
-        interaction.status = Some(InteractionStatus::BudgetExceeded);
-        assert!(interaction.is_terminal());
-        assert!(!interaction.is_completed());
-    }
-
-    #[test]
-    fn test_budget_exceeded_status_deserializes() {
-        let status: InteractionStatus = serde_json::from_value(json!("budget_exceeded"))
-            .expect("budget_exceeded should deserialize");
-
-        assert!(matches!(status, InteractionStatus::BudgetExceeded));
-        assert!(status.is_terminal());
-    }
-
-    #[test]
-    fn test_budget_exceeded_status_update_deserializes() {
-        let event: InteractionSseEvent = serde_json::from_value(json!({
-            "event_type": "interaction.status_update",
-            "interaction_id": "interaction-123",
-            "status": "budget_exceeded",
-            "event_id": "event-456"
-        }))
-        .expect("budget_exceeded status update should deserialize");
-
-        match event {
-            InteractionSseEvent::InteractionStatusUpdate {
-                interaction_id,
-                status,
-                event_id,
-            } => {
-                assert_eq!(interaction_id, "interaction-123");
-                assert!(matches!(status, InteractionStatus::BudgetExceeded));
-                assert!(status.is_terminal());
-                assert_eq!(event_id.as_deref(), Some("event-456"));
-            }
-            other => panic!("expected status update event, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_build_interaction_stream_path() {
-        let path = build_interaction_stream_path("interaction-123", None);
-        assert_eq!(path, "/v1beta/interactions/interaction-123?stream=true");
-
-        let path = build_interaction_stream_path("interaction-123", Some("event-456"));
-        assert_eq!(
-            path,
-            "/v1beta/interactions/interaction-123?stream=true&last_event_id=event-456"
-        );
-    }
-
-    #[test]
-    fn test_inline_citations_from_annotations() {
-        let text_content = TextContent {
-            text: "Hello world".to_string(),
-            annotations: Some(vec![
-                Annotation {
-                    start_index: Some(6),
-                    end_index: Some(11),
-                    source: Some("https://example.com".to_string()),
-                },
-                Annotation {
-                    start_index: Some(0),
-                    end_index: Some(5),
-                    source: Some("https://hello.example".to_string()),
-                },
-            ]),
-        };
-
-        let cited = text_content.with_inline_citations();
-        assert_eq!(
-            cited,
-            "Hello[1](https://hello.example) world[2](https://example.com)"
-        );
-
-        let interaction = Interaction {
-            steps: vec![Step::ModelOutput {
-                content: vec![Content::Text(text_content)],
-            }],
-            ..Default::default()
-        };
-
-        let cited_text = interaction.text_with_inline_citations();
-        assert_eq!(
-            cited_text.as_deref(),
-            Some("Hello[1](https://hello.example) world[2](https://example.com)")
-        );
-    }
-}
+#[cfg(test)]
+mod history_tests;

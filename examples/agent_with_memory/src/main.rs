@@ -7,10 +7,9 @@
 //! Requires `OPENAI_API_KEY`.
 
 use anyhow::Result;
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::Prompt;
 use rig::memory::InMemoryConversationMemory;
-use rig::providers::openai;
+use rig::prelude::*;
+use rig::providers::openai::{self, OpenAI};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,8 +17,7 @@ async fn main() -> Result<()> {
     // depend on the `rig-memory` companion crate. Here we use the bare backend.
     let memory = InMemoryConversationMemory::new();
 
-    let agent = openai::Client::from_env()?
-        .agent(openai::GPT_4O)
+    let agent = AgentBuilder::new(OpenAI::from_env()?.completion(openai::GPT_4O))
         .preamble("You are a helpful assistant with persistent memory.")
         .memory(memory)
         .build();
@@ -27,13 +25,15 @@ async fn main() -> Result<()> {
     let first = agent
         .prompt("My name is Alice.")
         .conversation("user-123")
-        .await?;
+        .await?
+        .output();
     println!("turn 1: {first}");
 
     let second = agent
         .prompt("What's my name?")
         .conversation("user-123")
-        .await?;
+        .await?
+        .output();
     println!("turn 2: {second}");
 
     Ok(())

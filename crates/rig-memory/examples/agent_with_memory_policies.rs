@@ -13,9 +13,10 @@
 //! Requires `OPENAI_API_KEY`.
 
 use anyhow::Result;
-use rig_core::client::{CompletionClient, ProviderClient};
-use rig_core::completion::{Message, Prompt};
+use rig_agent::prelude::*;
+use rig_core::completion::Message;
 use rig_core::providers::openai;
+use rig_core::providers::openai::OpenAI;
 use rig_memory::{InMemoryConversationMemory, IntoFilter, SlidingWindowMemory, TokenWindowMemory};
 
 fn approx_token_count(message: &Message) -> usize {
@@ -28,7 +29,7 @@ fn approx_token_count(message: &Message) -> usize {
             })
             .collect::<Vec<_>>()
             .join(" "),
-        Message::Assistant { content, .. } => content
+        Message::Assistant(rig_core::message::AssistantMessage { content, .. }) => content
             .iter()
             .filter_map(|c| match c {
                 rig_core::completion::message::AssistantContent::Text(t) => Some(t.text.as_str()),
@@ -43,13 +44,14 @@ fn approx_token_count(message: &Message) -> usize {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = openai::Client::from_env()?;
+    let client = OpenAI::from_env()?;
+    // One model serves both agents: erase it once, clone the handle.
+    let model = client.completion(openai::GPT_4O).erase();
 
     let sliding_memory = InMemoryConversationMemory::new()
         .with_filter(SlidingWindowMemory::last_messages(20).into_filter());
 
-    let sliding_agent = client
-        .agent(openai::GPT_4O)
+    let sliding_agent = AgentBuilder::new(model.clone())
         .preamble("You are a helpful assistant. Keep responses short.")
         .memory(sliding_memory)
         .build();
@@ -57,14 +59,14 @@ async fn main() -> Result<()> {
     let reply = sliding_agent
         .prompt("Remember: my favorite color is teal.")
         .conversation("alice")
-        .await?;
+        .await?
+        .output();
     println!("[sliding] {reply}");
 
     let token_memory = InMemoryConversationMemory::new()
         .with_filter(TokenWindowMemory::new(256, approx_token_count).into_filter());
 
-    let token_agent = client
-        .agent(openai::GPT_4O)
+    let token_agent = AgentBuilder::new(model)
         .preamble("You are a helpful assistant. Keep responses short.")
         .memory(token_memory)
         .build();
@@ -72,7 +74,8 @@ async fn main() -> Result<()> {
     let reply = token_agent
         .prompt("Plan a 3-day trip to Kyoto.")
         .conversation("alice")
-        .await?;
+        .await?
+        .output();
     println!("[token]   {reply}");
 
     Ok(())

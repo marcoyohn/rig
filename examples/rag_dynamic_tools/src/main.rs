@@ -1,10 +1,8 @@
 use anyhow::Result;
 use rig::prelude::*;
-use rig::providers::openai;
+use rig::providers::openai::{self, OpenAI};
 use rig::{
-    completion::{Prompt, ToolDefinition},
     embeddings::EmbeddingsBuilder,
-    providers::openai::Client,
     tool::{Tool, ToolEmbedding, ToolSet},
     vector_store::in_memory_store::InMemoryVectorStore,
 };
@@ -34,26 +32,30 @@ impl Tool for Add {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "add".to_string(),
-            description: "Add x and y together".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The first number to add"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The second number to add"
-                    }
-                }
-            }),
-        }
+    fn description(&self) -> String {
+        "Add x and y together".to_string()
     }
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The first number to add"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The second number to add"
+                }
+            }
+        })
+    }
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let result = args.x + args.y;
         Ok(result)
     }
@@ -77,27 +79,31 @@ impl Tool for Subtract {
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "subtract".to_string(),
-            description: "Subtract y from x (i.e.: x - y)".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The number to subtract from"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The number to subtract"
-                    }
-                }
-            }),
-        }
+    fn description(&self) -> String {
+        "Subtract y from x (i.e.: x - y)".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The number to subtract from"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The number to subtract"
+                }
+            }
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let result = args.x - args.y;
         Ok(result)
     }
@@ -127,13 +133,15 @@ async fn main() -> Result<(), anyhow::Error> {
         .with_target(false)
         .init();
 
-    // Create OpenAI client
-    let openai_client = Client::from_env()?;
-    let embedding_model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
-    let toolset = ToolSet::builder()
-        .dynamic_tool(Add)
-        .dynamic_tool(Subtract)
-        .build();
+    // One OpenAI config serves both: completions go to the Responses API,
+    // embeddings to the shared REST surface.
+    let openai_client = OpenAI::from_env()?;
+    let embedding_model = openai_client
+        .embedding(openai::TEXT_EMBEDDING_ADA_002, None)
+        .erase();
+    let mut toolset = ToolSet::default();
+    toolset.add_retrieved_tool(Add)?;
+    toolset.add_retrieved_tool(Subtract)?;
     let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
         .documents(toolset.schemas()?)?
         .build()
@@ -147,16 +155,16 @@ async fn main() -> Result<(), anyhow::Error> {
     let index = vector_store.index(embedding_model);
 
     // Create RAG agent with a single context prompt and a dynamic tool source
-    let calculator_rag = openai_client
-        .agent(openai::GPT_4)
+    let calculator_rag = AgentBuilder::new(openai_client.completion(openai::GPT_4))
         .preamble("You are a calculator here to help the user perform arithmetic operations.")
         // Add a dynamic tool source with a sample rate of 1 (i.e.: only
         // 1 additional tool will be added to prompts)
-        .dynamic_tools(1, index, toolset)
+        .retrieved_tools(1, index, toolset)
+        .default_max_turns(2)
         .build();
 
     // Prompt the agent and print the response
-    let response = calculator_rag.prompt("Calculate 3 - 7").await?;
+    let response = calculator_rag.prompt("Calculate 3 - 7").await?.output();
 
     println!("{response}");
 

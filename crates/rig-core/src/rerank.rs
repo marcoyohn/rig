@@ -1,52 +1,26 @@
 //! Provider-agnostic reranking abstractions.
 //!
 //! Reranking models reorder a list of documents by relevance to a query.
-//! The [`RerankModel`] trait defines the interface, and [`RerankResponse`]
-//! carries both the scored results and token usage.
+//! A [`Model`](crate::driver::Model) over a rerank wire calls one, and
+//! [`RerankResponse`] carries both the scored results and token usage.
+//!
+//! ```no_run
+//! use rig_core::DynModel;
+//! use rig_core::operation::{Rerank, RerankRequest};
+//!
+//! # async fn example(model: &DynModel<Rerank>) -> Result<(), Box<dyn std::error::Error>> {
+//! let request = RerankRequest {
+//!     query: "Rust".into(),
+//!     documents: vec!["A systems programming language".into()],
+//! };
+//! let response = model.call(request).await?;
+//! # let _ = response;
+//! # Ok(())
+//! # }
+//! ```
 
-use crate::{
-    completion::Usage,
-    http_client,
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
-};
+use crate::completion::Usage;
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, thiserror::Error)]
-pub enum RerankError {
-    #[error("HttpError: {0}")]
-    HttpError(#[from] http_client::Error),
-
-    #[error("JsonError: {0}")]
-    JsonError(#[from] serde_json::Error),
-
-    #[error("UrlError: {0}")]
-    UrlError(#[from] url::ParseError),
-
-    #[error("ResponseError: {0}")]
-    ResponseError(String),
-
-    #[error("ProviderError: {0}")]
-    ProviderError(String),
-}
-
-/// Trait for reranking models that score documents by relevance to a query.
-pub trait RerankModel: WasmCompatSend + WasmCompatSync {
-    /// The maximum number of documents that can be reranked in a single request.
-    const MAX_DOCUMENTS: usize;
-
-    /// Provider client type used to construct this rerank model.
-    type Client;
-
-    /// Construct a model handle from a provider client and model identifier.
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self;
-
-    /// Rerank a list of documents against a query.
-    fn rerank(
-        &self,
-        query: &str,
-        documents: Vec<String>,
-    ) -> impl std::future::Future<Output = Result<RerankResponse, RerankError>> + WasmCompatSend;
-}
 
 /// A single reranked document result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,17 +29,52 @@ pub struct RerankResult {
     pub index: usize,
     /// The document text, if requested via `return_documents`.
     pub document: Option<String>,
-    /// Relevance score between 0 and 1 (higher is more relevant).
+    /// Relevance score, with higher values more relevant within this response.
+    /// The range is provider-specific and may include negative values. Do not
+    /// interpret it as a probability or compare scores across responses.
     pub relevance_score: f64,
 }
 
-/// Response from a reranking request.
-#[derive(Debug, Clone)]
+/// Ranked documents and normalized provider metadata.
+/// Provider-specific response data is available through [`Self::raw`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankResponse {
     /// Reranked results sorted by relevance (highest first).
     pub results: Vec<RerankResult>,
-    /// Model identifier used for this request.
-    pub model: String,
-    /// Token usage for this rerank request.
+    /// Provider-reported model identifier, or `None` when omitted.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Token usage for this rerank request; every counter is `None` when the
+    /// provider reported none (see [`Usage`]).
+    #[serde(default)]
     pub usage: Usage,
+    /// Stable descriptor name of the provider that produced this response,
+    /// for example `"voyageai"`. Always populated.
+    pub provider: String,
+    /// Provider-assigned response-scoped identifier, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    /// Transport request ID from HTTP headers, or `None` when unreported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
+    /// Provider response document. Defaults to null until populated.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub raw: serde_json::Value,
+}
+
+impl RerankResponse {
+    /// A response carrying `results`. The driver writes the provider, the
+    /// transport request id and the reply document; decoders set what the
+    /// provider reported.
+    pub fn new(results: Vec<RerankResult>) -> Self {
+        Self {
+            results,
+            model: None,
+            usage: Usage::default(),
+            provider: String::new(),
+            response_id: None,
+            provider_request_id: None,
+            raw: serde_json::Value::Null,
+        }
+    }
 }

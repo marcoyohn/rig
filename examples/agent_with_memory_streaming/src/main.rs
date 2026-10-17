@@ -8,16 +8,15 @@
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use rig::agent::{MultiTurnStreamItem, StreamingResult};
-use rig::client::{CompletionClient, ProviderClient};
 use rig::memory::InMemoryConversationMemory;
-use rig::providers::openai;
-use rig::streaming::StreamingPrompt;
+use rig::prelude::*;
+use rig::providers::openai::{self, OpenAI};
 
-async fn collect_final<R>(stream: &mut StreamingResult<R>) -> Result<String> {
+async fn collect_final(stream: &mut StreamingResult) -> Result<String> {
     let mut final_response = None;
     while let Some(item) = stream.next().await {
         if let MultiTurnStreamItem::FinalResponse(response) = item? {
-            final_response = Some(response.response().to_owned());
+            final_response = Some(response.output().to_owned());
         }
     }
     final_response.ok_or_else(|| anyhow!("stream finished without a final response"))
@@ -27,23 +26,22 @@ async fn collect_final<R>(stream: &mut StreamingResult<R>) -> Result<String> {
 async fn main() -> Result<()> {
     let memory = InMemoryConversationMemory::new();
 
-    let agent = openai::Client::from_env()?
-        .agent(openai::GPT_4O)
+    let agent = AgentBuilder::new(OpenAI::from_env()?.completion(openai::GPT_4O))
         .preamble("You are a helpful assistant with persistent memory.")
         .memory(memory)
         .build();
 
     let mut first = agent
-        .stream_prompt("My name is Alice.")
+        .prompt("My name is Alice.")
         .conversation("user-123")
-        .await;
+        .stream();
     let reply1 = collect_final(&mut first).await?;
     println!("turn 1: {reply1}");
 
     let mut second = agent
-        .stream_prompt("What's my name?")
+        .prompt("What's my name?")
         .conversation("user-123")
-        .await;
+        .stream();
     let reply2 = collect_final(&mut second).await?;
     println!("turn 2: {reply2}");
 

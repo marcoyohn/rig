@@ -1,11 +1,10 @@
 use anyhow::Result;
 use rig::integrations::cli_chatbot::ChatBotBuilder;
 use rig::prelude::*;
-use rig::providers::openai;
+use rig::providers::openai::{self, OpenAI};
 use rig::{
     agent::{Agent, AgentBuilder},
-    completion::{Chat, CompletionModel, Message, PromptError, ToolDefinition},
-    providers::openai::Client as OpenAIClient,
+    completion::Message,
     tool::Tool,
 };
 use serde::Deserialize;
@@ -13,7 +12,9 @@ use serde_json::json;
 
 // Define a wrapper around an agent so that it can be provided to another agent
 // as a tool
-struct TranslatorTool<M: CompletionModel>(Agent<M>);
+struct TranslatorTool(Agent);
+
+const TRANSLATOR_TOOL_NAME: &str = "translator";
 
 // The input that will be sent to the translator agent from the main agent
 #[derive(Deserialize)]
@@ -21,38 +22,42 @@ struct TranslatorArgs {
     prompt: String,
 }
 
-impl<M: CompletionModel + 'static> Tool for TranslatorTool<M> {
-    const NAME: &'static str = "translator";
+impl Tool for TranslatorTool {
+    const NAME: &'static str = TRANSLATOR_TOOL_NAME;
+
+    type Error = PromptError;
 
     type Args = TranslatorArgs;
-    type Error = PromptError;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description:
-                "Translate any text to English. If already in English, fix grammar and syntax issues."
-                    .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "The text to translate to English"
-                    }
-                },
-                "required": ["prompt"]
-            }),
-        }
+    fn description(&self) -> String {
+        "Translate any text to English. If already in English, fix grammar and syntax issues."
+            .to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The text to translate to English"
+                }
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let mut empty_history = Vec::<Message>::new();
         match self.0.chat(&args.prompt, &mut empty_history).await {
             Ok(response) => {
-                println!("Translated prompt: {response}");
-                Ok(response)
+                println!("Translated prompt: {}", response.output());
+                Ok(response.output())
             }
             Err(e) => Err(e),
         }
@@ -67,8 +72,8 @@ impl<M: CompletionModel + 'static> Tool for TranslatorTool<M> {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
-    let openai_client = OpenAIClient::from_env()?;
-    let model = openai_client.completion_model(openai::GPT_4O);
+    let openai_client = OpenAI::from_env()?;
+    let model = openai_client.completion(openai::GPT_4O).erase();
 
     let translator_agent = AgentBuilder::new(model.clone())
                 .preamble(
@@ -80,12 +85,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let translator_tool = TranslatorTool(translator_agent);
 
     let multi_agent_system = AgentBuilder::new(model)
-        .preamble(&format!(
+        .preamble(format!(
             "You are a helpful assistant that can work with text in any language. \
             When you receive input that is not in English, or contains grammatical errors \
-            use the {} tool first to ensure proper English, then provide your response. \
-            Always show both the translated text and your final response.",
-            translator_tool.name()
+            use the {TRANSLATOR_TOOL_NAME} tool first to ensure proper English, then provide your response. \
+            Always show both the translated text and your final response."
         ))
         .tool(translator_tool)
         .build();
@@ -93,7 +97,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Spin up a CLI chatbot using the multi-agent system
     let chatbot = ChatBotBuilder::new()
         .agent(multi_agent_system)
-        .max_turns(1)
+        .max_turns(2)
         .build();
 
     chatbot.run().await?;

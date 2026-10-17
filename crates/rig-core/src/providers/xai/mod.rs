@@ -1,32 +1,82 @@
-//! xAI API client and Rig integration
+//! xAI's model identifiers and its dialect.
 //!
-//! # Example
+//! [`from_env`] and [`new`] build a client on [`DIALECT`], which uses the
+//! Responses endpoint and reads `XAI_API_KEY`.
+//!
 //! ```no_run
-//! use rig_core::{client::CompletionClient, providers::xai};
+//! use rig_core::providers::xai;
 //!
 //! # fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let client = xai::Client::new("YOUR_API_KEY")?;
-//!
-//! let grok = client.completion_model(xai::GROK_3);
+//! let grok = xai::from_env()?.completion(xai::GROK_3);
+//! # let _ = grok;
 //! # Ok(())
 //! # }
 //! ```
 
-mod api;
 #[cfg(feature = "audio")]
 pub mod audio_generation;
-pub mod client;
-pub mod completion;
+pub mod extension;
 #[cfg(feature = "image")]
 pub mod image_generation;
-mod streaming;
 
 #[cfg(feature = "audio")]
-pub use audio_generation::{AudioGenerationModel, TTS_1};
-pub use client::Client;
-pub use completion::{
-    CompletionModel, CompletionResponse, GROK_2_1212, GROK_2_IMAGE_1212, GROK_2_VISION_1212,
-    GROK_3, GROK_3_FAST, GROK_3_MINI, GROK_3_MINI_FAST, GROK_4,
-};
+pub use audio_generation::TTS_1;
 #[cfg(feature = "image")]
-pub use image_generation::{GROK_IMAGINE_IMAGE, GROK_IMAGINE_IMAGE_PRO, ImageGenerationModel};
+pub use image_generation::{GROK_IMAGINE_IMAGE, GROK_IMAGINE_IMAGE_PRO};
+
+/// Identifier for the Grok 2 December 2024 model.
+pub const GROK_2_1212: &str = "grok-2-1212";
+pub const GROK_2_VISION_1212: &str = "grok-2-vision-1212";
+pub const GROK_3: &str = "grok-3";
+pub const GROK_3_FAST: &str = "grok-3-fast";
+pub const GROK_3_MINI: &str = "grok-3-mini";
+pub const GROK_3_MINI_FAST: &str = "grok-3-mini-fast";
+pub const GROK_2_IMAGE_1212: &str = "grok-2-image-1212";
+pub const GROK_4: &str = "grok-4-0709";
+
+use crate::providers::openai::responses_api::SystemInstructionsPlacement;
+use crate::providers::openai::wire::{
+    Dialect, ImageBody, Quirks, ResponsesContract, ResponsesQuirks, Route, SpeechBody,
+};
+
+/// The provider key: the dialect name, a reply's `Origin::provider` and
+/// the typed provider-options key.
+pub const PROVIDER_NAME: &str = "xai";
+
+/// xAI endpoint and encoding configuration. Responses system messages remain
+/// in `input`; error envelopes may arrive with HTTP 200. Completed function calls
+/// arrive at `output_item.done`, and structured output cannot combine with tools.
+pub const DIALECT: Dialect = Dialect {
+    request_id_header: Some("x-request-id"),
+    quirks: Quirks {
+        completion_route: Route::Responses,
+        completion_path: "/v1/chat/completions",
+        embeddings_path: "/v1/embeddings",
+        models_path: "/v1/models",
+        verify_path: "/v1/api-key",
+        transcription_path: "/v1/audio/transcriptions",
+        image_generation_path: "/v1/images/generations",
+        audio_generation_path: "/v1/tts",
+        image_body: ImageBody::Xai,
+        speech_body: SpeechBody::Xai,
+        responses: ResponsesQuirks {
+            path: "/v1/responses",
+            system_instructions: SystemInstructionsPlacement::InputSystemMessages,
+            contract: ResponsesContract::Xai,
+            ..ResponsesQuirks::openai()
+        },
+        ..Quirks::openai()
+    },
+    ..Dialect::gateway(PROVIDER_NAME, "https://api.x.ai", "XAI_API_KEY")
+};
+
+crate::client::macros::openai_vendor!(DIALECT, "xAI");
+
+/// Whether the xAI `model`, an id the catalog does not list, reads images:
+/// Grok 2 only in its vision models, and neither Grok 3 nor Grok Code.
+pub(crate) fn reads_images(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    !((model.starts_with("grok-2") && !model.contains("vision"))
+        || model.starts_with("grok-3")
+        || model.starts_with("grok-code"))
+}

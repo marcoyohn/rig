@@ -1,7 +1,7 @@
-use rig_core::client::{CompletionClient, ProviderClient};
-use rig_core::completion::Prompt;
+use rig_agent::prelude::*;
 use rig_core::providers;
-use rig_core::tool::{Tool, ToolError};
+use rig_core::providers::openai::OpenAI;
+use rig_core::tool::ToolExecutionError;
 use rig_derive::rig_tool;
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ async fn async_operation(
     input: String,
     /// Delay in milliseconds before returning result
     delay_ms: u64,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecutionError> {
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
     Ok(format!(
@@ -26,8 +26,7 @@ async fn async_operation(
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt().pretty().init();
 
-    let async_agent = providers::openai::Client::from_env()?
-        .agent(providers::openai::GPT_4O)
+    let async_agent = AgentBuilder::new(OpenAI::from_env()?.completion(providers::openai::GPT_4O))
         .preamble("You are an agent with tools access, always use the tools")
         .max_tokens(1024)
         .tool(AsyncOperation)
@@ -36,7 +35,7 @@ async fn main() -> Result<(), anyhow::Error> {
     println!("Tool definition:");
     println!(
         "ASYNCOPERATION: {}",
-        serde_json::to_string_pretty(&AsyncOperation.definition(String::default()).await)?
+        serde_json::to_string_pretty(&rig_agent::tool::tool_definition(&AsyncOperation))?
     );
 
     for prompt in [
@@ -47,7 +46,7 @@ async fn main() -> Result<(), anyhow::Error> {
         "Process the text 'error handling' with a delay of 'not a number'",
     ] {
         println!("User: {prompt}");
-        println!("Agent: {}", async_agent.prompt(prompt).await?);
+        println!("Agent: {}", async_agent.prompt(prompt).await?.output());
     }
 
     Ok(())

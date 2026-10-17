@@ -1,10 +1,12 @@
+use rig::error::ProviderError;
+use rig::extractor::ExtractorBuilder;
 use rig::prelude::*;
 use rig::{
     agent::Agent,
-    completion::{CompletionError, CompletionModel, Prompt, PromptError, ToolDefinition},
+    completion::PromptError,
     extractor::Extractor,
     message::Message,
-    providers::anthropic,
+    providers::anthropic::{self, Anthropic},
     tool::Tool,
 };
 use schemars::JsonSchema;
@@ -21,13 +23,12 @@ struct ChainOfThoughtSteps {
     steps: Vec<String>,
 }
 
-struct ReasoningAgent<M: CompletionModel> {
-    chain_of_thought_extractor: Extractor<M, ChainOfThoughtSteps>,
-    executor: Agent<M>,
+struct ReasoningAgent {
+    chain_of_thought_extractor: Extractor<ChainOfThoughtSteps>,
+    executor: Agent,
 }
 
-impl<M: CompletionModel + 'static> Prompt for ReasoningAgent<M> {
-    #[allow(refining_impl_trait)]
+impl ReasoningAgent {
     async fn prompt(&self, prompt: impl Into<Message> + Send) -> Result<String, PromptError> {
         let prompt: Message = prompt.into();
         let chat_history = vec![prompt.clone()];
@@ -37,8 +38,9 @@ impl<M: CompletionModel + 'static> Prompt for ReasoningAgent<M> {
             .await
             .map_err(|e| {
                 tracing::error!("Extraction error: {:?}", e);
-                CompletionError::ProviderError("".into())
-            })?;
+                ProviderError::Provider("".into())
+            })?
+            .output;
         if extracted.steps.is_empty() {
             return Ok("No reasoning steps provided.".into());
         }
@@ -49,19 +51,15 @@ impl<M: CompletionModel + 'static> Prompt for ReasoningAgent<M> {
         let response = self
             .executor
             .prompt(reasoning_prompt.as_str())
-            .with_history(&chat_history)
+            .history(&chat_history)
             .max_turns(20)
-            .extended_details()
             .await?;
-        if let Some(messages) = &response.messages {
-            let history_vec: Vec<_> = messages.clone().into_iter().collect();
-            tracing::info!(
-                "full chat history generated: {}",
-                serde_json::to_string_pretty(&history_vec)
-                    .unwrap_or_else(|_| "<failed to serialize chat history>".to_string())
-            );
-        }
-        Ok(response.output)
+        tracing::info!(
+            "full chat history generated: {}",
+            serde_json::to_string_pretty(&response.messages)
+                .unwrap_or_else(|_| "<failed to serialize chat history>".to_string())
+        );
+        Ok(response.output())
     }
 }
 
@@ -72,16 +70,18 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    // Create Anthropic client
-    let anthropic_client = anthropic::Client::from_env()?;
+    // The Anthropic client, from `ANTHROPIC_API_KEY`.
+    let anthropic_client = Anthropic::from_env()?;
+    // One model serves the extractor and the executor: erase it once, clone the handle.
+    let model = anthropic_client
+        .completion(anthropic::completion::CLAUDE_SONNET_4_6)
+        .erase();
     let agent = ReasoningAgent {
-        chain_of_thought_extractor: anthropic_client
-            .extractor(anthropic::completion::CLAUDE_SONNET_4_6)
-            .preamble(CHAIN_OF_THOUGHT_PROMPT)
+        chain_of_thought_extractor: ExtractorBuilder::new(model.clone())
+            .append_preamble(CHAIN_OF_THOUGHT_PROMPT)
             .build(),
 
-        executor: anthropic_client
-            .agent(anthropic::completion::CLAUDE_SONNET_4_6)
+        executor: AgentBuilder::new(model)
             .preamble(
                 "You are an assistant here to help the user select which tool is most appropriate to perform arithmetic operations.
                 Follow these instructions closely.
@@ -127,26 +127,30 @@ impl Tool for Add {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "add".to_string(),
-            description: "Add x and y together".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The first number to add"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The second number to add"
-                    }
-                }
-            }),
-        }
+    fn description(&self) -> String {
+        "Add x and y together".to_string()
     }
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The first number to add"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The second number to add"
+                }
+            }
+        })
+    }
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let result = args.x + args.y;
         Ok(result)
     }
@@ -158,27 +162,31 @@ impl Tool for Subtract {
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "subtract".to_string(),
-            description: "Subtract y from x (i.e.: x - y)".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The number to subtract from"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The number to subtract"
-                    }
-                }
-            }),
-        }
+    fn description(&self) -> String {
+        "Subtract y from x (i.e.: x - y)".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The number to subtract from"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The number to subtract"
+                }
+            }
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let result = args.x - args.y;
         Ok(result)
     }
@@ -192,27 +200,31 @@ impl Tool for Multiply {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "multiply".to_string(),
-            description: "Compute the product of x and y (i.e.: x * y)".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The first factor in the product"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The second factor in the product"
-                    }
-                }
-            }),
-        }
+    fn description(&self) -> String {
+        "Compute the product of x and y (i.e.: x * y)".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The first factor in the product"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The second factor in the product"
+                }
+            }
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let result = args.x * args.y;
         Ok(result)
     }
@@ -226,28 +238,31 @@ impl Tool for Divide {
     type Args = OperationArgs;
     type Output = i32;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "divide".to_string(),
-            description: "Compute the Quotient of x and y (i.e.: x / y). Useful for ratios."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "x": {
-                        "type": "number",
-                        "description": "The Dividend of the division. The number being divided"
-                    },
-                    "y": {
-                        "type": "number",
-                        "description": "The Divisor of the division. The number by which the dividend is being divided"
-                    }
-                }
-            }),
-        }
+    fn description(&self) -> String {
+        "Compute the Quotient of x and y (i.e.: x / y). Useful for ratios.".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "The Dividend of the division. The number being divided"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "The Divisor of the division. The number by which the dividend is being divided"
+                }
+            }
+        })
+    }
+
+    async fn call(
+        &self,
+        _context: &mut rig::tool::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let result = args.x / args.y;
         Ok(result)
     }
